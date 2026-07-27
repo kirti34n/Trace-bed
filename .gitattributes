@@ -1,0 +1,28 @@
+# Line endings are settled here rather than left to each clone's core.autocrlf.
+#
+# The canonical working copy is Linux (WSL): Docker, Postgres and the whole test
+# stack are native there, and /mnt/c is 5-10x slower for the file I/O a 4,000-test
+# suite does. Windows clones still work — Git converts on checkout — but the repo
+# and every diff stay LF, which is what stopped `git commit` printing a screen of
+# "LF will be replaced by CRLF" warnings on every run.
+#
+# This matters beyond tidiness: tests/fixtures/scan_corpus/*.jsonl are byte-exact
+# corpora, and harness gate runners compare rendered output. A CRLF sneaking into
+# either changes a hash or a substring match for reasons no reader would guess.
+
+* text=auto eol=lf
+
+# PowerShell is invoked by Windows and wants CRLF.
+*.ps1 text eol=crlf
+
+# Byte-exact: never touch these.
+*.jsonl  -text
+*.png    binary
+*.jpg    binary
+*.ico    binary
+*.woff   binary
+*.woff2  binary
+
+# Generated; keep them out of diffs and language stats.
+package-lock.json  linguist-generated=true -diff
+docs/MEMORY-FLOW.html  linguist-documentation=true
