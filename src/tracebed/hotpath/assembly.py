@@ -83,16 +83,21 @@ __all__ = [
     "slot_for",
 ]
 
-# Word characters only, lowercased, order-preserving-unique. NOT pg_textsearch's tokenizer: this
+# Word characters only, lowercased, order-preserving-unique. NOT the server's tokenizer: this
 # one does no stemming and drops no stopwords, and the pg one is not reachable from a pure
 # function. The mismatch is deliberately in the strict direction. "Shared term" is computed with
 # THIS tokenizer on both the query and the candidate's content, so it is self-consistent; the
-# document frequency of each term is computed by the SERVER (`content @@@ term`) under the real
-# tokenizer, so the df number is the real one. The only effect of the difference is that a query
-# term and a candidate term that differ only by inflection are not counted as shared here even
-# though the index would match them — i.e. the rarity gate sees FEWER shared rare terms than a
-# stemming tokenizer would, and `rarity_min_shared_terms` is a `>=` bar. Undercounting can only
-# turn an inject into an abstain, never the reverse (D-066).
+# document frequency of each term is computed by the SERVER (`m.lexemes @@ plainto_tsquery(
+# 'english', term)`) under the real 'english' tokenizer. A stopword survives THIS tokenizer but
+# `plainto_tsquery` collapses it to an empty query matching no row; `stores.pg.search
+# .document_frequency` therefore reports such a term at the FULL corpus count (true df ~100%), NOT
+# df=0 — otherwise the corpus's commonest words would score as maximally RARE and two shared
+# stopwords alone would pass the gate. With that handled the df number is the real one, and the only
+# residual effect of the tokenizer mismatch is that a query term and a candidate term that differ
+# only by inflection are not counted as shared here even though the index would match them — i.e.
+# the rarity gate sees FEWER shared rare terms than a stemming tokenizer would, and
+# `rarity_min_shared_terms` is a `>=` bar. Undercounting can only turn an inject into an abstain,
+# never the reverse (D-066).
 _TERM_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-z]+")
 
 # Which slot a retrieved memory occupies. A Tier-A `candidate` row overrides this to

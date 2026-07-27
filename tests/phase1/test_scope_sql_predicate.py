@@ -380,7 +380,7 @@ def test_no_statement_is_issued_for_a_blank_query_or_empty_embedding() -> None:
 # Postgres evaluates that text the way `_evaluate` models it -- in particular the NULL semantics
 # the unresolved-reference fail-closed behaviour rests on. That needs a database. Skips cleanly
 # (never errors at setup) when none is reachable, exactly like every other integration fixture in
-# this repository, and skips again if the reachable database lacks the `pg_textsearch`/`pgvector`
+# this repository, and skips again if the reachable database lacks the `vchord_bm25`/`pgvector`
 # access methods `stores.pg.search`'s statements depend on.
 # --------------------------------------------------------------------------- #
 
@@ -418,7 +418,7 @@ def test_the_scoped_arm_returns_exactly_what_scope_visible_accepts_on_a_real_dat
             with pool.connection() as conn:
                 create_project_partitions(conn, project_id)
         except psycopg.errors.UndefinedObject as exc:
-            pytest.skip(f"pgvector/pg_textsearch access method unavailable: {exc}")
+            pytest.skip(f"pgvector/vchord_bm25 access method unavailable: {exc}")
         except Exception as exc:  # pragma: no cover - environment-dependent
             pytest.skip(f"could not provision a test project: {exc.__class__.__name__}")
 
@@ -470,10 +470,7 @@ def test_the_scoped_arm_returns_exactly_what_scope_visible_accepts_on_a_real_dat
             planted[_insert(scope_type, scope_id)] = (scope_type, scope_id)
 
         search = SearchStore(pool)
-        try:
-            hits = search.lexical_arm(project_id, "retry budget", 50, visibility=visibility)
-        except psycopg.errors.UndefinedFunction as exc:
-            pytest.skip(f"pg_textsearch bm25_score()/@@@ unavailable: {exc}")
+        hits = search.lexical_arm(project_id, "retry budget", 50, visibility=visibility)
 
         returned = {hit.memory_id for hit in hits}
         expected = {

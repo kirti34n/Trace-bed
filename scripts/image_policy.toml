@@ -15,7 +15,7 @@ repository = "tensorchord/vchord-suite"
 tag = "pg18-latest"
 floating_tag = true
 licence = "Apache-2.0 (VectorChord); PostgreSQL License (server)"
-purpose = "Postgres 18 + pgvector/VectorChord + pg_textsearch — the store, dev and CI"
+purpose = "Postgres 18 + pgvector/VectorChord + vchord_bm25/pg_tokenizer — the store, dev and CI"
 note = """Named in no PLAN.md or DECISIONS.md entry before D-109, on a floating tag. The tag is
 accepted for now because pinning by digest needs network access the build machine does not have,
 and a wrong digest fails CI in a way that reads as a code failure. Owner action: pin a digest

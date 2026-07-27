@@ -74,7 +74,7 @@ class RarityEvidence:
     `shared_term_doc_freq_pct` holds exactly one entry per query term that
     ALSO appears in the candidate's content — genuinely shared terms only;
     tokenising both sides and computing per-term document frequency from
-    pg_textsearch's index (the corpus-wide IDF source, D-003) is the
+    the `lexemes` tsvector (the corpus-wide IDF source, D-003/D-140) is the
     retriever's job, not this module's. A shared term counts as "rare" when
     its document-frequency percentage is `<= rarity_max_df_pct`.
     """
@@ -172,9 +172,10 @@ def rare_shared_term_count(rarity: RarityEvidence, cfg: AbstentionConfig) -> int
     """How many shared query/candidate terms clear the rarity bar.
 
     A term counts iff its document frequency is `<= rarity_max_df_pct`
-    percent of the corpus — this *is* the IDF computation (D-003: BM25 via
-    `pg_textsearch` was chosen specifically because it exposes a real IDF;
-    `ts_rank` has none, and this gate could not exist against it).
+    percent of the corpus — this *is* the IDF computation (D-003/D-140: the
+    exact per-term document frequency comes from the `lexemes` tsvector, which
+    exposes a real DF; `ts_rank` has none, and this gate could not exist
+    against it).
     """
     return sum(1 for pct in rarity.shared_term_doc_freq_pct if pct <= cfg.rarity_max_df_pct)
 

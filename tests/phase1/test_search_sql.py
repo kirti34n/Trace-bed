@@ -7,13 +7,13 @@ reason: this is the regression guard PLAN.md §7 itself asks for ("an offline te
 generated SQL and asserts the status predicate and the project_id predicate are both present in
 every query ... dropping either is a silent leak").
 
-INTEGRATION (`@pytest.mark.integration`, needs a live Postgres 18 with `pgvector` + `pg_textsearch`
+INTEGRATION (`@pytest.mark.integration`, needs a live Postgres 18 with `pgvector` + `vchord_bm25`
 — absent on this build machine): provisions one real project, inserts rows across every status,
 and proves the retrievable-status predicate holds against a real database, not just against the
 SQL text. Skips cleanly — never errors at setup — exactly like every other fixture in this
 repository when no database is reachable, per the environment constraint this whole test suite is
 written under; it additionally skips (rather than erroring) if the database IS reachable but
-lacks the `pg_textsearch`/`pgvector` extensions this module's queries depend on, because "database
+lacks the `vchord_bm25`/`pgvector` extensions this module's queries depend on, because "database
 present, extension absent" is a provisioning gap, not a proof that invariant 7's retrieval-side
 predicate is wrong.
 """
@@ -325,6 +325,58 @@ def test_lexical_arm_top_n_is_clamped_to_the_ceiling() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Stage 2 (D-140): the vchord_bm25 ranking wiring — the per-partition index bind, the
+# score/match surface, the search_path, and the absence of the phantom pg_textsearch surface.
+# --------------------------------------------------------------------------- #
+
+
+def test_lexical_arm_binds_the_partition_bm25_index_and_drops_the_phantom_surface() -> None:
+    from tracebed.stores.pg.ddl import MEMORY_ITEM_BM25_INDEX_SUFFIX, partition_index_name
+
+    store, pool = _store()
+    store.lexical_arm(PROJECT, "retry", 10)
+    sql, params = _memory_item_statements(pool.log)[0]
+    assert params["bm25_index"] == partition_index_name(
+        "memory_item", PROJECT, MEMORY_ITEM_BM25_INDEX_SUFFIX
+    )
+    assert "%(bm25_index)s::regclass" in sql
+    assert "content_bm25 <&>" in sql and "content_bm25 IS NOT NULL" in sql
+    assert "bm25_score" not in sql and "@@@" not in sql
+    # The exact non-negative, higher-is-better score transform, pinned character-for-character.
+    # `<&>` returns a NEGATIVE distance for a match; dropping the negation clamps every score to 0
+    # (destroying ranking and forcing universal lexical abstention), and dropping the clamp feeds a
+    # negative raw_score into abstention (a ValueError). Both mutations are one assertion away from
+    # red — offline, without a database — complementing the under-the-app-role ranking test below.
+    assert "GREATEST(0.0::real, -(bm25_distance))" in sql
+
+
+def test_lexical_arm_sets_bm25_search_path_before_its_select() -> None:
+    store, pool = _store()
+    store.lexical_arm(PROJECT, "retry", 10)
+    kinds = [
+        "guc"
+        if "tracebed.project_id" in s
+        else "path"
+        if "search_path" in s
+        else "select"
+        if "FROM memory_item" in s
+        else "other"
+        for s, _ in pool.log
+    ]
+    assert kinds == ["guc", "path", "select"]
+    (path_sql,) = [s for s, _ in pool.log if "search_path" in s]
+    assert "bm25_catalog" in path_sql
+
+
+def test_document_frequency_uses_the_tsvector_not_the_phantom_match_operator() -> None:
+    store, pool = _store()
+    store.document_frequency(PROJECT, ["retry"])
+    sql, _ = _memory_item_statements(pool.log)[0]
+    assert "m.lexemes @@ plainto_tsquery('english', t.term)" in sql
+    assert "@@@" not in sql
+
+
+# --------------------------------------------------------------------------- #
 # vector_arm's HNSW GUCs — set before the SELECT, mapped from the config bool.
 # --------------------------------------------------------------------------- #
 
@@ -494,7 +546,7 @@ def test_vector_arm_rejects_an_all_nan_embedding_even_at_length_one() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Integration — a real Postgres 18 with pgvector + pg_textsearch (absent here; skips cleanly).
+# Integration — a real Postgres 18 with pgvector + vchord_bm25 (absent here; skips cleanly).
 # --------------------------------------------------------------------------- #
 
 
@@ -504,7 +556,7 @@ def test_retrievable_predicate_holds_against_a_real_database(pg: str) -> None:
     against SQL text: insert one row per status (plus a Tier-B `candidate`), and assert every
     method here returns/counts ONLY the validated row and the Tier-A candidate row.
 
-    Skips (does not error) if the reachable Postgres lacks the `pg_textsearch` / `pgvector`
+    Skips (does not error) if the reachable Postgres lacks the `vchord_bm25` / `pgvector`
     extensions or the `bm25`/`vector` access methods this module's queries depend on — that is a
     provisioning gap on this machine, not evidence about the predicate under test, and the
     environment constraint governing every fixture in this repository requires a clean skip over
@@ -534,7 +586,7 @@ def test_retrievable_predicate_holds_against_a_real_database(pg: str) -> None:
             with pool.connection() as conn:
                 create_project_partitions(conn, project_id)
         except psycopg.errors.UndefinedObject as exc:
-            pytest.skip(f"pgvector/pg_textsearch access method unavailable: {exc}")
+            pytest.skip(f"pgvector/vchord_bm25 access method unavailable: {exc}")
         except Exception as exc:  # pragma: no cover - environment-dependent
             pytest.skip(f"could not provision a test project: {exc.__class__.__name__}")
 
@@ -601,11 +653,8 @@ def test_retrievable_predicate_holds_against_a_real_database(pg: str) -> None:
         _insert("retry budget note", status=Status.QUARANTINED, tier=TrustTier.B)
         _insert("retry budget note", status=Status.TOMBSTONED, tier=TrustTier.B)
 
-        try:
-            search = SearchStore(pool)
-            hits = search.lexical_arm(project_id, "retry budget", 10)
-        except psycopg.errors.UndefinedFunction as exc:
-            pytest.skip(f"pg_textsearch bm25_score()/@@@ unavailable: {exc}")
+        search = SearchStore(pool)
+        hits = search.lexical_arm(project_id, "retry budget", 10)
 
         returned_ids = {hit.memory_id for hit in hits}
         assert returned_ids <= {validated_id, candidate_a_id}
@@ -615,3 +664,105 @@ def test_retrievable_predicate_holds_against_a_real_database(pg: str) -> None:
         assert corpus == 2
     finally:
         pool.close()
+
+
+@pytest.mark.integration
+def test_lexical_arm_writes_and_ranks_under_the_app_role(pg: str) -> None:
+    """Stage 2 (D-140) under the role production actually runs as. The `pg` fixture is the
+    tracebed_owner (SUPERUSER/BYPASSRLS) DSN, so it silently bypasses BOTH the
+    bm25_catalog/tokenizer_catalog schema ACLs AND RLS -- which is exactly why the un-skipped
+    lexical tests above passed while the feature was in fact broken for the app role. This test
+    drives the WRITE path (repo.insert_memory_item, which tokenizes content into content_bm25) and
+    the READ path (lexical_arm, which tokenizes the query and calls to_bm25query) through a
+    tracebed_app (NOBYPASSRLS) connection, and asserts BM25 actually RANKS: a clearly-relevant row
+    above a clearly-irrelevant one, with a finite, non-negative raw_score. A missing schema grant
+    (InsufficientPrivilege) or a dropped score negation (every score clamped to 0) fails here rather
+    than only in a real deployment."""
+    import math
+    import os
+
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+
+    from tracebed.core.scans import ScanContext, scan
+    from tracebed.domain.clock import FakeClock
+    from tracebed.domain.enums import Lane, MemType, ProvenanceClass, ScopeType
+    from tracebed.domain.ids import mint_run_id
+    from tracebed.domain.memory import NewMemoryItem, Provenance
+    from tracebed.stores.pg.migrate import apply_migrations
+    from tracebed.stores.pg.partitions import create_project_partitions
+    from tracebed.stores.pg.pool import create_pool
+    from tracebed.stores.pg.repo import Repo
+
+    try:
+        apply_migrations(pg)
+    except Exception as exc:
+        pytest.skip(f"could not bring the schema current: {exc.__class__.__name__}")
+
+    owner_pool = create_pool(pg)
+    app_dsn = make_conninfo(
+        pg, user="tracebed_app", password=os.environ.get("TB_APP_ROLE_PASSWORD", "tracebed_app_dev")
+    )
+    try:
+        app_pool = create_pool(app_dsn)
+    except Exception as exc:  # pragma: no cover - environment-dependent
+        owner_pool.close()
+        pytest.skip(f"tracebed_app role unreachable: {exc.__class__.__name__}")
+
+    try:
+        project_id = ProjectId(uuid.uuid4())
+        try:
+            with owner_pool.connection() as conn:  # partitions are DDL: owner only
+                create_project_partitions(conn, project_id)
+        except psycopg.errors.UndefinedObject as exc:
+            pytest.skip(f"pgvector/vchord_bm25 access method unavailable: {exc}")
+        except Exception as exc:  # pragma: no cover - environment-dependent
+            pytest.skip(f"could not provision a test project: {exc.__class__.__name__}")
+
+        run_id = mint_run_id()
+
+        def _insert_via(pool: Any, content: str) -> MemoryId:
+            # Candidate Tier-A is retrievable, so both rows reach the arm. The insert runs under
+            # `pool`'s role -- as tracebed_app it exercises the write-path tokenize()::bm25vector.
+            item = NewMemoryItem(
+                scope_type=ScopeType.PROJECT_SHARED,
+                scope_id=None,
+                mem_type=MemType.LESSON,
+                kind="k",
+                lane=Lane.OPERATIONAL,
+                trust_tier=TrustTier.A,
+                status=Status.CANDIDATE,
+                content=content,
+                token_count=len(content.split()),
+                provenance=Provenance(cls=ProvenanceClass.PARSER, trace_ids=(run_id,)),
+            )
+            verdict = scan(
+                content,
+                context=ScanContext(
+                    project_id=project_id,
+                    mem_type=item.mem_type,
+                    trust_tier=item.trust_tier,
+                    provenance_class=item.provenance.cls,
+                    lane=Lane.OPERATIONAL,
+                ),
+            ).verdict()
+            return Repo(pool, FakeClock()).insert_memory_item(project_id, item, verdict)
+
+        relevant = _insert_via(
+            app_pool, "jittered exponential backoff retry strategy for the flaky tool"
+        )
+        _insert_via(app_pool, "the weather forecast predicts sunshine over the coastal meadow")
+
+        # Read path under the app role; top_n=1 forces the ranker to return only its single best row.
+        hits = SearchStore(app_pool).lexical_arm(project_id, "retry backoff strategy", 1)
+
+        assert hits, "lexical arm returned nothing under the app role"
+        assert hits[0].memory_id == relevant, "BM25 did not rank the relevant row first"
+        for hit in hits:
+            assert math.isfinite(hit.raw_score) and hit.raw_score >= 0.0, (
+                f"raw_score must be finite and non-negative, got {hit.raw_score!r}"
+            )
+        assert hits[0].raw_score > 0.0, "the matching row must score strictly above the 0.0 floor"
+    finally:
+        app_pool.close()
+        owner_pool.close()

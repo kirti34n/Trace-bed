@@ -397,7 +397,10 @@ class TestExportColumnListMatchesRealSchema:
         assert not (_declared_columns(table) & _EXPORT_EXCLUDED_COLUMNS[table])
 
     def test_raw_embedding_and_lexemes_are_the_excluded_memory_item_columns(self) -> None:
-        assert _EXPORT_EXCLUDED_COLUMNS["memory_item"] == {"embedding", "lexemes"}
+        # `content_bm25` (vchord_bm25 bm25vector, migrations/0005_bm25.sql, D-140) joins
+        # `embedding`/`lexemes` in the withheld set for the same reason: no psycopg loader and
+        # nothing an NDJSON export should carry as text.
+        assert _EXPORT_EXCLUDED_COLUMNS["memory_item"] == {"embedding", "lexemes", "content_bm25"}
 
     def test_all_three_export_constants_have_the_same_keys(self) -> None:
         assert set(_EXPORT_COLUMNS) == set(_EXPORT_TABLES)

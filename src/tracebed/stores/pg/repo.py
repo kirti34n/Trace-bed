@@ -80,6 +80,7 @@ from tracebed.domain.scan import ScanVerdict
 from tracebed.domain.scope import ProjectScope
 from tracebed.domain.signatures import ABSENT_SIGNATURE, is_absent_signature
 from tracebed.domain.state_machine import Status, assert_legal_creation_status
+from tracebed.stores.pg.ddl import LEXICAL_TOKENIZER
 from tracebed.stores.pg.pool import _unscoped, scoped
 from tracebed.stores.pg.rows import (
     InjectionRow,
@@ -361,6 +362,38 @@ _MEMORY_ITEM_COLUMNS: Final[str] = (
     "created_at, status_changed_at"
 )
 
+# The `memory_item` write path (STAGE 2, D-140). `lexemes` and `content_bm25` are computed
+# in-SQL from the already-bound `%(content)s` (psycopg allows reusing a named param), so neither
+# is a bind key and the params dict `_impl_insert_memory_item` builds is unchanged. The tokenizer
+# name is substituted from `stores.pg.ddl.LEXICAL_TOKENIZER` (one source of truth with the read
+# path and migrations/0005_bm25.sql) via the same `@`-placeholder idiom as `_TRACE_INDEX_UPSERT_SQL`
+# above — an f-string here would trip ruff S608 even though every substituted value is a fixed
+# constant, never caller data. `tokenizer_catalog.tokenize(...)::bm25_catalog.bm25vector` resolves
+# under the default search_path (verified), so the write path needs no search_path change.
+_INSERT_MEMORY_ITEM_TEMPLATE: Final[str] = """
+INSERT INTO memory_item (
+    id, project_id, scope_type, scope_id, mem_type, kind, lane, trust_tier, status,
+    content, content_hash, token_count, subject_tag, q_value, confidence,
+    scored_use_count, strike_count, cluster_id, ttl_class, pinned, valid_from,
+    valid_to, created_at, status_changed_at, provenance, scan_verdict_id,
+    schema_version, lexemes, content_bm25
+) VALUES (
+    %(id)s, %(project_id)s, %(scope_type)s, %(scope_id)s, %(mem_type)s, %(kind)s,
+    %(lane)s, %(trust_tier)s, %(status)s, %(content)s, %(content_hash)s,
+    %(token_count)s, %(subject_tag)s, %(q_value)s, %(confidence)s,
+    %(scored_use_count)s, %(strike_count)s, %(cluster_id)s, %(ttl_class)s,
+    %(pinned)s, %(valid_from)s, %(valid_to)s, %(created_at)s, %(status_changed_at)s,
+    %(provenance)s, %(scan_verdict_id)s, %(schema_version)s,
+    to_tsvector('english', %(content)s),
+    tokenizer_catalog.tokenize(%(content)s, '@TOKENIZER@')::bm25_catalog.bm25vector
+)
+""".strip()
+_INSERT_MEMORY_ITEM_SQL: Final[str] = _INSERT_MEMORY_ITEM_TEMPLATE.replace(
+    "@TOKENIZER@", LEXICAL_TOKENIZER
+)
+if "@" in _INSERT_MEMORY_ITEM_SQL:  # pragma: no cover - import-time structural guard
+    raise RuntimeError("insert_memory_item template has an unsubstituted placeholder")
+
 # `trace_index`'s export list is the same projection the upsert already writes
 # (`_TRACE_INDEX_COLUMNS` above -- deliberately reused, not duplicated, since it is already every
 # column the table has and a second hand-typed copy is exactly the drift this fix removes).
@@ -389,7 +422,7 @@ _EXPORT_COLUMNS: Final[Mapping[str, str]] = {
 # (`shadow_confirm_runs`, `pinned`, `ttl_class`, ...) precisely because "this project's data" for
 # an export means more than "what a retrieval-path row needs".
 _EXPORT_EXCLUDED_COLUMNS: Final[Mapping[str, frozenset[str]]] = {
-    "memory_item": frozenset({"embedding", "lexemes"}),
+    "memory_item": frozenset({"embedding", "lexemes", "content_bm25"}),
     "trace_index": frozenset(),
     "outcome_event": frozenset(),
     "injection_log": frozenset(),
@@ -887,22 +920,7 @@ class Repo:
         memory_id = item.id if item.id is not None else mint_memory_id()
         now = self._clock.now()
         conn.execute(
-            """
-            INSERT INTO memory_item (
-                id, project_id, scope_type, scope_id, mem_type, kind, lane, trust_tier, status,
-                content, content_hash, token_count, subject_tag, q_value, confidence,
-                scored_use_count, strike_count, cluster_id, ttl_class, pinned, valid_from,
-                valid_to, created_at, status_changed_at, provenance, scan_verdict_id,
-                schema_version
-            ) VALUES (
-                %(id)s, %(project_id)s, %(scope_type)s, %(scope_id)s, %(mem_type)s, %(kind)s,
-                %(lane)s, %(trust_tier)s, %(status)s, %(content)s, %(content_hash)s,
-                %(token_count)s, %(subject_tag)s, %(q_value)s, %(confidence)s,
-                %(scored_use_count)s, %(strike_count)s, %(cluster_id)s, %(ttl_class)s,
-                %(pinned)s, %(valid_from)s, %(valid_to)s, %(created_at)s, %(status_changed_at)s,
-                %(provenance)s, %(scan_verdict_id)s, %(schema_version)s
-            )
-            """,
+            _INSERT_MEMORY_ITEM_SQL,
             {
                 "id": memory_id,
                 "project_id": project_id,

@@ -100,13 +100,20 @@ class TestMigrationPairExists:
         assert first_line.strip() == "-- depends: 0003_rls"
 
     def test_yoyo_can_load_every_migration_including_lifecycle(self) -> None:
-        """The loader-level proof for this file's own CONTRACT GAP note above: four ids,
-        dependency-ordered, `0004_lifecycle` last. `test_migrations.py`'s hardcoded 3-tuple
-        assertion is what needs a one-line update elsewhere; this is not that test."""
+        """The loader-level proof for this file's own CONTRACT GAP note above: the tree loads
+        dependency-ordered with `0004_lifecycle` after `0003_rls` (Stage 2's `0005_bm25` then
+        follows it, D-140). `test_migrations.py`'s hardcoded `MIGRATION_IDS` tuple is what needs
+        the per-migration update elsewhere; this is not that test."""
         from tracebed.stores.pg.migrate import read_all_migrations
 
         ids = [m.id for m in read_all_migrations()]
-        assert ids == ["0001_registries", "0002_partitioned", "0003_rls", "0004_lifecycle"]
+        assert ids == [
+            "0001_registries",
+            "0002_partitioned",
+            "0003_rls",
+            "0004_lifecycle",
+            "0005_bm25",
+        ]
 
     def test_rollback_has_no_more_statements_than_the_migration(self) -> None:
         """Same proving mechanism as `test_migrations.py`'s companion test: yoyo pairs

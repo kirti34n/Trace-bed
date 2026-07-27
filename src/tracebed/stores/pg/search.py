@@ -80,17 +80,27 @@ are `fact`/`exemplar`/`pitfall`/`candidate_note`/`jit_lesson`/`static_prefix` �
 builder). Including it here would hand the fusion/assembler layer rows with no slot to place them
 in. Logged as a decision (DECISIONS.md), not silently assumed.
 
-CONTRACT GAP (reported, not silently guessed): neither PLAN.md nor PHASE0-CONTRACT.md specifies
-`pg_textsearch`'s actual SQL surface — its match operator, its scoring function, or its DF/IDF
-accessor. The migration (`stores/pg/ddl.py`) fixes only the index access method name
-(`USING bm25 (content) WITH (text_config='english')`); everything past that is this chunk's
-inference, chosen to be internally consistent with that access-method name and stated as a
-decision entry (DECISIONS.md) rather than invented silently:
+BM25 RANKING SURFACE (STAGE 2, D-140 — supersedes D-050's inferred pg_textsearch surface, which
+was a phantom that never existed on the pinned image). Ranking is `vchord_bm25` 0.3.0 over the
+`memory_item.content_bm25 bm25vector` column, indexed per-partition by `stores/pg/ddl.py`'s `bm25`
+access-method spec (`USING bm25 (content_bm25 bm25_catalog.bm25_ops)`):
 
-  * Match predicate: `content @@@ %(query)s` (the `@@@` operator, mirroring the established
-    match-operator convention for BM25-style Postgres extensions).
-  * Score function: `bm25_score(content, query) -> double precision` — the raw, unbounded BM25
-    relevance value (D-003: NOT `ts_rank`), named after the index's own access-method (`bm25`).
+  * Scoring: `content_bm25 <&> bm25_catalog.to_bm25query(<partition_index>::regclass,
+    tokenize(query))`. The `<&>` operator returns a NEGATIVE real for a match (best = most
+    negative) and `-0.0` for a non-match, so the arm reports `GREATEST(0.0::real, -(<&>))` — a
+    finite, non-negative, higher-is-better `raw_score` (abstention refuses NaN/negative). There is
+    NO boolean match operator in vchord_bm25 0.3.0, so the arm is top-k-by-score (`ORDER BY
+    <&> LIMIT top_n`, guarded by `content_bm25 IS NOT NULL`), structurally parallel to the ANN arm;
+    abstention is the quality filter (a 0-score non-match saturates below threshold).
+  * `to_bm25query` binds the PER-PARTITION index regclass (the parent partitioned index is
+    storage-less and errors at query time), carrying that project's own IDF statistics.
+  * to_bm25query references `bm25vector` UNQUALIFIED internally, so `lexical_arm` issues a
+    transaction-scoped `SET LOCAL search_path` (`_LEXICAL_SEARCH_PATH_SQL`) putting `bm25_catalog`
+    on the path before its SELECT.
+  * Rarity-gate document frequency (`document_frequency` below) stays OFF the ranking surface: it
+    counts `m.lexemes @@ plainto_tsquery('english', term)` on the existing tsvector column (backed
+    by the per-partition `gin (lexemes)` index) — an exact DF, which is what the gate needs (D-003
+    rejected ts_rank's *ranking*, not tsvector *matching*).
 
 Every function here is read-only and takes a `ProjectId` positionally with no default, exactly
 like every other partitioned-table access in this codebase (contract §5.0) — obtained exclusively
@@ -130,6 +140,11 @@ from tracebed.domain.errors import TracebedError
 from tracebed.domain.ids import MemoryId, ProjectId
 from tracebed.domain.state_machine import Status
 from tracebed.domain.visibility import RunVisibility
+from tracebed.stores.pg.ddl import (
+    LEXICAL_TOKENIZER,
+    MEMORY_ITEM_BM25_INDEX_SUFFIX,
+    partition_index_name,
+)
 from tracebed.stores.pg.pool import scoped
 
 __all__ = [
@@ -286,20 +301,32 @@ def _without_scope(template: str) -> str:
 # substitution actually happened rather than silently leaving the placeholder token in the SQL
 # psycopg executes.
 _LEXICAL_ARM_TEMPLATE: Final[str] = """
-SELECT id, trust_tier, status, bm25_score(content, %(query)s) AS raw_score
-FROM memory_item
-WHERE project_id = %(project_id)s
-  AND content @@@ %(query)s
-  AND @RETRIEVABLE@
-  AND @SCOPE@
+SELECT id, trust_tier, status, GREATEST(0.0::real, -(bm25_distance)) AS raw_score
+FROM (
+    SELECT id, trust_tier, status,
+           content_bm25 <&> bm25_catalog.to_bm25query(
+               %(bm25_index)s::regclass,
+               tokenizer_catalog.tokenize(%(query)s, '@TOKENIZER@')::bm25_catalog.bm25vector
+           ) AS bm25_distance
+    FROM memory_item
+    WHERE project_id = %(project_id)s
+      AND content_bm25 IS NOT NULL
+      AND @RETRIEVABLE@
+      AND @SCOPE@
+    ORDER BY bm25_distance
+    LIMIT %(top_n)s
+) AS ranked
 ORDER BY raw_score DESC
-LIMIT %(top_n)s
 """.strip()
-_LEXICAL_ARM_SQL: Final[str] = _without_scope(_LEXICAL_ARM_TEMPLATE).replace(
-    "@RETRIEVABLE@", _RETRIEVABLE_PREDICATE
+_LEXICAL_ARM_SQL: Final[str] = (
+    _without_scope(_LEXICAL_ARM_TEMPLATE)
+    .replace("@RETRIEVABLE@", _RETRIEVABLE_PREDICATE)
+    .replace("@TOKENIZER@", LEXICAL_TOKENIZER)
 )
-_LEXICAL_ARM_SCOPED_SQL: Final[str] = _with_scope(_LEXICAL_ARM_TEMPLATE).replace(
-    "@RETRIEVABLE@", _RETRIEVABLE_PREDICATE
+_LEXICAL_ARM_SCOPED_SQL: Final[str] = (
+    _with_scope(_LEXICAL_ARM_TEMPLATE)
+    .replace("@RETRIEVABLE@", _RETRIEVABLE_PREDICATE)
+    .replace("@TOKENIZER@", LEXICAL_TOKENIZER)
 )
 
 # `hnsw.iterative_scan` / `hnsw.max_scan_tuples` are pgvector session GUCs (filtered-ANN recall
@@ -329,12 +356,30 @@ _VECTOR_ARM_SQL: Final[str] = _VECTOR_ARM_TEMPLATE.replace(
     "@RETRIEVABLE@", _RETRIEVABLE_PREDICATE
 )
 
+# A raw query term is matched against `lexemes` via `plainto_tsquery('english', term)`. For an
+# English STOPWORD that query is EMPTY and matches zero rows, so a naive COUNT would report df=0 —
+# and the abstention rarity gate reads df=0 as "0% of the corpus = maximally rare". The corpus's
+# commonest words would then be its rarest, and two shared stopwords alone would clear
+# `rarity_min_shared_terms`, nullifying the one gate that stops a generic query matching generic
+# memory (hotpath.abstention). So a term whose tsquery is empty is reported at the FULL retrievable
+# corpus count (its true df is ~100%), which reads as common, not rare. Non-stopword terms keep the
+# real per-term match count.
 _DOCUMENT_FREQUENCY_TEMPLATE: Final[str] = """
-SELECT t.term AS term, COUNT(m.id) AS df
+WITH corpus AS (
+    SELECT COUNT(*) AS n
+    FROM memory_item m
+    WHERE m.project_id = %(project_id)s
+      AND (@RETRIEVABLE_M@)
+)
+SELECT t.term AS term,
+       CASE
+           WHEN plainto_tsquery('english', t.term)::text = '' THEN (SELECT n FROM corpus)
+           ELSE COUNT(m.id)
+       END AS df
 FROM unnest(%(terms)s::text[]) AS t(term)
 LEFT JOIN memory_item m
   ON m.project_id = %(project_id)s
- AND m.content @@@ t.term
+ AND m.lexemes @@ plainto_tsquery('english', t.term)
  AND (@RETRIEVABLE_M@)
 GROUP BY t.term
 """.strip()
@@ -388,6 +433,22 @@ if _SCOPE_PREDICATE not in _LEXICAL_ARM_SCOPED_SQL:  # pragma: no cover - import
         "the scoped lexical statement lost its scope conjunct; it would be indistinguishable "
         "from the unscoped one while its caller believes a visibility was applied"
     )
+
+if any("@TOKENIZER@" in sql for sql in _ALL_STATEMENTS):  # pragma: no cover - import-time guard
+    raise RuntimeError(
+        "a lexical template has an unsubstituted @TOKENIZER@ placeholder; tokenize() would be "
+        "called with a literal token instead of the configured tokenizer name"
+    )
+
+# vchord_bm25's to_bm25query() references the `bm25vector` type UNQUALIFIED internally, so the
+# read path needs bm25_catalog on search_path even though every call this module writes is fully
+# qualified. Transaction-scoped SET LOCAL (reverts at COMMIT/ROLLBACK, never leaks onto a pooled
+# connection) issued right after scoped()'s RLS GUC — the same pre-statement idiom vector_arm uses
+# for its HNSW GUCs. public stays ahead of the extension schemas so app-table resolution is
+# unchanged; the `<&>` operator itself lives in pg_catalog and needs nothing.
+_LEXICAL_SEARCH_PATH_SQL: Final[str] = (
+    "SET LOCAL search_path = pg_catalog, public, bm25_catalog, tokenizer_catalog"
+)
 
 
 def _retrievability_params() -> dict[str, object]:
@@ -563,13 +624,15 @@ class SearchStore:
         visibility: RunVisibility | None = None,
         statement_timeout_ms: int | None = None,
     ) -> list[ArmHit]:
-        """True BM25 via `pg_textsearch` (D-003) — never `ts_rank`, which the audit measured at
-        nDCG@10 0.07 on BEIR SciFact against BM25's 0.69, and which exposes no IDF for the
-        rarity gate (`document_frequency` below) to read.
+        """True BM25 via `vchord_bm25` (D-003, D-140) — never `ts_rank`, which the audit measured
+        at nDCG@10 0.07 on BEIR SciFact against BM25's 0.69. Ranks the per-partition
+        `content_bm25 bm25vector` column with `content_bm25 <&> to_bm25query(<partition_index>,
+        tokenize(query))`, top-k by score (module docstring's BM25 RANKING SURFACE section); the
+        raw `<&>` distance is negated and clamped to a finite non-negative `raw_score`.
 
         An empty/whitespace-only query or a non-positive `top_n` returns `[]` without issuing a
-        statement — `content @@@ ''` is not a query pg_textsearch's match operator can score, and
-        "return nothing" is the correct, cheaper answer to "asked for nothing."
+        statement — an empty query tokenizes to an empty `bm25vector`, and "return nothing" is the
+        correct, cheaper answer to "asked for nothing" (no statement, not even the SET LOCAL).
 
         `visibility`, when supplied, narrows the SQL itself to exactly the rows
         `domain.visibility.scope_visible` would accept for that run (module docstring's DEFENCE IN
@@ -595,6 +658,9 @@ class SearchStore:
             "project_id": project_id,
             "query": query,
             "top_n": _bounded_top_n(top_n),
+            "bm25_index": partition_index_name(
+                "memory_item", project_id, MEMORY_ITEM_BM25_INDEX_SUFFIX
+            ),
             **_retrievability_params(),
         }
         if visibility is None:
@@ -606,6 +672,7 @@ class SearchStore:
             scoped(self._pool, project_id, statement_timeout_ms=statement_timeout_ms) as conn,
             conn.cursor(row_factory=dict_row) as cur,
         ):
+            cur.execute(_LEXICAL_SEARCH_PATH_SQL)
             cur.execute(sql, params)
             rows = cur.fetchall()
         return [_row_to_arm_hit(r) for r in rows]
@@ -700,8 +767,11 @@ class SearchStore:
 
     def document_frequency(self, project_id: ProjectId, terms: Sequence[str]) -> dict[str, int]:
         """Per-term document frequency among retrievable rows — the IDF source the rarity gate
-        needs (`hotpath.abstention.RarityEvidence`, D-003: this is exactly the computation
-        `ts_rank` cannot provide).
+        needs (`hotpath.abstention.RarityEvidence`, D-003/D-140). Counted off the `lexemes`
+        tsvector (`m.lexemes @@ plainto_tsquery('english', term)`), not the vchord_bm25 ranking
+        surface, because vchord_bm25 0.3.0 exposes no df/idf accessor and an exact DF is exactly
+        the quantity the gate reads. `plainto_tsquery` (not `to_tsquery`) sanitizes the
+        caller-derived term and applies the same 'english' stemming `lexemes` was built with.
 
         A `LEFT JOIN` against `unnest(terms)` rather than one query per term: a term with zero
         matches must report `0`, not be silently absent from the result — the rarity gate reads

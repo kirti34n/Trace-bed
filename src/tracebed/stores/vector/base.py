@@ -13,7 +13,7 @@ port — swapping a driver in for real needs a constructor change in `hotpath/re
 outside this chunk's file list. This port is the compile-tested interface PLAN.md §7 asks for;
 it is not yet the type the hot path depends on.
 
-Deliberately NOT included: `lexical_arm` (BM25 via `pg_textsearch` has no Qdrant/AGE analogue),
+Deliberately NOT included: `lexical_arm` (BM25 via `vchord_bm25` has no Qdrant/AGE analogue),
 `document_frequency`/`corpus_size` (the rarity gate's IDF source is Postgres-native), and
 `fetch_candidates` (content/score columns live in `memory_item` regardless of which store
 indexes the embedding). Widening this port to cover those would be exactly the "aspirational

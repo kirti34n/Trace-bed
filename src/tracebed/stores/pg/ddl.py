@@ -3,7 +3,7 @@
 The single source of truth for what must exist on every per-project
 partition of every LIST-partitioned table: the partition itself, its
 row-level-security setup, its grants, and its indexes (HNSW halfvec_cosine_ops
-ANN on `memory_item.embedding`, pg_textsearch BM25 on `memory_item.content`,
+ANN on `memory_item.embedding`, vchord_bm25 BM25 on `memory_item.content_bm25`,
 btree on hot lookup keys). `stores.pg.partitions.create_project_partitions`
 and `ensure_schema_current` both call these functions instead of embedding
 their own SQL, so a partition created after a migration landed cannot drift
@@ -26,14 +26,18 @@ for an object that exists).
 from __future__ import annotations
 
 import re
+from typing import Final
 from uuid import UUID
 
 from tracebed.domain.ids import ProjectId
 
 __all__ = [
+    "LEXICAL_TOKENIZER",
+    "MEMORY_ITEM_BM25_INDEX_SUFFIX",
     "PARTITIONED_TABLES",
     "create_partition_sql",
     "partition_grant_statements",
+    "partition_index_name",
     "partition_index_statements",
     "partition_name",
     "partition_policy_name",
@@ -161,6 +165,13 @@ def partition_policy_name(table: str, project_id: ProjectId) -> str:
     return _checked_ident(f"{partition_name(table, project_id)}_isolation")
 
 
+def partition_index_name(table: str, project_id: ProjectId, suffix: str) -> str:
+    """The exact index name `partition_index_statements` builds for `(table, suffix)` — exposed
+    so `stores.pg.search` resolves a partition's vchord_bm25 index regclass for `to_bm25query`
+    without re-deriving the spelling (single source of truth with the CREATE INDEX above)."""
+    return _checked_ident(f"{partition_name(table, project_id)}_{suffix}")
+
+
 def create_partition_sql(table: str, project_id: ProjectId) -> str:
     """`CREATE TABLE ... PARTITION OF ... FOR VALUES IN (...)` for `table`.
 
@@ -212,6 +223,14 @@ def partition_grant_statements(table: str, project_id: ProjectId) -> list[str]:
     return [f"GRANT SELECT, INSERT, UPDATE, DELETE ON {name} TO {_APP_ROLE}"]
 
 
+# The pg_tokenizer tokenizer migrations/0005_bm25.sql creates; the single source of truth for
+# its name, referenced by the write path (stores.pg.repo) and the read path (stores.pg.search).
+LEXICAL_TOKENIZER: Final[str] = "tracebed_lexical"
+
+# Suffix of the per-partition vchord_bm25 ranking index; shared by the CREATE INDEX below and
+# stores.pg.search's to_bm25query index-regclass resolution so the two cannot drift.
+MEMORY_ITEM_BM25_INDEX_SUFFIX: Final[str] = "bm25"
+
 # (index-name suffix, index definition after `ON <partition>`) per table.
 # Suffixes are kept short deliberately: `partition_name` already spends
 # 32 characters on the project uuid, and `_checked_ident` refuses anything
@@ -220,13 +239,16 @@ _INDEX_SPECS: dict[str, tuple[tuple[str, str], ...]] = {
     "memory_item": (
         ("hnsw", "USING hnsw (embedding halfvec_cosine_ops)"),
         # Rarity-gate document-frequency source: GIN over the `lexemes` tsvector supports the
-        # `lexemes @@ to_tsquery(...)` counting in search.document_frequency — an EXACT document
-        # frequency, which is the quantity the abstention rarity gate reads (D-003 rejected
-        # ts_rank's *ranking*, not tsvector *matching*). The true BM25 *ranking* index —
-        # vchord_bm25 over a `content_bm25 bm25vector` column — is added alongside that column
-        # (STAGE 2). This replaced the phantom `USING bm25 (content) WITH (text_config='english')`:
-        # pg_textsearch never existed, and vchord_bm25's `bm25` access method rejects `text_config`.
+        # `lexemes @@ plainto_tsquery(...)` counting in search.document_frequency — an EXACT
+        # document frequency, which is the quantity the abstention rarity gate reads (D-003
+        # rejected ts_rank's *ranking*, not tsvector *matching*).
         ("lex", "USING gin (lexemes)"),
+        # The true BM25 *ranking* index (STAGE 2, D-140): vchord_bm25's `bm25` access method over
+        # the `content_bm25 bm25vector` column migrations/0005_bm25.sql adds. Per-partition only,
+        # exactly like HNSW — to_bm25query reads THIS index's own per-project IDF statistics, and
+        # the storage-less partitioned PARENT index errors at query time (UndefinedFile). The
+        # opclass is schema-qualified so the CREATE INDEX resolves under the default search_path.
+        (MEMORY_ITEM_BM25_INDEX_SUFFIX, "USING bm25 (content_bm25 bm25_catalog.bm25_ops)"),
         ("status", "(status)"),
         ("subject", "(subject_tag)"),
         ("verdict", "(scan_verdict_id)"),
@@ -251,7 +273,7 @@ def partition_index_statements(table: str, project_id: ProjectId) -> list[str]:
     """Per-partition indexes for `table`'s partition of `project_id`.
 
     `memory_item` gets the HNSW `halfvec_cosine_ops` ANN index (pgvector) and
-    the pg_textsearch BM25 index (both PLAN.md §5's "retrieval quality" half
+    the vchord_bm25 BM25 index (both PLAN.md §5's "retrieval quality" half
     of invariant 4) plus btree on its hot filter columns; every other
     partitioned table gets a btree on the column its Repo builders filter or
     join on most (contract §5.1's builder list). Idempotent throughout

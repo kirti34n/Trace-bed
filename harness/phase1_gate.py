@@ -447,11 +447,13 @@ _KNOWN_GAPS: tuple[str, ...] = (
     "The whole hot path is proven end to end OFFLINE only "
     "(tests/phase1/test_hotpath_end_to_end.py drives HTTP -> auth -> scope -> pipeline -> "
     "retriever -> arms -> fusion -> assembly -> abstention -> assembler -> renderer -> "
-    "response with the SearchStore and the EmbeddingPort faked). The four SQL statements in "
-    "stores/pg/search.py -- including pg_textsearch's `content @@@ q` / `bm25_score(...)` "
-    "surface, which PLAN.md never specified and which remains this codebase's inference -- "
-    "have never executed against a real Postgres. Every retrieval-quality claim is therefore "
-    "unverified end to end.",
+    "response with the SearchStore and the EmbeddingPort faked). The lexical arm's real SQL "
+    "surface (Stage 2, D-140) is now vchord_bm25's `content_bm25 <&> to_bm25query(...)` ranking "
+    "with the rarity-gate document frequency counted off the `lexemes` tsvector "
+    "(`m.lexemes @@ plainto_tsquery('english', term)`), and the integration-marked tests in "
+    "tests/phase1/test_search_sql.py / test_scope_sql_predicate.py execute those statements "
+    "against a real Postgres. Latency-shaped retrieval-quality claims remain unmeasured end to "
+    "end, but the SQL surface itself is no longer inference.",
     "hotpath.assembly issues three store round trips (candidate content, per-term document "
     "frequency, corpus size) that no statement_timeout bounds. hotpath.pipeline REPORTS the "
     "overrun correctly (a third total-budget check after assembly degrades the call to "
