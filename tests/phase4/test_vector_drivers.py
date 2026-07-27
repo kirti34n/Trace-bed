@@ -128,6 +128,7 @@ class _FakeSearchStore:
     def __init__(self, hits: list[ArmHit]) -> None:
         self._hits = hits
         self.calls: list[tuple[ProjectId, Sequence[float], int, bool, int]] = []
+        self.statement_timeouts: list[int | None] = []
 
     def vector_arm(
         self,
@@ -137,8 +138,10 @@ class _FakeSearchStore:
         *,
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
+        statement_timeout_ms: int | None = None,
     ) -> list[ArmHit]:
         self.calls.append((project_id, embedding, top_n, hnsw_iterative_scan, hnsw_max_scan_tuples))
+        self.statement_timeouts.append(statement_timeout_ms)
         return self._hits
 
 
@@ -153,6 +156,29 @@ def test_pgvector_ann_search_delegates_faithfully_to_search_store() -> None:
 
     assert result == hits
     assert fake_search.calls == [(PROJECT_A, [0.1, 0.2, 0.3], 5, True, 20_000)]
+    assert fake_search.statement_timeouts == [None]
+
+
+def test_pgvector_ann_search_forwards_the_server_side_bound_rather_than_dropping_it() -> None:
+    """D-139. The bound is the one thing on this port that can be silently accepted and
+    discarded and leave no trace: the query still runs, still returns, and only the recovery
+    behaviour under a stalled store differs. Qdrant documents exactly that drop as a contract
+    gap; pgvector must not have it, since pgvector is the shipped driver and `SearchStore` is
+    where the `set_config` is actually issued.
+    """
+    fake_search = _FakeSearchStore([])
+    store = PgVectorStore(search=fake_search, pool=MagicMock())  # type: ignore[arg-type]
+
+    store.ann_search(
+        PROJECT_A,
+        [0.1],
+        3,
+        hnsw_iterative_scan=False,
+        hnsw_max_scan_tuples=1,
+        statement_timeout_ms=173,
+    )
+
+    assert fake_search.statement_timeouts == [173]
 
 
 def test_pgvector_ann_search_passes_the_project_it_was_given_not_another() -> None:

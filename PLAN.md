@@ -314,7 +314,7 @@ Statuses: `quarantined, candidate, validated, superseded, stale, retired, archiv
 | ∅ → candidate | Tier A parser output, scan pass, provenance complete |
 | ∅ → quarantined | Tier B (distiller or proposal), scan pass, provenance complete |
 | ∅ → pinned | operator-created preference (provenance class `operator`) |
-| quarantined → candidate | shadow-confirmed: ≥2 distinct runs, distinct principals AND distinct input-signature clusters (1 run for failure lessons); OR verified-human-verdict provenance. `proposal` class: **no skip ever applies** |
+| quarantined → candidate | shadow-confirmed: ≥2 distinct runs, distinct principals AND distinct input-signature clusters (1 run for failure lessons). `proposal` class: **no skip ever applies**. *The "OR verified-human-verdict provenance" alternative this row used to name is NOT implemented and was removed from the guard (D-134, corrected by D-137): the insert door checks status membership and per-class provenance fields but never the creation guard, so a `quarantined` row carrying `human_verdict` provenance is constructible, and the skip was therefore a reachable zero-evidence exit from quarantine rather than the dead code it was first taken for. Restoring it needs an audited operator route with its own authenticated write path — §11.2 gap, not a code deviation.* |
 | quarantined → archived | quarantine TTL (30d) expired |
 | candidate → validated | promotion predicate: ≥`promote_min_outcomes` outcome-consistent observations from ≥2 distinct principals, scan re-pass, no open contradiction |
 | candidate → quarantined | contradiction with weaker provenance, or scan re-flag |
@@ -457,8 +457,8 @@ yet proven against a live stack", never "failed".
 | 3 — Quality lane + learning | yes | **PASS — 9/9** | Clause 2's "no probe reached `validated`" is conditioned by D-085/D-086: all four probes terminate in `archived`, which is not a terminal status. |
 | 4 — Workflow memory + polish | yes | **INCOMPLETE — 6/6 gate clauses PASS** | The only `-m phase4` skip is one pgvector test needing real Postgres. Every tracked clause passed. |
 
-Full CI after the 2026-07-26 remediation pass: `pytest -q` 3,754 passed / 41 skipped / 0 failed; `mypy` clean on
-143 source files; `ruff check src tests harness scripts` clean; `raw_sql_lint`,
+Full CI after the 2026-07-27 BMAD remediation pass (§11's D-129…D-139 block): `pytest -q` 4,276 passed /
+45 skipped / 0 failed; `mypy` clean on 151 source files; `ruff check src tests harness scripts` clean; `raw_sql_lint`,
 `purity_check` (now an allowlist, and `--root` works — D-101), `license_check`,
 `license_check --dependency-audit` (D-104) and `image_check` (D-109) all PASS. The figures
 above superseded a stale line reporting 3,592 passed / 139 mypy files; if you are reading this
@@ -571,11 +571,45 @@ immediately below, once, and in the audit's §12.1 in full.
 * **Two Benjamini-Hochberg implementations** (D-095's residue, D-126's contract gap) —
   `workers/killswitch.py` imports the exact one and defines none.
 
+**Closed by the BMAD remediation pass (2026-07-27), D-129 to D-139.** These are defects the
+head-to-head evaluation in `docs/BMAD-EVALUATION.md` surfaced, not spec gaps; they are listed here
+because §11.2 previously carried three of them as "unenforced rather than unbuilt".
+
+* **Invariant 2 was enforced against exceptions only, never against hangs** — the top BMAD
+  finding. Closed in three layers and, critically, WIRED at every call site (D-132, D-138,
+  D-139): the retriever's arm waits are bounded against one re-derived deadline, its work queue
+  has admission control so a stalled store cannot leak a queue entry per request, and
+  `statement_timeout` now reaches Postgres — derived from `retrieval.total_budget_ms`, issued
+  transaction-scoped by `stores.pg.search`, so it can neither drift from the client-side bound
+  nor leak onto the background plane. `create_pool` also bounds connection establishment and
+  pool checkout from `StorageConfig`, at both `api/main.py` and `workers/runner.py`.
+* **`get_killswitch_overlay` could not see a project-wide kill switch** (D-129). The predicate
+  matched one scope, so a NULL-`agent_type_id` row — the project-wide overlay the migration
+  defines — was invisible to every agent-scoped resolution while the admin surface reported it
+  applied. Either row saying DISABLE now wins; the dashboard folds the same precedence into what
+  it renders (D-139), so a row recorded ENABLED under a project-wide DISABLE no longer reads as
+  "Enabled".
+* **The `trace_index` upsert rewrote the independence evidence** (D-130, D-135). The three
+  identity columns are now pinned — `agent_type_id` and `submitter_principal` first-write-wins,
+  `input_signature_hash` a ONE-WAY sentinel upgrade, because that column has a sentinel and
+  first-write-wins would have pinned a run at `ABSENT_SIGNATURE` whenever the first batch to land
+  carried no `run_start`.
+* **`ABSENT_SIGNATURE` read as maximally independent evidence** (D-131, D-136, D-139). Missing
+  evidence is now excluded where a run becomes evidence, and KEPT where the set exists to refuse
+  evidence — both legs, including the one-identity self-replay the first fix opened.
+* **`/export/project` shipped the embedding vector and tsvector** (D-133, D-137). Every exported
+  table has an explicit column list, and the control asserts the STATEMENT rather than the
+  constant feeding it.
+* **The isolation gate could not fail for the reason it was written** (D-139). It accepted any
+  statement whose params bound `project_id` without checking the SQL used it; five predicate
+  deletions had survived the whole suite. It now requires the placeholder in the statement text,
+  for every `Repo` method, with no allowlist.
+
 **Still open:**
 
 | # | Gap | Evidence | Size |
 |---|---|---|---|
-| M2 | **Half-closed.** A periodic plane now exists — `workers/composition.py` + a `Scheduler` thread in `runner.run()` — but only **3 of 13** periodic workers are schedulable (`embedder`, `gc`, and `corroboration` given a host-supplied candidate source). The other ten are refused BY NAME with the port each is blocked on in `composition.UNSCHEDULED_WORKERS`, and `build_scheduled_jobs` raises rather than returning a shorter list | `workers/composition.py::UNSCHEDULED_WORKERS`; `harness/closed_loop.py` prints it beside its verdict | 3–5 d, and it is entirely M3 |
+| M2 | **Half-closed.** A periodic plane now exists — `workers/composition.py` + a `Scheduler` thread in `runner.run()` — but only **3 of 14** periodic workers are schedulable (`embedder`, `gc`, and `corroboration` given a host-supplied candidate source). The other ELEVEN are refused BY NAME with the port each is blocked on in `composition.UNSCHEDULED_WORKERS`, and `build_scheduled_jobs` raises rather than returning a shorter list | `workers/composition.py::UNSCHEDULED_WORKERS`; `harness/closed_loop.py` prints it beside its verdict | 3–5 d, and it is entirely M3 |
 | M3 | **4 of 10 closed.** `EmbeddingRepoPort`, `CorroborationRepoPort`, `MemoryEditRepoPort`, `ForensicsRepoPort` now have Postgres implementations. Still declared only in the worker that consumes them: `MemoryLifecycleRepoPort`, `ScorerRepoPort`, `ShadowValidatorRepoPort`, `PromotionRepoPort`, `KillswitchStorePort`, `DerivedStateStorePort`, `EpochStorePort` | `stores/pg/learning.py`, `stores/pg/lifecycle.py` for the four; the rest are still worker-local Protocols | 4–6 d |
 | M4 | Four §5 tables have no writer | `memory_link`, `derived_state`, `killswitch_state`, `scoring_epoch` (plus `agent_type_config`) are created, partitioned and RLS-protected and never written. `memory_item.epoch_id` and `memory_status_log.epoch_id` now exist, typed and empty — the column is there, the writer is not | inside M3 |
 | M5 | Static prefix is never delivered | `hotpath/pipeline.py` never consults it on the happy path, `api/main.py` passes no `static_prefix=`, and no class implements `StaticPrefixPort` — so the `timeout_prefix_only` rung returns an empty block and pinned preferences are unreachable | 1–2 d |
@@ -616,6 +650,20 @@ and `killswitch_state` are unpartitioned with no RLS despite §5 printing them u
 partitioned" heading (~1 d); budget dedup compares candidates against each other only, never
 against content already in the caller's context, because no wire field carries it (~1 d); and
 `prefetch_for` is accepted at the API boundary and dropped before it reaches anything (~0.5 d).
+
+Two more joined this list from the BMAD remediation pass, both named where a reader meets them
+rather than only here. **The insert door enforces no creation guard.** `Repo.insert_memory_item`
+runs `assert_legal_creation_status` (status membership) and `validate_provenance` (per-class
+fields) and never `apply(None, status, evidence, limits)`, so every §5 creation-edge guard — Tier,
+`scan_passed`, `provenance_complete`, `operator_created` — is convention at the repository
+boundary rather than mechanism. This is the general form of D-137's human-verdict finding and it
+also covers BMAD's B19 (operator-created `pinned` rows skip the content scan). Closing it needs
+the creation evidence four worker modules assemble, so it is a change to those modules and not to
+`repo.py` alone (~2 d). **The Qdrant driver has no server-side bound.** `QdrantVectorStore
+.ann_search` accepts `statement_timeout_ms` and documents it as unused, because
+`_QdrantClientPort.search` exposes no timeout and this environment cannot exercise Qdrant's HTTP
+API; on that driver the hot path is bounded client-side only, which is the pre-D-139 state.
+pgvector is the shipped default and does forward it (~0.5 d).
 
 ### 11.3 Built but never requested
 

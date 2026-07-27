@@ -112,26 +112,57 @@ function EvidencePanel({ evidence }: { evidence: Record<string, unknown> | null 
 export default function KillSwitch() {
   const query = useKillswitchState();
   const cells = useMemo(() => query.data?.cells ?? [], [query.data]);
-  const disabledCount = cells.filter((c) => c.disabled).length;
+
+  // D-129's precedence, applied HERE because the API returns recorded decisions, one row per
+  // scope, and never the resolved state. `Repo.get_killswitch_overlay` folds a project-wide row
+  // (NULL agent_type_id) together with the agent-type row for the same mem_type by logical OR:
+  // whichever says DISABLE wins, and a narrower ENABLE cannot lift a wider DISABLE. Reading
+  // `row.disabled` alone therefore renders an agent-type row as "Enabled" while the hot path is
+  // injecting nothing for it — the same disagreement between the reported state and the enforced
+  // one that the fail-open predicate D-129 fixed had, only in the safe direction. An operator
+  // whose re-enable appears to work and does not is the failure this avoids.
+  const projectWideDisabled = useMemo(
+    () =>
+      new Set(
+        cells.filter((c) => c.agent_type_id === null && c.disabled).map((c) => c.mem_type),
+      ),
+    [cells],
+  );
+  const isEffectivelyDisabled = (row: KillswitchCellOut) =>
+    row.disabled || projectWideDisabled.has(row.mem_type);
+
+  const disabledCount = cells.filter(isEffectivelyDisabled).length;
+  const overriddenCount = cells.filter(
+    (c) => !c.disabled && projectWideDisabled.has(c.mem_type),
+  ).length;
 
   const columns: ColumnDef<KillswitchCellOut>[] = [
     {
       key: "state",
       header: "State",
-      width: "14ch",
+      width: "18ch",
       // Word first, colour second — an operator with any colour vision reads
-      // "DISABLED" identically.
+      // "DISABLED" identically. Three states, not two: a row can be recorded
+      // enabled and still be disabled in effect, and collapsing that into
+      // "Enabled" is what made this column disagree with the hot path.
       render: (row) =>
         row.disabled ? (
           <span className="inline-flex items-center gap-1.5 rounded-full border border-status-tombstoned-border bg-status-tombstoned-bg px-2 py-0.5 text-xs font-semibold text-status-tombstoned-fg">
             <span aria-hidden="true">■</span> DISABLED
+          </span>
+        ) : projectWideDisabled.has(row.mem_type) ? (
+          <span
+            className="inline-flex items-center gap-1.5 rounded-full border border-status-tombstoned-border bg-status-tombstoned-bg px-2 py-0.5 text-xs font-semibold text-status-tombstoned-fg"
+            title="This row records ENABLED, but a project-wide row disables this memory type. Either row saying DISABLE wins, so nothing of this type is injected. To re-enable, clear the project-wide row."
+          >
+            <span aria-hidden="true">■</span> DISABLED (project-wide)
           </span>
         ) : (
           <span className="inline-flex items-center gap-1.5 rounded-full border border-border-strong px-2 py-0.5 text-xs font-medium text-text-muted">
             <span aria-hidden="true">□</span> Enabled
           </span>
         ),
-      sortValue: (row) => (row.disabled ? 0 : 1),
+      sortValue: (row) => (isEffectivelyDisabled(row) ? 0 : 1),
     },
     {
       key: "scope",
@@ -205,8 +236,18 @@ export default function KillSwitch() {
           {query.status === "success" && (
             <p className="text-sm text-text">
               <span className="font-semibold tabular-nums">{formatInt(disabledCount)}</span> of{" "}
-              {formatInt(cells.length)} recorded cell(s) are currently disabled — memory of that
+              {formatInt(cells.length)} recorded cell(s) are disabled in effect — memory of that
               type is not injected for that agent type until the state changes.
+              {overriddenCount > 0 && (
+                <>
+                  {" "}
+                  <span className="font-semibold tabular-nums">
+                    {formatInt(overriddenCount)}
+                  </span>{" "}
+                  of those record ENABLED and are disabled only because a project-wide row
+                  disables the same memory type; clearing that row is what re-enables them.
+                </>
+              )}
             </p>
           )}
           <Table

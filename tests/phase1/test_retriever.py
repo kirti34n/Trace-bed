@@ -47,7 +47,14 @@ class _FakeSearch:
         self.lexical_calls: list[tuple[ProjectId, str, int]] = []
         self.vector_calls: list[tuple[ProjectId, Sequence[float], int, bool, int]] = []
 
-    def lexical_arm(self, project_id: ProjectId, query: str, top_n: int) -> list[ArmHit]:
+    def lexical_arm(
+        self,
+        project_id: ProjectId,
+        query: str,
+        top_n: int,
+        *,
+        statement_timeout_ms: int | None = None,
+    ) -> list[ArmHit]:
         self.lexical_calls.append((project_id, query, top_n))
         return self._lexical
 
@@ -59,6 +66,7 @@ class _FakeSearch:
         *,
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
+        statement_timeout_ms: int | None = None,
     ) -> list[ArmHit]:
         self.vector_calls.append(
             (project_id, embedding, top_n, hnsw_iterative_scan, hnsw_max_scan_tuples)
@@ -199,7 +207,14 @@ def test_both_arms_run_concurrently() -> None:
     lock = threading.Lock()
 
     class _SynchronizedSearch:
-        def lexical_arm(self, project_id: ProjectId, query: str, top_n: int) -> list[ArmHit]:
+        def lexical_arm(
+            self,
+            project_id: ProjectId,
+            query: str,
+            top_n: int,
+            *,
+            statement_timeout_ms: int | None = None,
+        ) -> list[ArmHit]:
             barrier.wait()
             with lock:
                 order.append("lexical")
@@ -213,6 +228,7 @@ def test_both_arms_run_concurrently() -> None:
             *,
             hnsw_iterative_scan: bool,
             hnsw_max_scan_tuples: int,
+            statement_timeout_ms: int | None = None,
         ) -> list[ArmHit]:
             barrier.wait()
             with lock:
@@ -240,7 +256,14 @@ def test_lexical_arm_starts_before_the_embed_call_returns() -> None:
     lexical_started = threading.Event()
 
     class _SignallingSearch:
-        def lexical_arm(self, project_id: ProjectId, query: str, top_n: int) -> list[ArmHit]:
+        def lexical_arm(
+            self,
+            project_id: ProjectId,
+            query: str,
+            top_n: int,
+            *,
+            statement_timeout_ms: int | None = None,
+        ) -> list[ArmHit]:
             lexical_started.set()
             return []
 
@@ -252,6 +275,7 @@ def test_lexical_arm_starts_before_the_embed_call_returns() -> None:
             *,
             hnsw_iterative_scan: bool,
             hnsw_max_scan_tuples: int,
+            statement_timeout_ms: int | None = None,
         ) -> list[ArmHit]:
             return []
 
@@ -405,7 +429,14 @@ def test_embed_latency_is_measured_from_the_injected_clock() -> None:
 
 def test_concurrent_arms_complete_faster_than_the_sum_of_their_latencies() -> None:
     class _SlowSearch:
-        def lexical_arm(self, project_id: ProjectId, query: str, top_n: int) -> list[ArmHit]:
+        def lexical_arm(
+            self,
+            project_id: ProjectId,
+            query: str,
+            top_n: int,
+            *,
+            statement_timeout_ms: int | None = None,
+        ) -> list[ArmHit]:
             time.sleep(0.05)
             return []
 
@@ -417,6 +448,7 @@ def test_concurrent_arms_complete_faster_than_the_sum_of_their_latencies() -> No
             *,
             hnsw_iterative_scan: bool,
             hnsw_max_scan_tuples: int,
+            statement_timeout_ms: int | None = None,
         ) -> list[ArmHit]:
             time.sleep(0.05)
             return []

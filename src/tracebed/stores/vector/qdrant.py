@@ -357,11 +357,22 @@ class QdrantVectorStore:
         *,
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
+        statement_timeout_ms: int | None = None,
     ) -> list[ArmHit]:
         # Qdrant's own ANN tuning is `hnsw_ef` / exact-search flags, not pgvector's iterative-
         # scan GUCs -- accepted (per VectorStorePort's contract) and deliberately unused here
         # rather than dropped from the signature, so every driver presents one port shape.
-        del hnsw_iterative_scan, hnsw_max_scan_tuples
+        #
+        # CONTRACT GAP (D-139), reported rather than half-implemented: `statement_timeout_ms` is
+        # accepted and UNUSED here too, so on this driver the hot path's server-side bound does
+        # not exist and a stalled Qdrant is bounded only by the retriever's client-side wait --
+        # i.e. exactly the pre-D-139 state, which leaves the arm's worker slot occupied for the
+        # life of the stall. Qdrant's HTTP API does carry a per-request timeout, but
+        # `_QdrantClientPort.search` above does not expose one, and widening that Protocol on the
+        # strength of an API this environment cannot exercise (no Qdrant here) would be a claim
+        # rather than a mechanism. The pgvector driver is the shipped default; this is a gap in
+        # the alternative driver, named where a reader of it will meet it.
+        del hnsw_iterative_scan, hnsw_max_scan_tuples, statement_timeout_ms
         if top_n <= 0 or not embedding:
             return []
         results = self._client.search(

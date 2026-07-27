@@ -133,6 +133,30 @@ class StorageConfig(_StrictModel):
     valkey_url: str = "valkey://localhost:6379/0"
     tracestore: TraceStoreConfig = Field(default_factory=TraceStoreConfig)
 
+    # The two PROCESS-level connection bounds (D-139). They live here, not in `RetrievalConfig`,
+    # because a pool is constructed once per process from `TracebedSettings` while
+    # `EffectiveConfig` is resolved per project per request -- a per-project override of a
+    # process-wide pool would be a knob that silently does nothing, which is the exact defect
+    # D-128 refused to reintroduce for the worker cadences. The per-REQUEST bound that does vary
+    # with the project is `retrieval.total_budget_ms`, and `hotpath.retriever` derives the
+    # server-side `statement_timeout` from it directly rather than from anything here.
+    pg_connect_timeout_s: int = Field(default=5, ge=1)
+    """libpq's own `connect_timeout`: how long ESTABLISHING one physical connection may take.
+    Five seconds because this bounds a TCP handshake plus authentication against a database the
+    process is expected to be co-located with -- long enough that a slow-but-working network is
+    not mistaken for an outage, short enough that a black-holed address surfaces as a startup
+    failure rather than a hang. It is not a query bound and must never be used as one."""
+
+    pg_checkout_timeout_s: float = Field(default=5.0, ge=0.1)
+    """`psycopg_pool.ConnectionPool.timeout`: how long waiting for a FREE pooled connection may
+    take before `PoolTimeout`. The library's default is 30s, which is 100x invariant 2's entire
+    300ms budget -- a saturated pool would blow the budget in the checkout queue, before either
+    of the other two bounds has a statement to measure. Five seconds is deliberately still far
+    above the hot path's own budget: this value also governs the BACKGROUND plane, whose sweeps
+    legitimately queue behind each other, and the hot path is already bounded well inside it by
+    `hotpath.retriever`. Its job is to convert an indefinite wait into a named, countable error,
+    not to be the hot path's budget."""
+
 
 class EmbeddingConfig(_StrictModel):
     """The embedding pin (D-007): model id/version/dim stamped on every row."""

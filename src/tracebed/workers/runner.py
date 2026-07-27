@@ -414,7 +414,15 @@ def run() -> None:
 
     settings = TracebedSettings()
     clock = SystemClock()
-    pool = create_pool(settings.storage.pg_dsn)
+    # D-139, same two process-level bounds as `api/main.py`'s hot-path pool. Deliberately NOT the
+    # per-statement bound: a distiller or scorer sweep legitimately runs far longer than any
+    # retrieval budget, and a `statement_timeout` inherited from the hot path is precisely the
+    # cross-plane leak `stores.pg.pool`'s transaction-scoped `set_config` exists to prevent.
+    pool = create_pool(
+        settings.storage.pg_dsn,
+        connect_timeout_s=settings.storage.pg_connect_timeout_s,
+        checkout_timeout_s=settings.storage.pg_checkout_timeout_s,
+    )
     repo = Repo(pool, clock)
     queue = WorkQueue(pool, clock, settings.queue)
     tracestore = _build_tracestore(settings, clock)

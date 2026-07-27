@@ -368,12 +368,25 @@ def test_failure_lesson_flag_does_not_lower_threshold_for_non_lessons(mem_type: 
         apply(Status.QUARANTINED, Status.CANDIDATE, evidence, LIMITS)
 
 
-def test_quarantined_to_candidate_verified_human_verdict_skips_corroboration() -> None:
+def test_quarantined_to_candidate_verified_human_verdict_no_longer_skips_corroboration() -> None:
+    """The inverse of what this test asserted before D-134/D-137.
+
+    The `provenance_class is HUMAN_VERDICT and has_verified_human_verdict` clause used to
+    return `candidate` here with an empty confirmation tuple. It was removed because it was
+    REACHABLE, not because it was dead: `Repo.insert_memory_item` runs
+    `assert_legal_creation_status` (membership only -- `quarantined` is a member) and
+    `validate_provenance` (HUMAN_VERDICT requires only a `verdict_id`), and never
+    `apply(None, ...)`, so a row with exactly this provenance can be inserted straight into
+    quarantine and `shadow_validator.evaluate_one` derives the flag from it. That is a
+    zero-evidence exit from quarantine, i.e. an invariant-7 bypass. Shadow corroboration is
+    now the only route out; the operator route PLAN.md §5 names is a documented gap.
+    """
     evidence = _evidence(
         provenance_class=ProvenanceClass.HUMAN_VERDICT,
         has_verified_human_verdict=True,
     )
-    assert apply(Status.QUARANTINED, Status.CANDIDATE, evidence, LIMITS) == Status.CANDIDATE
+    with pytest.raises(GuardNotSatisfied):
+        apply(Status.QUARANTINED, Status.CANDIDATE, evidence, LIMITS)
 
 
 def test_quarantined_to_candidate_human_verdict_flag_without_matching_class_rejected() -> None:

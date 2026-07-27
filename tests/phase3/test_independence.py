@@ -54,7 +54,13 @@ def _sig(cluster: int) -> bytes:
     return (b"\x00" * 32) + cluster.to_bytes(8, "big")
 
 
-_CLUSTER_A = 0x0000000000000000
+# NOT 0: `_sig(0)` is `bytes(40)`, which IS `domain.signatures.ABSENT_SIGNATURE`. Since D-131
+# `build_confirmations` drops that value as "no `run_start` was ever recorded" rather than
+# resolving it as ordinary evidence, so a fixture built on it would be testing the sentinel path
+# while claiming to test cluster arithmetic. 1 is one bit from 0 -- well inside
+# `SAME_CLUSTER_MAX_HAMMING`, so every "same cluster" claim this constant backs still holds --
+# and is not the sentinel.
+_CLUSTER_A = 0x0000000000000001
 _CLUSTER_B = 0xFFFFFFFFFFFFFFFF
 
 
@@ -294,20 +300,25 @@ def test_cluster_radius_boundary_is_inclusive_at_max_hamming() -> None:
     one too wide — is invisible: every other fixture in this file sits tens of bits from the
     boundary and would keep passing.
     """
+    # The anchor is the high bit, not 0: `_sig(0)` is `ABSENT_SIGNATURE`, which
+    # `build_confirmations` drops entirely (D-131), so a boundary pair anchored there would
+    # measure the sentinel path instead of the radius. XOR-ing the offsets into a bit no
+    # offset touches preserves both Hamming distances exactly.
+    anchor = 1 << 63
     at_radius = (1 << SAME_CLUSTER_MAX_HAMMING) - 1  # exactly SAME_CLUSTER_MAX_HAMMING bits
     just_outside = (1 << (SAME_CLUSTER_MAX_HAMMING + 1)) - 1  # one more bit
-    assert hamming(0, at_radius) == SAME_CLUSTER_MAX_HAMMING
-    assert hamming(0, just_outside) == SAME_CLUSTER_MAX_HAMMING + 1
+    assert hamming(anchor, anchor | at_radius) == SAME_CLUSTER_MAX_HAMMING
+    assert hamming(anchor, anchor | just_outside) == SAME_CLUSTER_MAX_HAMMING + 1
 
     inside = {
-        _run(1): ConfirmingRun(_run(1), _principal(1), _sig(0)),
-        _run(2): ConfirmingRun(_run(2), _principal(2), _sig(at_radius)),
+        _run(1): ConfirmingRun(_run(1), _principal(1), _sig(anchor)),
+        _run(2): ConfirmingRun(_run(2), _principal(2), _sig(anchor | at_radius)),
     }
     assert count_independent(PROJECT, list(inside.keys()), _FakeLookup(inside)) == 1
 
     outside = {
-        _run(1): ConfirmingRun(_run(1), _principal(1), _sig(0)),
-        _run(2): ConfirmingRun(_run(2), _principal(2), _sig(just_outside)),
+        _run(1): ConfirmingRun(_run(1), _principal(1), _sig(anchor)),
+        _run(2): ConfirmingRun(_run(2), _principal(2), _sig(anchor | just_outside)),
     }
     assert count_independent(PROJECT, list(outside.keys()), _FakeLookup(outside)) == 2
 

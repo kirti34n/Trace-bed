@@ -43,7 +43,11 @@ from tracebed.domain.config import TracebedSettings
 from tracebed.domain.enums import Arm, InstrumentationSource, TraceOutcomeStatus
 from tracebed.domain.errors import NotFound
 from tracebed.domain.ids import AgentTypeId, PrincipalId, ProjectId, RunId, uuid7
-from tracebed.domain.signatures import ABSENT_SIGNATURE, input_signature_hash
+from tracebed.domain.signatures import (
+    ABSENT_SIGNATURE,
+    input_signature_hash,
+    is_absent_signature,
+)
 from tracebed.ingest.trace_writer import (
     MAX_TRACE_SEQ,
     PATH_PAYLOAD_REFS,
@@ -275,12 +279,29 @@ class _FakeScopedTraceRepo:
         merged = TraceIndexRow(
             project_id=self._project_id,
             run_id=row.run_id,
-            agent_type_id=row.agent_type_id,
+            # The three IDENTITY columns, mirroring `repo._TRACE_INDEX_UPSERT_SQL`'s
+            # `DO UPDATE SET` (D-130/D-135). Plain EXCLUDED here for years -- which meant this
+            # fake modelled the defect rather than the statement, and a writer-level test could
+            # not have seen a later batch overwriting the principal or regressing the signature.
+            # `agent_type_id` and `submitter_principal` are first-write-wins: NOT NULL from the
+            # first insert, no sentinel, so the FIRST value is pinned permanently.
+            agent_type_id=existing.agent_type_id if existing else row.agent_type_id,
             workflow_template_id=row.workflow_template_id
             if row.workflow_template_id is not None
             else (existing.workflow_template_id if existing else None),
-            submitter_principal=row.submitter_principal,
-            input_signature_hash=row.input_signature_hash,
+            submitter_principal=(
+                existing.submitter_principal if existing else row.submitter_principal
+            ),
+            # `input_signature_hash` is the asymmetric one: NOT NULL but WITH a sentinel
+            # (`ABSENT_SIGNATURE`), so first-write-wins would pin a run at "no run_start was
+            # recorded" whenever the first batch to land carried no `run_start` -- which
+            # at-least-once, out-of-order delivery makes routine. One-way upgrade instead: the
+            # sentinel may be replaced by a real signature exactly once, a real signature never.
+            input_signature_hash=(
+                row.input_signature_hash
+                if existing is None or is_absent_signature(existing.input_signature_hash)
+                else existing.input_signature_hash
+            ),
             instrumentation_source=row.instrumentation_source,
             # `TraceIndexUpsert` no longer carries an arm: the real upsert derives
             # `trace_index.arm` from `retrieval_event.arm` server-side (PLAN.md §10). This
@@ -730,11 +751,10 @@ def test_input_signature_hash_stable_across_event_reordering(
 def test_run_start_seen_in_later_batch_does_not_erase_earlier_signature(
     settings: TracebedSettings,
 ) -> None:
-    """A batch that does NOT contain this run's run_start must resupply the
-    already-known `input_signature_hash`/`arm` rather than letting them
-    regress to ABSENT_SIGNATURE/default — the upsert's non-COALESCEd
-    columns (contract §5.1) make this the writer's responsibility, not the
-    repo's."""
+    """run_start FIRST, ordinary batch second. The writer resupplies the already-known
+    `input_signature_hash` rather than sending the sentinel, and the merge rule keeps the real
+    signature either way -- this pins the writer's half (D-135 moved the guarantee itself into
+    the SQL, so both halves now have to agree)."""
     h = _harness(settings)
     project_id = ProjectId(uuid7())
     principal_id = PrincipalId(uuid7())
@@ -765,6 +785,115 @@ def test_run_start_seen_in_later_batch_does_not_erase_earlier_signature(
     h.writer.run_once()
 
     assert h.repo.trace_index[(project_id, run_id)].input_signature_hash == sig_after_start
+
+
+def test_a_late_run_start_batch_upgrades_a_row_pinned_at_the_absent_sentinel(
+    settings: TracebedSettings,
+) -> None:
+    """The OTHER ordering, and the one that matters: ordinary batch FIRST, `run_start` second.
+
+    Delivery is at-least-once and out of order, so the first batch persisted for a run is
+    routinely one that carries no `run_start`; the writer has nothing to resupply and correctly
+    writes `ABSENT_SIGNATURE`. Whether the run ever recovers a real signature is then decided
+    entirely by the upsert's merge rule. First-write-wins -- the natural reading of "identity
+    columns are pinned", and what shipped before D-135 -- keeps the non-NULL sentinel forever,
+    at which point `workers.independence.build_confirmations` drops that run from every evidence
+    tuple (D-131) and delivery ORDER alone decides whether a legitimate run can ever corroborate
+    anything. The rule is a one-way upgrade instead, and this is that upgrade end to end through
+    the real `TraceWriter`.
+    """
+    h = _harness(settings)
+    project_id = ProjectId(uuid7())
+    principal_id = PrincipalId(uuid7())
+    agent_type_id = AgentTypeId(uuid7())
+    run_id = RunId(uuid7())
+    ts0 = h.clock.now()
+
+    _enqueue_run(
+        h,
+        project_id=project_id,
+        principal_id=principal_id,
+        agent_type_id=agent_type_id,
+        run_id=run_id,
+        events=[(1, _event("tool_call", ts0 + timedelta(seconds=1), {}))],
+    )
+    h.writer.run_once()
+    assert h.repo.trace_index[(project_id, run_id)].input_signature_hash == ABSENT_SIGNATURE
+
+    _enqueue_run(
+        h,
+        project_id=project_id,
+        principal_id=principal_id,
+        agent_type_id=agent_type_id,
+        run_id=run_id,
+        events=[(0, _event("run_start", ts0, {"query_text": "q1"}))],
+    )
+    h.writer.run_once()
+
+    upgraded = h.repo.trace_index[(project_id, run_id)].input_signature_hash
+    assert upgraded != ABSENT_SIGNATURE
+    assert not is_absent_signature(upgraded)
+
+    # ... and only once. A third batch with no `run_start` resupplies the real signature, but
+    # even if it did not, the merge rule refuses to regress a real value to the sentinel.
+    _enqueue_run(
+        h,
+        project_id=project_id,
+        principal_id=principal_id,
+        agent_type_id=agent_type_id,
+        run_id=run_id,
+        events=[(2, _event("tool_call", ts0 + timedelta(seconds=2), {}))],
+    )
+    h.writer.run_once()
+    assert h.repo.trace_index[(project_id, run_id)].input_signature_hash == upgraded
+
+
+def test_a_second_principal_never_takes_over_an_existing_runs_identity(
+    settings: TracebedSettings,
+) -> None:
+    """`submitter_principal` is the OTHER leg of D-020's independence proof, and unlike
+    `input_signature_hash` it has no sentinel, so first-write-wins is the whole rule: the first
+    authenticated submitter of a `run_id` owns it permanently.
+
+    Two mechanisms now enforce that and this test covers the WRITER's one -- `_resolve_owner`
+    returns the existing row's principal as the owner, so the second batch's upsert never even
+    claims the new principal. The DATABASE's one (`COALESCE(trace_index.submitter_principal,
+    EXCLUDED.submitter_principal)`, D-130) is proved separately in
+    `tests/phase0/test_trace_index_monotonicity.py` against the real statement text. Keeping
+    them in separate files is deliberate: before D-130 the database half did not exist and this
+    guarantee rested entirely on `_resolve_owner` continuing to behave, which is the
+    convention-not-mechanism shape the repo's own docstrings reject.
+    """
+    h = _harness(settings)
+    project_id = ProjectId(uuid7())
+    first_principal = PrincipalId(uuid7())
+    second_principal = PrincipalId(uuid7())
+    agent_type_id = AgentTypeId(uuid7())
+    run_id = RunId(uuid7())
+    ts0 = h.clock.now()
+
+    _enqueue_run(
+        h,
+        project_id=project_id,
+        principal_id=first_principal,
+        agent_type_id=agent_type_id,
+        run_id=run_id,
+        events=[(0, _event("run_start", ts0, {"query_text": "q1"}))],
+    )
+    h.writer.run_once()
+    assert h.repo.trace_index[(project_id, run_id)].submitter_principal == first_principal
+
+    _enqueue_run(
+        h,
+        project_id=project_id,
+        principal_id=second_principal,
+        agent_type_id=agent_type_id,
+        run_id=run_id,
+        events=[(1, _event("tool_call", ts0 + timedelta(seconds=1), {}))],
+    )
+    h.writer.run_once()
+
+    assert h.repo.trace_index[(project_id, run_id)].submitter_principal == first_principal
 
 
 def test_malformed_item_is_nacked_not_processed(settings: TracebedSettings) -> None:

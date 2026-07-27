@@ -310,8 +310,20 @@ class ShadowValidator:
         # at MAX_CONFIRMATIONS_CONSIDERED: without a total order, WHICH origins are resolved
         # would vary between processes under hash randomisation, and so would the promotion
         # decision. `RunId` is not orderable, hence the key.
+        # `include_absent_signatures=True` because THIS set exists to REFUSE evidence, not to
+        # be it (D-136). D-131's default exclusion is right for `offered` above -- a run whose
+        # `run_start` was never recorded is missing evidence, and missing evidence must not read
+        # as independent evidence (BMAD B5). Applied to the ORIGIN set the same exclusion
+        # inverts: dropping an unrecorded origin empties the tuple, the `if not
+        # origin_confirmations` short circuit below fires, and the origin's authenticated
+        # principal stops disqualifying anything -- so a failure lesson distilled from a run
+        # that omitted `run_start` could be promoted out of quarantine by a self-replay under
+        # that same principal. Omitting `run_start` costs an attacker nothing, so the exclusion
+        # that closed a two-identity bypass would have opened a one-identity one.
+        # `independent_of` fails closed on the sentinel, so a kept absent origin disqualifies
+        # every offered confirmation rather than none.
         origin_confirmations = build_confirmations(
-            project_id, sorted(origins, key=str), self._lookup
+            project_id, sorted(origins, key=str), self._lookup, include_absent_signatures=True
         )
         if not origin_confirmations:
             return confirmations

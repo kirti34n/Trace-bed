@@ -63,7 +63,10 @@ EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 PROJECT = ProjectId(UUID(int=1))
 OTHER_PROJECT = ProjectId(UUID(int=2))
 
-_CLUSTER_A = 0x0000000000000000
+# NOT 0 -- see `tests/phase3/test_independence.py::_CLUSTER_A`. A zero cluster makes the whole
+# 40-byte signature `ABSENT_SIGNATURE`, which `build_confirmations` excludes as missing evidence
+# (D-131) rather than resolving as a real cluster.
+_CLUSTER_A = 0x0000000000000001
 _CLUSTER_B = 0xFFFFFFFFFFFFFFFF
 
 
@@ -334,7 +337,16 @@ def test_proposal_class_never_uses_human_verdict_skip() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_human_verdict_class_promotes_with_zero_confirmations() -> None:
+def test_human_verdict_class_does_not_promote_with_zero_confirmations() -> None:
+    """The end-to-end half of D-134/D-137, inverted from what it asserted before.
+
+    This row shape is constructible through the real insert door -- `insert_memory_item`
+    checks status MEMBERSHIP and per-class provenance FIELDS, never the creation guard --
+    so the removed skip was a reachable zero-evidence exit from quarantine, not dead code.
+    With the skip gone the worker still computes `has_verified_human_verdict` from the
+    stored provenance and no guard reads it, so the row stays quarantined on the ordinary
+    corroboration arithmetic: zero confirmations against a threshold of two.
+    """
     lookup = _FakeLookup()
     row = _row(
         1,
@@ -346,8 +358,9 @@ def test_human_verdict_class_promotes_with_zero_confirmations() -> None:
 
     outcome = worker.evaluate_one(PROJECT, row, cfg=_effective_config())
 
-    assert outcome.promoted is True
-    assert outcome.to_status is Status.CANDIDATE
+    assert outcome.promoted is False
+    assert outcome.to_status is None
+    assert outcome.independent_count == 0
 
 
 # --------------------------------------------------------------------------- #

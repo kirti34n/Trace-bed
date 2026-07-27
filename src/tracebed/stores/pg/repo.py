@@ -40,6 +40,7 @@ blocks importing this module at all; that is a cross-chunk blocker, not a defect
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -77,6 +78,7 @@ from tracebed.domain.ids import AgentTypeId, MemoryId, PrincipalId, ProjectId, R
 from tracebed.domain.memory import NewMemoryItem, Provenance, validate_provenance
 from tracebed.domain.scan import ScanVerdict
 from tracebed.domain.scope import ProjectScope
+from tracebed.domain.signatures import ABSENT_SIGNATURE, is_absent_signature
 from tracebed.domain.state_machine import Status, assert_legal_creation_status
 from tracebed.stores.pg.pool import _unscoped, scoped
 from tracebed.stores.pg.rows import (
@@ -105,6 +107,8 @@ __all__ = [
     "Repo",
     "ScopedRepo",
 ]
+
+logger = logging.getLogger(__name__)
 
 # Capability token: holding it is what proves a `ScopedRepo` came from `Repo.tx`. Module-private
 # and never exported, so no other module can pass the check (see `ScopedRepo.__init__`).
@@ -166,6 +170,37 @@ _EXPORT_TABLES: tuple[str, ...] = (
     "retrieval_event",
 )
 
+# One export projection per table, assembled into `_EXPORT_COLUMNS` below alongside
+# `_EXPORT_EXCLUDED_COLUMNS`. `tests/phase0/test_export_column_list.py` parses the real DDL
+# (`CREATE TABLE` plus every column-shaped `ALTER TABLE`) and asserts that every real column of
+# every exported table is accounted for by EXACTLY one of the two maps, AND that the SQL
+# `_impl_iter_export_rows` actually issues projects exactly this list. Both halves are needed:
+# asserting only on these constants cannot fail if a future edit puts `SELECT *` back into the
+# statement, which is the original defect verbatim.
+_MEMORY_ITEM_EXPORT_COLUMNS: Final[str] = (
+    "id, project_id, scope_type, scope_id, mem_type, kind, lane, trust_tier, status, "
+    "content, content_hash, token_count, embedding_model_id, embedding_model_version, "
+    "subject_tag, q_value, confidence, scored_use_count, last_scored_at, strike_count, "
+    "shadow_confirm_runs, cluster_id, ttl_class, pinned, last_retrieved_at, "
+    "last_revalidated_at, status_changed_at, valid_from, valid_to, created_at, expired_at, "
+    "provenance, scan_verdict_id, schema_version, epoch_id"
+)
+
+# `outcome_event` / `injection_log` / `retrieval_event` carry no vector/tsvector columns, so
+# their export lists are every column the table has -- still explicit, and still one entry per
+# table, because the point of this fix is that a FUTURE column added to any of these five tables
+# has to be a conscious edit here, not a `SELECT *` that picks it up for free.
+_OUTCOME_EVENT_EXPORT_COLUMNS: Final[str] = (
+    "event_id, run_id, project_id, principal_id, adapter, r, payload, occurred_at, arrived_at"
+)
+_INJECTION_LOG_EXPORT_COLUMNS: Final[str] = (
+    "run_id, project_id, memory_id, slot, score, tokens, injected_at"
+)
+_RETRIEVAL_EVENT_EXPORT_COLUMNS: Final[str] = (
+    "run_id, project_id, outcome_code, latency_ms, embed_latency_ms, candidates_considered, "
+    "top_score, arm, created_at"
+)
+
 # `arm` is DERIVED, never bound. PLAN.md §10 forbids accepting an experiment-arm assignment
 # from any caller in those words, and this upsert used to bind `%(arm)s` straight out of the
 # caller-supplied `run_start` payload (`ingest.trace_writer`), which made the kill switch's
@@ -204,10 +239,56 @@ INSERT INTO trace_index (
     %(path)s, %(started_at)s, %(ended_at)s, %(payload_ref)s, %(outcome_status)s
 )
 ON CONFLICT (project_id, run_id) DO UPDATE SET
-    agent_type_id = EXCLUDED.agent_type_id,
+    -- `agent_type_id` is the third identity-bearing column: it is an INPUT to
+    -- `domain.signatures.input_signature_hash`, so letting a later batch move it would move
+    -- the signature cluster the next `run_start` computes. `ingest.trace_writer._resolve_owner`
+    -- already pins it application-side (an existing row's `agent_type_id` IS the owner, and
+    -- envelopes disagreeing with the owner are refused), so this makes the database agree with
+    -- the only caller instead of trusting it to keep agreeing. NOT NULL, so the EXCLUDED arm
+    -- fires only on the INSERT half.
+    agent_type_id = COALESCE(trace_index.agent_type_id, EXCLUDED.agent_type_id),
     workflow_template_id = COALESCE(EXCLUDED.workflow_template_id, trace_index.workflow_template_id),
-    submitter_principal = EXCLUDED.submitter_principal,
-    input_signature_hash = EXCLUDED.input_signature_hash,
+    -- `submitter_principal` and `input_signature_hash` are the identity columns
+    -- `workers.independence.build_confirmations` resolves a `ShadowConfirmation`'s principal
+    -- and signature cluster from (PLAN.md invariant 7 / D-020). Plain `EXCLUDED.<col>` used to
+    -- let a retry, a duplicate delivery, or a late batch for the SAME run silently overwrite
+    -- the identity the independence check relies on.
+    --
+    -- `submitter_principal` follows the same first-write-wins COALESCE idiom as `started_at`
+    -- below: the EXISTING row's value wins. It is `NOT NULL` from the first insert and has no
+    -- sentinel value, so the FIRST authenticated submitter is pinned permanently.
+    submitter_principal = COALESCE(trace_index.submitter_principal, EXCLUDED.submitter_principal),
+    -- `input_signature_hash` CANNOT use that idiom, and this is the one asymmetry in the
+    -- statement worth reading twice. It is `NOT NULL` too, but unlike `submitter_principal` it
+    -- has a SENTINEL: `domain.signatures.ABSENT_SIGNATURE` (40 zero bytes, C-07), which
+    -- `trace_writer._identity_columns` writes for a batch that does not carry this run's
+    -- `run_start`. Delivery is at-least-once and out of order, so the FIRST batch for a run is
+    -- routinely a non-`run_start` one; a plain `COALESCE(trace_index.x, EXCLUDED.x)` would see
+    -- a non-NULL sentinel, keep it, and pin the run at ABSENT_SIGNATURE forever -- after which
+    -- `workers.independence.build_confirmations` drops that run from the evidence tuple
+    -- outright (D-131: missing evidence must not read as independent evidence), so it could
+    -- never corroborate anything again. The mechanism is that exclusion, NOT `same_cluster`:
+    -- `domain.signatures.same_cluster` is deliberately left a pure Hamming predicate (D-131),
+    -- which answers True for ABSENT vs ABSENT and False -- "distinct cluster" -- for ABSENT vs
+    -- a real signature, which is precisely the BMAD B5 defect the exclusion exists to close.
+    -- Delivery order would silently decide whether a legitimate run counts as evidence. The
+    -- rule is therefore a ONE-WAY
+    -- upgrade rather than first-write-wins: the sentinel may be replaced by a real signature
+    -- exactly once, and a real signature is never replaced by anything -- not by a different
+    -- real signature (the spoofing case) and not by the sentinel (the late-partial-batch case).
+    -- The sentinel literal is substituted from `domain.signatures.ABSENT_SIGNATURE` rather than
+    -- hand-typed, so the SQL cannot drift from the Python definition of "absent". `decode(...,
+    -- 'hex')` rather than a `'\xdead'::bytea` literal: the literal form's meaning depends on the
+    -- session's `standard_conforming_strings`, and a sentinel comparison that silently stops
+    -- matching under a non-default GUC would disable the upgrade branch with no error anywhere.
+    input_signature_hash = CASE
+        WHEN trace_index.input_signature_hash = decode('@ABSENT_SIGNATURE@', 'hex')
+            THEN EXCLUDED.input_signature_hash
+        ELSE trace_index.input_signature_hash
+    END,
+    -- `instrumentation_source` is descriptive, not identity: nothing reads it to decide trust,
+    -- independence, or arm, and a re-instrumented run legitimately reports the newest source.
+    -- Last-write-wins is the deliberate rule here, not an oversight.
     instrumentation_source = EXCLUDED.instrumentation_source,
     path = COALESCE(EXCLUDED.path, trace_index.path),
     started_at = COALESCE(trace_index.started_at, EXCLUDED.started_at),
@@ -233,9 +314,24 @@ ON CONFLICT (project_id, run_id) DO UPDATE SET
     arm = COALESCE(@ARM_SUBQUERY@, trace_index.arm)
 """
 
+# `_impl_upsert_trace_index` reads these two columns back after the upsert above to compare
+# the row's KEPT (post-merge) identity against what THIS call claimed -- see the long
+# comment on `submitter_principal`/`input_signature_hash` in the template above. A separate
+# statement rather than a `RETURNING EXCLUDED....` clause on the upsert itself: RETURNING
+# would sit after the `arm` assignment as the literal last thing in that SQL string, and
+# `tests/phase0/test_repo_isolation_offline.py::test_trace_index_upsert_never_regresses_a_finished_run_to_pending`
+# already asserts, byte for byte, that the upsert's SQL ends at `trace_index.arm)` -- a
+# structural check this fix must not have to fight. The extra round trip is one indexed
+# primary-key lookup per ingest write, not a scan.
+_TRACE_INDEX_IDENTITY_SELECT_SQL: Final[str] = (
+    "SELECT submitter_principal, input_signature_hash FROM trace_index "
+    "WHERE project_id = %(project_id)s AND run_id = %(run_id)s"
+)
+
 _TRACE_INDEX_UPSERT_SQL: Final[str] = (
     _TRACE_INDEX_UPSERT_TEMPLATE.replace("@PENDING@", TraceOutcomeStatus.PENDING.value)
     .replace("@MEMORY_ON@", Arm.MEMORY_ON.value)
+    .replace("@ABSENT_SIGNATURE@", ABSENT_SIGNATURE.hex())
     .replace("@ARM_SUBQUERY@", _SERVER_DERIVED_ARM_SUBQUERY)
 )
 
@@ -264,6 +360,49 @@ _MEMORY_ITEM_COLUMNS: Final[str] = (
     "scored_use_count, strike_count, provenance, scan_verdict_id, schema_version, "
     "created_at, status_changed_at"
 )
+
+# `trace_index`'s export list is the same projection the upsert already writes
+# (`_TRACE_INDEX_COLUMNS` above -- deliberately reused, not duplicated, since it is already every
+# column the table has and a second hand-typed copy is exactly the drift this fix removes).
+_EXPORT_COLUMNS: Final[Mapping[str, str]] = {
+    "memory_item": _MEMORY_ITEM_EXPORT_COLUMNS,
+    "trace_index": _TRACE_INDEX_COLUMNS,
+    "outcome_event": _OUTCOME_EVENT_EXPORT_COLUMNS,
+    "injection_log": _INJECTION_LOG_EXPORT_COLUMNS,
+    "retrieval_event": _RETRIEVAL_EVENT_EXPORT_COLUMNS,
+}
+
+# Columns an exported table carries that the export deliberately WITHHOLDS. Keyed by table, with
+# an explicit empty entry for the four tables that withhold nothing, because the completeness
+# check in `tests/phase0/test_export_column_list.py` is "every real column of every exported table
+# is in exactly one of these two maps" -- a per-table entry is what lets a future migration adding
+# a `halfvec`/`tsvector`/blob column to `retrieval_event` be excluded the same way `memory_item`'s
+# two are. A single `memory_item`-only set left that test with exactly one possible green answer
+# for the other four tables ("add it to the export list"), which is the wrong steer for precisely
+# the column class this fix exists to keep out of an NDJSON body.
+#
+# `memory_item`'s two are withheld for the same reasons `_MEMORY_ITEM_COLUMNS` above withholds
+# them from every by-id fetch: `embedding halfvec(768)` and `lexemes tsvector` have no registered
+# psycopg loader and are multi-kilobyte per row, and neither belongs in an export a caller reads
+# as text. This is its OWN set (not folded into `_MEMORY_ITEM_COLUMNS`) because the export's
+# projection is a different one -- it carries fields `MemoryItemRow` does not
+# (`shadow_confirm_runs`, `pinned`, `ttl_class`, ...) precisely because "this project's data" for
+# an export means more than "what a retrieval-path row needs".
+_EXPORT_EXCLUDED_COLUMNS: Final[Mapping[str, frozenset[str]]] = {
+    "memory_item": frozenset({"embedding", "lexemes"}),
+    "trace_index": frozenset(),
+    "outcome_event": frozenset(),
+    "injection_log": frozenset(),
+    "retrieval_event": frozenset(),
+}
+
+if frozenset(_EXPORT_COLUMNS) != frozenset(_EXPORT_TABLES) or frozenset(
+    _EXPORT_EXCLUDED_COLUMNS
+) != frozenset(_EXPORT_TABLES):  # pragma: no cover - import-time guard
+    raise RuntimeError(
+        "_EXPORT_COLUMNS/_EXPORT_EXCLUDED_COLUMNS and _EXPORT_TABLES have drifted -- every "
+        "exported table needs exactly one explicit column list and one explicit excluded set"
+    )
 
 
 # Advisory-lock class id for the proposal-cap critical section. `pg_advisory_xact_lock`'s
@@ -981,6 +1120,51 @@ class Repo:
         self, conn: psycopg.Connection[Any], project_id: ProjectId, row: TraceIndexUpsert
     ) -> None:
         conn.execute(_TRACE_INDEX_UPSERT_SQL, _trace_index_params(project_id, row))
+        kept = conn.execute(
+            _TRACE_INDEX_IDENTITY_SELECT_SQL, {"project_id": project_id, "run_id": row.run_id}
+        ).fetchone()
+        if kept is None:
+            # `(project_id, run_id)` is `trace_index`'s primary key, so a genuine Postgres
+            # connection always has a row here -- the upsert above just committed one. `None`
+            # only happens against a fake/stub connection (the offline `Repo` test suite's
+            # connections assert on STATEMENTS issued, not results, and their default
+            # cursor's `fetchone()` always returns `None`). There is no evidence to compare
+            # in that case, so there is nothing to log.
+            return
+        kept_principal_uuid, kept_signature = kept
+        kept_principal = PrincipalId(kept_principal_uuid)
+        claimed_signature = bytes(row.input_signature_hash)
+        # A claimed `ABSENT_SIGNATURE` is not a claim at all -- it is `trace_writer.
+        # _identity_columns`'s "this batch carried no run_start" sentinel (C-07). Comparing it
+        # like a rival signature would warn on the ordinary out-of-order batch, i.e. it would
+        # cry Sybil on the single most common shape of at-least-once delivery, and a signal that
+        # fires on the normal path is a signal nobody reads.
+        signature_conflict = (
+            not is_absent_signature(claimed_signature) and bytes(kept_signature) != claimed_signature
+        )
+        if kept_principal != row.submitter_principal or signature_conflict:
+            # The COALESCE fix above means THIS call's claimed identity lost to
+            # first-write-wins -- correct for D-020's independence evidence, but a second
+            # principal or signature cluster claiming the same run_id is itself a signal:
+            # either a retry that picked up the wrong credential (a bug) or an attempted
+            # Sybil/spoofing collision against `workers.independence` corroboration. Discarding
+            # it without a trace would mean nobody could ever notice either possibility
+            # occurred. `logger.warning`, not raise: the write already did the safe thing, and
+            # raising here would turn an at-least-once retry into an ingest outage over a
+            # signal, not a failure.
+            logger.warning(
+                "trace_index identity conflict on run_id=%s project_id=%s: kept "
+                "submitter_principal=%s input_signature_hash=%s (first write); this upsert "
+                "claimed submitter_principal=%s input_signature_hash=%s instead. "
+                "First-write-wins kept the original evidence; investigate this as a "
+                "possible retry bug or Sybil/spoofing attempt (D-020).",
+                row.run_id,
+                project_id,
+                kept_principal,
+                bytes(kept_signature).hex(),
+                row.submitter_principal,
+                claimed_signature.hex(),
+            )
 
     def get_trace_index(self, project_id: ProjectId, run_id: RunId) -> TraceIndexRow:
         with scoped(self._pool, project_id) as conn:
@@ -1454,6 +1638,17 @@ class Repo:
         hot path must not be able to branch on either. A governance reader needs the
         opposite: the evidence and the change time are the whole point, since a
         disablement with no recorded reason is not something an operator can review.
+
+        Every scope is returned, project-wide (`agent_type_id IS NULL`) rows included -- this
+        query filters on `project_id` alone, so it never had `get_killswitch_overlay`'s D-129
+        NULL-row blindness. What it does NOT return is the EFFECTIVE state: a row is one
+        recorded decision, and under D-129's precedence an agent-type row reading
+        `disabled=False` is still effectively disabled while a project-wide row for the same
+        `mem_type` reads `disabled=True`. Reading a single row as the answer therefore
+        overstates what is enabled, which is the safe direction to be wrong in but still worth
+        knowing at the surface an operator checks. Resolving the pair is
+        `get_killswitch_overlay`'s job and is deliberately not duplicated here: two functions
+        computing "is this disabled" is how they come to disagree.
         """
         with scoped(self._pool, project_id) as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
@@ -1561,17 +1756,42 @@ class Repo:
     ) -> Mapping[str, bool]:
         """Exact `ConfigStorePort` signature (contract §3.4): `agent_type_id` has no default, so
         a caller cannot accidentally read the project-wide overlay when it meant an agent-type
-        one. A NULL `agent_type_id` row is the project-wide overlay (migrations/0001).
+        one. A NULL `agent_type_id` row is the project-wide overlay (migrations/0001:127-141).
+
+        D-129: the predicate matches BOTH the agent-type-specific row (`agent_type_id = %(...)s`)
+        AND the project-wide row (`agent_type_id IS NULL`) in one query, not the project-wide row
+        alone or the agent-type row alone -- the old `IS NOT DISTINCT FROM %(agent_type_id)s`
+        predicate only ever matched one of the two, so a resolved (non-NULL) `agent_type_id`
+        could never see the NULL project-wide row and the control failed OPEN while
+        `list_killswitch_state` kept reporting it as active. Per-`mem_type` precedence, when both
+        rows exist, is the logical OR of their `disabled` flags: whichever row says disabled
+        wins. That is deliberately not "the more specific row wins" -- a project-wide DISABLE
+        overrides an agent-type ENABLE (the project-wide row is the bigger hammer; an operator
+        reaching for it is stating an intent about the whole project), and symmetrically an
+        agent-type-specific DISABLE is never silently re-enabled by the project defaulting back
+        to enabled elsewhere. Disabling is always the safer direction for a memory-injection
+        control, so either row asserting it is authoritative.
+
+        The consequence an operator will meet: while a project-wide DISABLE row stands,
+        `workers.killswitch.KillswitchGridEvaluator.record_override(disabled=False)` for ONE
+        agent type writes its row and is reported by `list_killswitch_state`, but changes
+        nothing here. That is the intended reading of "a narrower ENABLE cannot lift a wider
+        DISABLE"; the remedy is to clear the project-wide row, which is the scope the operator
+        actually disagrees with. `list_killswitch_state`'s docstring carries the same warning,
+        because that is the surface where the two rows are read side by side.
         """
         with scoped(self._pool, project_id) as conn, conn.cursor() as cur:
             cur.execute(
                 "SELECT mem_type, disabled FROM killswitch_state "
                 "WHERE project_id = %(project_id)s "
-                "AND agent_type_id IS NOT DISTINCT FROM %(agent_type_id)s",
+                "AND (agent_type_id IS NULL OR agent_type_id = %(agent_type_id)s)",
                 {"project_id": project_id, "agent_type_id": agent_type_id},
             )
             rows = cur.fetchall()
-        return dict(rows)
+        overlay: dict[str, bool] = {}
+        for mem_type, disabled in rows:
+            overlay[mem_type] = overlay.get(mem_type, False) or bool(disabled)
+        return overlay
 
     def set_project_config(self, project_id: ProjectId, key: str, value: object) -> None:
         """`updated_at` is written explicitly from the injected `Clock`, not left to the column
@@ -1620,10 +1840,16 @@ class Repo:
             # The name embeds a uuid4 so two exports in one transaction cannot collide; the
             # table name comes from the fixed `_EXPORT_TABLES` constant, never caller data.
             cursor_name = f"tb_export_{table}_{uuid4().hex}"
+            # Explicit per-table column list (`_EXPORT_COLUMNS`), never `SELECT *`: the latter
+            # streamed `memory_item.embedding`/`lexemes` (multi-KB, no JSON encoding) for every
+            # row, and silently absorbed any future column a migration added with no one having
+            # decided it should leave the repository. Both the table name and the column list
+            # come from fixed module constants, never caller data.
+            columns = _EXPORT_COLUMNS[table]
             with conn.cursor(name=cursor_name, row_factory=dict_row) as cur:
                 cur.itersize = 500
                 cur.execute(
-                    f"SELECT * FROM {table} WHERE project_id = %(project_id)s",  # noqa: S608
+                    f"SELECT {columns} FROM {table} WHERE project_id = %(project_id)s",  # noqa: S608
                     {"project_id": project_id},
                 )
                 for row in cur:

@@ -63,6 +63,7 @@ class VectorStorePort(Protocol):
         *,
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
+        statement_timeout_ms: int | None = None,
     ) -> list[ArmHit]:
         """Same contract as `SearchStore.vector_arm`: retrievability-predicate-filtered
         (`RETRIEVABLE_STATUSES` minus `pinned`, `candidate` restricted to Tier A), ordered by
@@ -76,6 +77,15 @@ class VectorStorePort(Protocol):
         constant (hard rule 4). A driver with no equivalent knob (Qdrant's own ANN tuning is
         `hnsw_ef`, a different parameter entirely) accepts and documents them as unused rather
         than dropping them from its signature — the port stays one shape for every driver.
+
+        `statement_timeout_ms` (D-139) is the SERVER-side half of invariant 2's bound: how long
+        the store may keep EXECUTING this query, as opposed to how long the caller waits for it.
+        The caller derives it from `retrieval.total_budget_ms` minus what the call has already
+        spent, so it is never a constant and never wider than the budget. It is on the port for
+        the same reason the HNSW knobs are — the hot path passes it through and no driver may
+        invent its own — and a driver with no server-side equivalent accepts and documents it as
+        unused by the same rule. `None` means "no server-side bound", which is what every
+        non-hot-path caller passes.
         """
         ...
 

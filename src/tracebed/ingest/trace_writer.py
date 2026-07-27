@@ -642,9 +642,16 @@ class TraceWriter:
     ) -> tuple[bytes, datetime | None]:
         """`input_signature_hash` and `started_at` for this upsert.
 
-        The repo's upsert does NOT COALESCE `input_signature_hash`, so a batch without this
-        run's `run_start` must resupply whatever is already known -- otherwise a later batch
-        silently regresses the signature to ABSENT_SIGNATURE.
+        Resupplying `existing.input_signature_hash` when this batch carries no `run_start` is
+        still required, but no longer for the reason it originally was. The repo's upsert now
+        has a merge rule for that column -- a ONE-WAY sentinel upgrade (D-135): the stored value
+        wins unless it is `ABSENT_SIGNATURE`, in which case EXCLUDED replaces it once. That rule
+        alone already prevents the regression this resupply used to be the only guard against.
+        What the resupply still buys is that the CLAIMED value and the KEPT value agree, which
+        is what keeps `Repo.upsert_trace_index`'s identity-conflict warning quiet on the
+        ordinary at-least-once path: sending the sentinel against a row that already holds a
+        real signature is harmless to the stored data but would otherwise be indistinguishable,
+        at the warning, from a genuine second claim.
 
         `arm` used to be computed here too, out of the caller-supplied `run_start` payload.
         It is not any more, and it is not this writer's to compute: PLAN.md §10 forbids

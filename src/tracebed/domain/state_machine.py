@@ -253,6 +253,18 @@ class TransitionEvidence:
     # quarantined -> candidate
     confirmations: tuple[ShadowConfirmation, ...] = ()
     has_verified_human_verdict: bool = False
+    """UNCONSULTED by any guard as of D-133, and it must STAY that way until an audited
+    operator route exists: `workers.shadow_validator.evaluate_one` derives this flag from a
+    row's STORED `provenance.cls`/`verdict_id`, and the insert door accepts that provenance on
+    a `quarantined` row without running any creation guard (D-137, and
+    `_guard_quarantined_to_candidate`'s docstring). Any guard that starts reading this field
+    therefore re-opens a zero-corroboration exit from quarantine.
+    `tests/phase3/test_human_verdict_route.py::
+    test_no_guard_in_the_table_consults_the_human_verdict_flag` sweeps every edge in
+    `TRANSITIONS` to keep that true.
+    Kept as a field, not deleted, solely because `workers.shadow_validator.evaluate_one` still
+    constructs a `TransitionEvidence` with this keyword on every call; deleting the field would
+    require editing that module, which is outside this chunk's file list."""
     # candidate -> validated
     promotion_outcomes: int = 0
     promotion_distinct_principals: int = 0
@@ -503,11 +515,59 @@ def _guard_none_to_pinned(evidence: TransitionEvidence, limits: TransitionLimits
 def _guard_quarantined_to_candidate(
     evidence: TransitionEvidence, limits: TransitionLimits
 ) -> GuardOutcome:
-    """PLAN §5 row 4 / D-020 / D-023 -- invariant 7's load-bearing guard.
+    """PLAN §5 row 4 / D-020 / D-023 / D-133 -- invariant 7's load-bearing guard.
 
     D-023 is checked first and unconditionally: `propose_memory` proposals are
-    a provenance class that can never satisfy either skip, full stop -- not a
-    config flag, not overridable by any amount of corroborating evidence.
+    a provenance class that can never satisfy the corroboration skip, full
+    stop -- not a config flag, not overridable by any amount of corroborating
+    evidence.
+
+    D-133/D-137: PLAN.md §5 row 4 names a SECOND skip, "OR verified-human-
+    verdict provenance", and this guard used to grant it -- an UNCONDITIONAL
+    `candidate`, zero corroboration -- whenever `evidence
+    .has_verified_human_verdict` was set together with `provenance_class is
+    ProvenanceClass.HUMAN_VERDICT`. The clause is removed.
+
+    D-137 corrects D-133's stated reason, which was wrong in the direction
+    that matters. D-133 (following BMAD finding B28 and fidelity-audit S26)
+    justified the removal as dead-code cleanup: no `∅ -> quarantined` edge in
+    the table below admits `HUMAN_VERDICT` provenance, and no transition
+    rewrites a row's stored class, so "no row this system can produce" could
+    satisfy it. The first two facts are true and the conclusion does not
+    follow, because `apply()` is not the only door into `memory_item`.
+    `Repo.insert_memory_item` runs `assert_legal_creation_status(status)`
+    (membership in `LEGAL_CREATION_STATUSES` -- `quarantined` is a member) and
+    `validate_provenance` (`HUMAN_VERDICT` requires a `verdict_id` and nothing
+    else); it does NOT call `apply(None, status, evidence, limits)`, so
+    `_guard_none_to_quarantined`'s class restriction is enforced only on
+    callers that voluntarily route through this module first. A `quarantined`
+    row carrying `HUMAN_VERDICT` provenance and a `verdict_id` is therefore
+    insertable, `workers.shadow_validator.evaluate_one` derives
+    `has_verified_human_verdict` straight off that stored provenance, and this
+    guard used to return `candidate` for it with no corroboration at all.
+    The removed clause was a REACHABLE invariant-7 bypass whose only remaining
+    barrier was that no shipped writer happens to construct that provenance --
+    convention, not mechanism. `tests/phase3/test_human_verdict_route.py`
+    section 2b pins the asymmetry (this guard refuses the combination; the
+    insert door accepts it), so the reasoning cannot silently rot back.
+
+    Restoring the route for real needs a genuinely new capability this module
+    cannot provide alone: a repository write path that can promote an EXISTING
+    row's stored provenance to `HUMAN_VERDICT` (`stores/pg/lifecycle.py`'s
+    `LifecycleWriter` writes `status` only, by design --
+    `tests/phase1/test_learning_repos.py::
+    test_exactly_one_status_writing_statement_exists_in_the_lifecycle_module`
+    pins that to exactly one statement in `stores/pg/`), plus an explicit,
+    audited operator action (an `api/admin.py` route backed by a
+    `workers/edit_ops.py`-shaped write) that performs that promotion as its
+    own logged event -- and, per PLAN.md §10, that route must itself be a
+    state-machine transition carrying provenance, never an admin bypass around
+    one. Building it is out of this chunk's file list (`repo.py`
+    /`state_machine.py` only); until it exists, quarantined content leaves
+    quarantine through shadow corroboration ONLY, and `PLAN.md` §5 row 4's
+    "OR verified-human-verdict provenance" clause documents a route this build
+    does not implement (contract_gap, not a code deviation -- `PLAN.md` is
+    outside this chunk's file list).
 
     The failure-lesson relaxation is gated on `mem_type` as well as on the
     flag. PLAN.md §5 and invariant 7 both say "1 run for failure lessons", and
@@ -522,12 +582,6 @@ def _guard_quarantined_to_candidate(
             False, "proposal provenance class can never exit quarantine via any skip (D-023)"
         )
 
-    if (
-        evidence.has_verified_human_verdict
-        and evidence.provenance_class is ProvenanceClass.HUMAN_VERDICT
-    ):
-        return GuardOutcome(True, "")
-
     if evidence.is_failure_lesson and evidence.mem_type is MemType.LESSON:
         required = limits.failure_lesson_outcomes
     else:
@@ -538,8 +592,9 @@ def _guard_quarantined_to_candidate(
     return GuardOutcome(
         False,
         f"only {independent} independent confirmation(s) (distinct run, distinct principal AND "
-        f"distinct input-signature cluster); need >= {required}, and no verified human verdict "
-        f"route applies",
+        f"distinct input-signature cluster); need >= {required} -- there is no verified-human-"
+        f"verdict skip in this build (D-133); quarantined content exits only via shadow "
+        f"corroboration",
     )
 
 

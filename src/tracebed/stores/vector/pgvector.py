@@ -70,6 +70,7 @@ class PgVectorStore:
         *,
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
+        statement_timeout_ms: int | None = None,
     ) -> list[ArmHit]:
         return self._search.vector_arm(
             project_id,
@@ -77,6 +78,7 @@ class PgVectorStore:
             top_n,
             hnsw_iterative_scan=hnsw_iterative_scan,
             hnsw_max_scan_tuples=hnsw_max_scan_tuples,
+            statement_timeout_ms=statement_timeout_ms,
         )
 
     def upsert(

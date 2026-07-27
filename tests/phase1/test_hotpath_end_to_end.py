@@ -108,7 +108,14 @@ class FakeSearchStore:
         if self._arm_stall_ms and self._clock is not None:
             self._clock.advance(ms=self._arm_stall_ms)
 
-    def lexical_arm(self, project_id: ProjectId, query: str, top_n: int) -> list[ArmHit]:
+    def lexical_arm(
+        self,
+        project_id: ProjectId,
+        query: str,
+        top_n: int,
+        *,
+        statement_timeout_ms: int | None = None,
+    ) -> list[ArmHit]:
         self.project_ids.append(project_id)
         self._charge()
         if self._raises:
@@ -123,6 +130,7 @@ class FakeSearchStore:
         *,
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
+        statement_timeout_ms: int | None = None,
     ) -> list[ArmHit]:
         self.project_ids.append(project_id)
         if self._raises:

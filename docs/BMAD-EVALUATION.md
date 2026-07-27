@@ -466,7 +466,67 @@ and leave the other forty-four on the shelf.
 
 ---
 
-## 6. Method note
+## 6. Remediation status — appended 2026-07-27
+
+The evaluation above was a measurement, not a work order. What follows is what was actually
+fixed afterwards, in five parallel chunks plus an integration pass (DECISIONS.md D-129 … D-139).
+It is deliberately written as a ledger of what is CLOSED and what is NOT, because the failure mode
+this repository is most prone to is a summary document drifting out of step with the code
+(FIDELITY-AUDIT §1).
+
+**Suite state after the pass:** `pytest -q` → **4,276 passed, 45 skipped, 0 failed** (baseline
+4,066/45; the count grew because the pass added test files). `mypy` 151 source files clean; `ruff
+check src tests harness scripts` clean; `raw_sql_lint` / `purity_check` / `license_check` /
+`image_check` PASS; `harness/closed_loop.py` 9/9 hops; `dashboard` `tsc --noEmit` and `npm run
+build` clean.
+
+### 6.1 Closed
+
+| Finding | What closed it | Standard of proof |
+|---|---|---|
+| **1 / A1+C15** — no cancellation anywhere on the hot path | D-132 (bounded arm waits, opt-in pool GUCs), D-138 (admission control; stale queued arms never run; an arm-raised `TimeoutError` no longer read as budget expiry), D-139 (**the wiring** — `statement_timeout` derived from `retrieval.total_budget_ms` reaches Postgres via `stores.pg.search`; `connect_timeout`/checkout timeout wired from `StorageConfig` at both `create_pool` call sites) | Offline. Real threads, real `SystemClock`, fake store. The queue-growth half was measured directly: 200 requests against a stalled store went from 398 queued items / 400 replayed queries to 0 / 2. The server-side half has **never run against Postgres** |
+| **2 / C22** — project-wide kill switch invisible, control fails open | D-129 (predicate matches both scopes; either row saying DISABLE wins), D-139 (dashboard folds the same precedence into what it renders) | Offline, statement-level. Mutation-proved in both precedence directions |
+| **3 / C7** — `trace_index` upsert rewrites independence evidence | D-130 (first-write-wins for `submitter_principal`), D-135 (one-way sentinel upgrade for `input_signature_hash`, which D-130's COALESCE would have pinned at `ABSENT_SIGNATURE`; `agent_type_id` joins the pinned set), D-139 (the writer-level fake now models the real merge; the ordering the regression travels through is tested end to end) | Offline. The test interprets the real `DO UPDATE SET` text rather than hardcoding the expected merge |
+| **4 / B5** — `ABSENT_SIGNATURE` reads as maximally independent evidence | D-131 (excluded where a run becomes evidence), D-136 (kept where the set exists to REFUSE evidence; `independent_of` fails closed on the sentinel), D-139 (the call site) | Offline, through the real `ShadowValidator`. Both the two-identity and the one-identity bypass are covered |
+| **5 / C3** — `/export/project` ships `embedding` and `lexemes` | D-133 (explicit per-table column lists), D-137 (the control asserts the emitted STATEMENT, and the DDL parser applies DROP/RENAME so a dropped exported column is caught) | Offline, statement-level against a fake connection |
+| **10 / B28** — human-verdict route out of quarantine | D-134 (clause removed), D-137 (its rationale corrected — it was REACHABLE through the insert door, not dead code), D-139 (both tests inverted to pin the refusal) | Offline |
+| Control-unique — the isolation test that cannot fail | D-139: `test_every_scoped_statement_carries_the_project_id_predicate` now requires `%(project_id)s` in the SQL, not merely in the params dict. Zero offenders across ~60 methods, no allowlist | Offline. The mutation that previously survived 4,100 tests now fails |
+
+### 6.2 Not closed, and honestly so
+
+* **B19 / the insert door.** `Repo.insert_memory_item` enforces status membership and provenance
+  fields, never `apply(None, ...)`, so *every* §5 creation-edge guard is convention at the
+  repository boundary. This is the general form of finding 10 and it subsumes B19
+  (operator-created `pinned` rows skip the content scan). PLAN §11.2.
+* **6 / A28 and 7 / A27** — the latency measurement window, and telemetry failure orphaning
+  `injection_log` rows. Untouched. Both are in `hotpath/pipeline.py::_finish`, which no chunk owned.
+* **8 / A2** — `_embed_bounded` can emit `embed_timeout_ms=0` through `model_copy`. Untouched.
+* **9 / C29** — `injection_log`'s `DO NOTHING` contradicts `jit.py`'s stated design. Untouched.
+* **11 / B2** — `retirement.q_threshold = 1.0` makes the quality gate vacuous. Untouched.
+* **12 / B10** — "our scanner improved" has no expressible transition. Untouched.
+* **14 / C12** — every operator list view truncates silently at 1,000 rows. Untouched.
+* **15 / C14+C19** — proposal caps are opt-in by call site. Untouched.
+* **16 / C1** — `ScopedRepo` has no lifetime invalidation. Untouched.
+* **17 / A22+A23** — the static-prefix rung will serve memories with no `injection_log` row and
+  no kill-switch overlay applied. Untouched, and still latent (M5: nothing implements
+  `StaticPrefixPort`).
+* The lower-priority tail named at the end of §4 — C27, C28, C4, A12, A6 — untouched.
+* **New, created by this pass:** `QdrantVectorStore.ann_search` accepts `statement_timeout_ms`
+  and documents it as unused, so on that driver the hot path has no server-side bound. pgvector
+  is the shipped default and does forward it.
+
+### 6.3 What a sceptic should still distrust
+
+Everything in 6.1 is proved **offline against fakes**. There is no Postgres, Valkey or S3 in this
+environment; 45 `@pytest.mark.integration` tests have never executed. Specifically: the
+`statement_timeout` GUC has never been observed to cancel a real query, the one-way sentinel
+upgrade's `CASE` has never been executed by Postgres, and the kill-switch predicate has never
+returned a real row. Each of those is asserted at the level of *the SQL that would be issued*,
+which is the strongest claim this environment supports and is strictly weaker than "it works".
+
+---
+
+## 7. Method note
 
 Every BMAD and control finding above was re-opened against the source before classification.
 Files read in full: `hotpath/pipeline.py`, `hotpath/budget.py`, `hotpath/holdout.py`,

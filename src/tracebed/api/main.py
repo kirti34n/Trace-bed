@@ -238,7 +238,15 @@ def run() -> None:
 
     settings = TracebedSettings()
     clock = SystemClock()
-    pool = create_pool(settings.storage.pg_dsn)
+    # D-139: both process-level connection bounds are wired here rather than left at the library
+    # defaults. This is the HOT-PATH pool; the per-statement bound is not set here because it
+    # varies per project with `retrieval.total_budget_ms` -- `hotpath.retriever` derives it per
+    # arm and `stores.pg.search` issues it transaction-scoped.
+    pool = create_pool(
+        settings.storage.pg_dsn,
+        connect_timeout_s=settings.storage.pg_connect_timeout_s,
+        checkout_timeout_s=settings.storage.pg_checkout_timeout_s,
+    )
     repo = Repo(pool, clock)
     queue = WorkQueue(pool, clock, settings.queue)
 

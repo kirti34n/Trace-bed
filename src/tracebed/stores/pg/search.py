@@ -561,6 +561,7 @@ class SearchStore:
         top_n: int,
         *,
         visibility: RunVisibility | None = None,
+        statement_timeout_ms: int | None = None,
     ) -> list[ArmHit]:
         """True BM25 via `pg_textsearch` (D-003) — never `ts_rank`, which the audit measured at
         nDCG@10 0.07 on BEIR SciFact against BM25's 0.69, and which exposes no IDF for the
@@ -578,6 +579,15 @@ class SearchStore:
         only, which on a corpus whose memories are almost all agent-type scoped would return
         nothing at all. The two statements are generated from one template and differ by exactly
         the scope conjunct.
+
+        `statement_timeout_ms` is the SERVER-side half of invariant 2's bound (D-139). The
+        retriever's `Future.result(timeout=...)` stops this process WAITING; it does not stop
+        Postgres EXECUTING, so before this parameter existed a wedged arm stayed wedged for the
+        whole life of the stall and the worker it occupied could never be reused. Passed through
+        to `scoped()` as a transaction-scoped `set_config`, so it can never leak onto the next
+        checkout of this pooled connection. `None` (the default, and what every non-hot-path
+        caller uses) leaves the pre-D-139 behaviour untouched -- a background worker's statements
+        legitimately run far longer than a retrieval budget.
         """
         if not query.strip() or top_n <= 0:
             return []
@@ -592,7 +602,10 @@ class SearchStore:
         else:
             sql = _LEXICAL_ARM_SCOPED_SQL
             params.update(_scope_predicate_params(visibility))
-        with scoped(self._pool, project_id) as conn, conn.cursor(row_factory=dict_row) as cur:
+        with (
+            scoped(self._pool, project_id, statement_timeout_ms=statement_timeout_ms) as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
             cur.execute(sql, params)
             rows = cur.fetchall()
         return [_row_to_arm_hit(r) for r in rows]
@@ -605,6 +618,7 @@ class SearchStore:
         *,
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
+        statement_timeout_ms: int | None = None,
     ) -> list[ArmHit]:
         """HNSW ANN over `halfvec` with cosine ops, honouring `retrieval.hnsw_iterative_scan` and
         `hnsw_max_scan_tuples` (filtered-ANN recall vs latency, PLAN.md §6).
@@ -626,12 +640,21 @@ class SearchStore:
         every agent-type-scoped row, which is most of the corpus. `hotpath.assembly`'s
         `scope_visible` filter (D-097) is this arm's scope control until all four signatures grow
         the parameter together; module docstring, contract gap 2.
+
+        `statement_timeout_ms`: see `lexical_arm`. It is a keyword-only parameter with a `None`
+        default rather than part of the port signature for the same reason `visibility` is not --
+        `VectorStorePort.ann_search` and its two drivers are pinned by
+        `tests/phase4/test_vector_drivers.py` -- and because this bound is a property of THIS
+        store's transaction handling, not of the ANN contract.
         """
         if top_n <= 0 or not embedding:
             return []
         literal = _embedding_literal(embedding)
         mode = "relaxed_order" if hnsw_iterative_scan else "off"
-        with scoped(self._pool, project_id) as conn, conn.cursor(row_factory=dict_row) as cur:
+        with (
+            scoped(self._pool, project_id, statement_timeout_ms=statement_timeout_ms) as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
             cur.execute(_HNSW_ITERATIVE_SCAN_GUC_SQL, {"mode": mode})
             cur.execute(_HNSW_MAX_SCAN_TUPLES_GUC_SQL, {"max_tuples": str(hnsw_max_scan_tuples)})
             cur.execute(

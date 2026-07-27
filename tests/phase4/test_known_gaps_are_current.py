@@ -21,6 +21,7 @@ mechanically falsified and pretending otherwise would be its own dishonesty.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -71,12 +72,23 @@ def _no_embedding_write_path_exists() -> bool:
 def _latency_bench_still_seeds_without_embeddings() -> bool:
     """The half of that gap which is still true, and the reason the phase-1 entry was rewritten
     rather than deleted: the bench seeds through `Repo.insert_memory_item`, which writes no
-    embedding, so its vector arm measures zero rows however well the writer works."""
+    embedding, so its vector arm measures zero rows however well the writer works.
+
+    Reads the INSERT's own column list rather than searching the whole of `repo.py` for the
+    string `"embedding"`. The file-wide search was a proxy that any unrelated mention of the
+    column could falsify, and one did: D-133's `_EXPORT_EXCLUDED_COLUMNS` names `embedding` in
+    order to keep it OUT of `/export/project`, which flipped this predicate to False and made
+    the gate report a still-live gap as fixed. The narrow read cannot be fooled that way --
+    only `INSERT INTO memory_item` actually gaining the column moves it.
+    """
     bench = (REPO_ROOT / "harness" / "latency_bench.py").read_text(encoding="utf-8")
     repo_src = (REPO_ROOT / "src" / "tracebed" / "stores" / "pg" / "repo.py").read_text(
         encoding="utf-8"
     )
-    return "insert_memory_item" in bench and '"embedding"' not in repo_src
+    match = re.search(r"INSERT INTO memory_item\s*\((?P<cols>[^)]*)\)", repo_src)
+    assert match is not None, "repo.py no longer contains an `INSERT INTO memory_item` statement"
+    insert_columns = {token.strip() for token in match.group("cols").split(",")}
+    return "insert_memory_item" in bench and "embedding" not in insert_columns
 
 
 def _routing_record_table_is_undefined() -> bool:

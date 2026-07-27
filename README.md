@@ -7,8 +7,8 @@
 Memory whose purpose is that agents *get better at their job over time* — not a knowledge base
 with a vector index bolted on.
 
-[![tests](https://img.shields.io/badge/tests-3%2C754%20passed%20%2F%2041%20skipped-2ea44f)](#the-gates)
-[![mypy](https://img.shields.io/badge/mypy--strict-clean%20%C2%B7%20143%20files-2ea44f)](#the-gates)
+[![tests](https://img.shields.io/badge/tests-4%2C276%20passed%20%2F%2045%20skipped-2ea44f)](#the-gates)
+[![mypy](https://img.shields.io/badge/mypy--strict-clean%20%C2%B7%20151%20files-2ea44f)](#the-gates)
 [![gates](https://img.shields.io/badge/full%20gate-INCOMPLETE-orange)](#the-gates)
 [![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)](#licence)
 [![python](https://img.shields.io/badge/python-3.13-3776ab)](#quick-start)
@@ -50,15 +50,31 @@ answer, in three sentences:
 > implementation of the port its worker declared, and the worker process now runs a scheduler
 > thread that drives them.
 >
-> **But 10 of the 13 periodic workers still cannot be scheduled**, because the store port each one
+> **But 11 of the 14 periodic workers still cannot be scheduled**, because the store port each one
 > takes has no Postgres implementation: the *shadow validator*, the *scorer* and the *promotion*
 > worker among them — which are precisely the three stages between "evidence recorded" and
 > "validated memory".
 >
 > So a deployed Tracebed today **records the evidence a memory needs to graduate, and cannot yet
-> graduate it.** `python harness/closed_loop.py` walks all nine hops end to end and passes — offline,
-> against in-memory implementations of the missing ports — and prints the ten unscheduled workers
-> beside its own verdict so that PASS cannot be mistaken for "the learning plane is live".
+> graduate it.** `python harness/closed_loop.py` walks all nine hops end to end and passes — the
+> loop **composes** — but it does so **offline, against in-memory implementations of the missing
+> ports**, and it prints all eleven unscheduled workers, each beside the exact port that blocks it,
+> underneath its own verdict, so that PASS cannot be mistaken for "the learning plane is live".
+> **Composing is not running.** That distinction is the single most important thing this README
+> has to convey.
+
+A third pass on 2026-07-27 fixed **six real defects** surfaced by a head-to-head review evaluation
+([`docs/BMAD-EVALUATION.md`](docs/BMAD-EVALUATION.md), remediation in
+[audit §13](docs/FIDELITY-AUDIT.md)). They were not spec gaps — the code matched its documents in
+every case — they were an adversary's questions: a kill switch that failed **open** while the admin
+surface reported it applied, an export that shipped raw embedding vectors, an independence check
+that read *missing* evidence as *independent* evidence, an upsert that let a later batch rewrite
+whose observation a run was, a hot path with no cancellation of any kind, and a route out of
+quarantine that needed no evidence at all. All six are closed **and wired** — four of the five fix
+chunks independently reported the same residue, a mechanism that is complete, tested, and reaches
+no call site, which is worse than an unfixed bug because every gate reads green while the property
+is enforced nowhere. Roughly eleven further real findings are open and enumerated, unfixed, in
+[`docs/BMAD-EVALUATION.md`](docs/BMAD-EVALUATION.md) §6.2.
 
 Everything below is written on the assumption you would rather know that on line 30 than discover it
 on day three.
@@ -80,18 +96,21 @@ on day three.
 | **Persisting a status change** | **Complete** | `stores/pg/lifecycle.py` — one `UPDATE memory_item SET status`, plus a `memory_status_log` row in the same transaction. Reached through `MemoryEditRepo`/`ForensicsRepo` |
 | **Embedding writes** | **Complete** | `stores/pg/learning.py::EmbeddingRepo`; swept on a config cadence. A pin change re-selects every row — that IS the re-embedding migration |
 | **`shadow_confirm_runs` writer** | **Complete** | `stores/pg/learning.py::CorroborationRepo` — a `FOR NO KEY UPDATE` CTE reporting appended / already-present / row-not-eligible |
-| **Worker process: periodic plane** | **Partial (3 of 13)** | `workers/composition.py` + a `Scheduler` thread in `runner.run()`. Scheduled: embedder, gc, corroboration (given a host-supplied candidate source). The other ten are refused **by name** with the port that blocks each |
+| **Worker process: periodic plane** | **Partial (3 of 14)** | `workers/composition.py` + a `Scheduler` thread in `runner.run()`. Scheduled: embedder, gc, corroboration (given a host-supplied candidate source). The other **eleven** are refused **by name** with the port that blocks each; `build_scheduled_jobs` raises rather than silently returning a shorter list |
 | **Postgres implementations of the worker ports** | **Partial (4 of 10)** | Done: `EmbeddingRepoPort`, `CorroborationRepoPort`, `MemoryEditRepoPort`, `ForensicsRepoPort`. Missing: `ScorerRepoPort`, `ShadowValidatorRepoPort`, `PromotionRepoPort`, `KillswitchStorePort`, `DerivedStateStorePort`, `MemoryLifecycleRepoPort` |
+| **Hot-path cancellation (invariant 2 against *hangs*)** | **Complete, wired** | Three bounds, all reached by a call site: the retriever's arm waits and its work-queue admission control (client), `statement_timeout` derived from `retrieval.total_budget_ms` and issued transaction-scoped by `stores.pg.search` (server), and `connect_timeout`/pool-checkout from `StorageConfig` at both `create_pool` sites. **Never observed cancelling a real query** — no Postgres here |
+| **Creation-edge guards at the insert door** | **Convention, not mechanism** | `insert_memory_item` checks status membership and provenance *fields*, never `apply(None, ...)`, so Tier / `scan_passed` / `provenance_complete` / `operator_created` are enforced only on callers that route through the state machine first. PLAN §11.2 |
 | **`q_history`, consolidation-diff table, `memory_link` over HTTP** | **MISSING** | Views for these render honest empty pages |
-| **Any integration test, ever** | **NEVER RUN** | No Docker/Postgres/Valkey/S3 on the build machine. All 12 SQL statements in `stores/pg/learning.py` + `lifecycle.py` are parsed and structurally asserted, never executed |
+| **Any integration test, ever** | **NEVER RUN** | No Docker/Postgres/Valkey/S3 on the build machine. Every SQL statement in the repository is parsed and structurally asserted, never executed |
 | Dashboard (16 views, React 18 + Vite + TS + Tailwind) | **Complete** | Zero fixture data; every view live or honestly empty |
 
 **Consequence:** the pieces that *decide* were always done. As of 2026-07-27 several pieces that
-*remember the decision* are done too — but the three stages that turn recorded evidence into a
-validated memory (shadow validator, scorer, promotion) still have no store, so they run in the
-closed-loop drill and in no deployment. What remains is bounded and specified one worker at a time
-in `workers/composition.py::UNSCHEDULED_WORKERS`; the columns, the partitions and the RLS policies
-all already exist. Written up in [`PLAN.md`](PLAN.md) §11 and [audit §12](docs/FIDELITY-AUDIT.md).
+*remember the decision* are done too, and the hot path is now bounded against hangs rather than only
+against exceptions — but the three stages that turn recorded evidence into a validated memory
+(shadow validator, scorer, promotion) still have no store, so they run in the closed-loop drill and
+in no deployment. What remains is bounded and specified one worker at a time in
+`workers/composition.py::UNSCHEDULED_WORKERS`; the columns, the partitions and the RLS policies all
+already exist. Written up in [`PLAN.md`](PLAN.md) §11 and [audit §12–§13](docs/FIDELITY-AUDIT.md).
 
 </details>
 
@@ -180,12 +199,15 @@ reading** — not a soft pass.
 
 | Gate | Verdict | Why |
 |---|---|---|
-| Phase 0 — trace substrate, isolation, security | `INCOMPLETE` | 6/7 · cross-project leak suite needs Postgres |
-| Phase 1 — hot path | `INCOMPLETE` | 6/7 · latency bench needs Postgres |
-| Phase 2 — operational lane + staleness | **`PASS`** | 7/7 |
-| Phase 3 — quality lane + learning | **`PASS`** | 9/9 |
-| Phase 4 — workflow memory + polish | `INCOMPLETE` | 6/6 clauses pass · one integration test unrun |
+| Phase 0 — trace substrate, isolation, security | `INCOMPLETE` | 6/7 clauses PASS · cross-project leak suite needs Postgres |
+| Phase 1 — hot path | `INCOMPLETE` | 6/7 clauses PASS · latency bench needs Postgres (informational, never gates) |
+| Phase 2 — operational lane + staleness | **`PASS`** | 7/7 · offline by design, and its own report says so |
+| Phase 3 — quality lane + learning | `INCOMPLETE` | **10/10 clauses PASS**, verdict INCOMPLETE on untracked skips (no Postgres). Clause 9 is the closed-loop drill |
+| Phase 4 — workflow memory + polish | `INCOMPLETE` | 6/6 clauses PASS · integration tests unrun |
 | **Full** | **`INCOMPLETE`** | The weakest of the five, by design |
+
+*Regenerated 2026-07-27 after the BMAD remediation pass. **No verdict improved and none regressed** —
+the remediation changed source and tests, not the one thing every `INCOMPLETE` here turns on.*
 
 Every gate runner reports each assertion as `PASS` / `FAIL` / `SKIPPED-NO-STACK` / `INCOMPLETE-DATA`
 individually. **An overall `PASS` is only legal when every assertion actually executed.** There is no
@@ -219,7 +241,7 @@ docker compose -f docker/compose.yaml up -d      # PG18 + Valkey + SeaweedFS
 psql "$TB_STORAGE__PG_DSN" -f docker/initdb/01-roles.sql
 python -m tracebed.stores.pg.migrate apply
 
-pytest -q                                        # 3,754 passed
+pytest -q                                        # 4,276 passed / 45 skipped
 python harness/full_gate.py                      # the honest verdict
 ```
 
@@ -250,7 +272,7 @@ python scripts/license_check.py      # CI step 1 — 49 distributions, permissiv
 python scripts/raw_sql_lint.py       # CI step 2 — no SQL outside stores/pg/
 python scripts/purity_check.py       # CI step 3 — invariant 1, by import-graph reachability
 python scripts/image_check.py        # container images declared and pinned
-mypy                                 # strict, 143 files
+mypy                                 # strict, 151 files
 ```
 
 Each has a `--self-test` proving the gate actually bites. They were written that way after two of
@@ -358,14 +380,17 @@ migrations/      plain SQL, yoyo
 Stated here rather than left to be discovered. Full detail in [`PLAN.md`](PLAN.md) §11 and
 [`docs/FIDELITY-AUDIT.md`](docs/FIDELITY-AUDIT.md) §11.4 and §12.4.
 
-Three of the seven gaps listed here before 2026-07-27 are now closed and have been **removed from
-this list rather than annotated**, so it stays readable as a live inventory: the status writer, the
-embedding writer and the duplicate Benjamini–Hochberg implementation. Audit §12.1 records what
-closed each. What is left:
+Gaps that close are **removed from this list rather than annotated**, so it stays readable as a live
+inventory. Closed before this revision: the status writer, the embedding writer and the duplicate
+Benjamini–Hochberg implementation (audit §12.1). Closed by the BMAD remediation pass: the hot path's
+total absence of cancellation, the fail-open project-wide kill switch, the `trace_index` upsert
+rewriting independence evidence, `ABSENT_SIGNATURE` counting as independent evidence, `/export/
+project` shipping raw embedding vectors, and the zero-evidence route out of quarantine (audit §13,
+D-129…D-139). What is left:
 
-1. **10 of the 13 periodic workers cannot be scheduled.** A scheduler thread now runs and drives
-   three jobs (embedder, gc, corroboration). The other ten — including the **shadow validator**, the
-   **scorer** and the **promotion** worker, i.e. the whole path from "evidence recorded" to
+1. **11 of the 14 periodic workers cannot be scheduled.** A scheduler thread now runs and drives
+   three jobs (embedder, gc, corroboration). The other eleven — including the **shadow validator**,
+   the **scorer** and the **promotion** worker, i.e. the whole path from "evidence recorded" to
    "validated" — are blocked on a Postgres implementation of the port each declares. Every one is
    named, with its blocking port, in `workers/composition.py::UNSCHEDULED_WORKERS`, and
    `build_scheduled_jobs` **refuses to return** if a worker is dropped without a recorded reason.
@@ -383,9 +408,18 @@ closed each. What is left:
    exposure is closed; the query is not yet narrow.
 6. **`memory_link`, `derived_state`, `killswitch_state` and `scoring_epoch` still have no writer.**
    `memory_item.epoch_id` and `memory_status_log.epoch_id` exist, typed and empty.
-7. **Not one of the five mandated phase STOPs occurred**, and the 2026-07-27 integration pass did not
-   have one either. All six gate reports were originally generated inside 58 seconds, after the final
-   phase was complete.
+7. **The insert door enforces no creation guard.** `Repo.insert_memory_item` checks status
+   membership and per-class provenance *fields*, and never the state machine's creation guard, so
+   every PLAN §5 creation-edge condition — Tier, scan pass, provenance completeness,
+   operator-created — holds by convention at the repository boundary rather than by mechanism.
+   Closing it needs the creation evidence four worker modules assemble.
+8. **Roughly eleven further real defects are known and unfixed**, enumerated with their evidence in
+   [`docs/BMAD-EVALUATION.md`](docs/BMAD-EVALUATION.md) §6.2 — among them the 300 ms p99 being
+   measured over the wrong window, a telemetry outage orphaning `injection_log` rows, and proposal
+   caps being opt-in by call site.
+9. **Not one of the five mandated phase STOPs occurred**, and neither the 2026-07-27 integration
+   pass nor the remediation pass that followed it had one either. All six gate reports were
+   originally generated inside 58 seconds, after the final phase was complete.
 
 ---
 

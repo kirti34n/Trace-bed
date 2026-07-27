@@ -165,6 +165,10 @@ def _repo() -> tuple[Repo, _FakePool]:
 
 PROJECT = ProjectId(uuid.UUID("11111111-1111-1111-1111-111111111111"))
 OTHER_PROJECT = ProjectId(uuid.UUID("22222222-2222-2222-2222-222222222222"))
+
+# The psycopg named-placeholder form. A statement that does not contain this text cannot be
+# using the `project_id` its params dict binds, however faithfully that dict is populated.
+_PROJECT_ID_PLACEHOLDER = "%(project_id)s"
 PRINCIPAL = PrincipalId(uuid.uuid4())
 AGENT_TYPE = AgentTypeId(uuid.uuid4())
 RUN = mint_run_id()
@@ -405,16 +409,35 @@ def test_every_scoped_statement_carries_the_project_id_predicate() -> None:
         scoped_repo = Repo(pool, FakeClock(EPOCH))  # type: ignore[arg-type]
         with suppress(Exception):
             _calls(scoped_repo)[name]()
-        for sql, params in pool.log:
+        # The params dict is deliberately NOT consulted -- that was the defect. Whether a
+        # statement is project-scoped is a property of the STATEMENT.
+        for sql, _params in pool.log:
             if "set_config" in sql:
                 continue
-            if isinstance(params, dict) and params.get("project_id") == PROJECT:
-                continue
-            if "project_id" in sql:
+            if _PROJECT_ID_PLACEHOLDER in sql:
                 continue
             offenders.append(f"{name}: {sql.strip()[:80]}")
     assert not offenders, f"statements with no project_id predicate: {offenders}"
     assert calls  # the table was actually built
+
+
+def test_binding_project_id_without_referencing_it_is_not_project_scoping() -> None:
+    """The anti-tautology control for the gate above, and the reason that gate was rewritten.
+
+    It used to accept a statement as scoped as soon as its PARAMS dict bound `project_id`,
+    without ever checking the SQL referenced the binding -- so deleting a `WHERE project_id =
+    %(project_id)s` predicate while leaving the (now unused) parameter in place satisfied the
+    control that PLAN.md §5 makes the PRIMARY isolation mechanism, with RLS as the only
+    remaining wall. That mutation was applied to `get_killswitch_overlay` and survived the
+    whole suite. The check is now the placeholder's presence in the statement text, which is
+    the thing that makes the binding load-bearing; this test proves the distinction is real by
+    running the old rule and the new rule over the same widened statement.
+    """
+    widened = "SELECT mem_type, disabled FROM killswitch_state"
+    params = {"project_id": PROJECT, "agent_type_id": None}
+
+    assert params.get("project_id") == PROJECT  # the OLD rule accepts it
+    assert _PROJECT_ID_PLACEHOLDER not in widened  # the NEW rule refuses it
 
 
 def test_registry_guc_allowlist_is_a_superset_of_the_signature_allowlist() -> None:

@@ -29,6 +29,7 @@ __all__ = [
     "SIMHASH_HEAD_CHARS",
     "hamming",
     "input_signature_hash",
+    "is_absent_signature",
     "same_cluster",
     "simhash64",
 ]
@@ -132,8 +133,47 @@ def same_cluster(a: bytes, b: bytes) -> bool:
     8 simhash bytes are within SAME_CLUSTER_MAX_HAMMING (D-020). This is the
     authoritative membership test that `state_machine.independent_confirmations`
     uses to reject two same-wording submissions from counting as independent.
+
+    Deliberately unaware of `ABSENT_SIGNATURE` (BMAD B5 / D-131): this is a pure
+    Hamming-distance predicate over any two `SIG_HASH_LEN` byte strings, and
+    `tests/phase0/test_signatures.py` pins that contract directly --
+    `test_same_cluster_rejects_wrong_length` calls this with `ABSENT_SIGNATURE` as one
+    argument and a wrong-length value as the other and still requires the length
+    `ValueError`, and `test_same_cluster_at_the_threshold_boundary` uses the same 40
+    zero bytes as an ordinary boundary-test signature and requires the plain distance
+    rule, not a forced match, against a far-away one. Whether a signature is evidence
+    AT ALL -- as opposed to "are these two clusters near each other" -- is answered by
+    `is_absent_signature`, and by the one caller that turns a `run_id` into evidence in
+    the first place (`workers.independence.build_confirmations`), never by this
+    function, which must keep meaning exactly "Hamming distance <= the radius" for
+    every existing caller.
     """
     return hamming(_trailing_simhash(a), _trailing_simhash(b)) <= SAME_CLUSTER_MAX_HAMMING
+
+
+def is_absent_signature(sig: bytes) -> bool:
+    """True iff `sig` is exactly the `ABSENT_SIGNATURE` sentinel (BMAD B5 / D-131).
+
+    The fail-closed test `workers.independence.build_confirmations` runs BEFORE
+    counting a resolved signature as evidence at all: a run with no `run_start` is
+    missing evidence, not a signature that happens to hash into its own distinct
+    cluster, and it must never be allowed to win the distinct-input-signature-cluster
+    leg of D-020 by virtue of being maximally far (in Hamming terms) from everything
+    real. `input_signature_hash` derives 32 of these 40 bytes from `hashlib.sha256`,
+    so a genuine signature landing on all-zero has probability ~2^-256 --
+    indistinguishable from never, in this system's threat model.
+
+    Equality over all `SIG_HASH_LEN` bytes, deliberately -- NOT a test on the trailing
+    8 simhash bytes alone, and NOT `same_cluster(sig, ABSENT_SIGNATURE)`. Both narrower
+    forms look equivalent and are not: `simhash64("") == 0` by construction, so a run
+    whose `run_start` recorded an EMPTY `query_text` produces a real sha256 prefix beside
+    an all-zero tail, and a cluster-radius form additionally swallows every real
+    signature whose tail popcount is <= SAME_CLUSTER_MAX_HAMMING. Either would silently
+    strike genuine evidence off the record as "no run_start was ever recorded" -- turning
+    a fail-closed guard against a Sybil bypass into a way to suppress a competitor's
+    corroboration by feeding it a low-popcount query.
+    """
+    return sig == ABSENT_SIGNATURE
 
 
 def _normalise_tool_manifest(tool_manifest: Sequence[str] | None) -> list[str]:

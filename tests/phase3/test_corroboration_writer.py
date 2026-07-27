@@ -97,7 +97,10 @@ def _sig(cluster: int) -> bytes:
     return (b"\x00" * 32) + cluster.to_bytes(8, "big")
 
 
-_CLUSTER_A = 0x0000000000000000
+# NOT 0 -- see `tests/phase3/test_independence.py::_CLUSTER_A`. A zero cluster makes the whole
+# 40-byte signature `ABSENT_SIGNATURE`, which `build_confirmations` excludes as missing evidence
+# (D-131) rather than resolving as a real cluster.
+_CLUSTER_A = 0x0000000000000001
 _CLUSTER_B = 0xFFFFFFFFFFFFFFFF
 
 _DISTILLED = Provenance(cls=ProvenanceClass.DISTILLER, trace_ids=(_run(_ORIGIN),))

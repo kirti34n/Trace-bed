@@ -13,6 +13,14 @@ edited. Claims below carry `file:line`.
 
 ---
 
+> **Reading order (updated 2026-07-27).** §1–§10 describe the tree as this audit found it on
+> 2026-07-26 and are deliberately never edited. §11 is same-day remediation, §12 the wiring pass
+> that closed the learning plane's composition, and **§13 the BMAD remediation pass** — six real
+> defects this audit did not find, because it asked whether the code matches the documents and
+> they are all cases where it does and the behaviour is still wrong. If you are reading §1 to
+> learn the current state of the tree, read §13.5 first: the counts there are current, the ones
+> below are historical.
+
 ## 1. Verdict
 
 The **rules** were built with unusual fidelity and the **runtime** was not. Every invariant, guard,
@@ -780,6 +788,114 @@ caused by the absence of Docker/Postgres on this machine are known, documented, 
 re-litigated.*
 
 *Remediation performed the same day and recorded in §11 above; a second, wiring-focused pass
-followed on 2026-07-27 and is recorded in §12. §1–§10 describe the tree as the audit found it
-and were deliberately left unedited, so the three parts of this document can be read against
+followed on 2026-07-27 and is recorded in §12; a third, defect-focused pass followed the BMAD
+head-to-head evaluation and is recorded in §13. §1–§10 describe the tree as the audit found it
+and were deliberately left unedited, so the four parts of this document can be read against
 each other.*
+
+---
+
+## 13. BMAD remediation pass (2026-07-27) — six real defects, and the wiring that made them real
+
+`docs/BMAD-EVALUATION.md` ran BMAD-METHOD v6.10.0's review skills against this repository's three
+highest-risk surfaces with a control arm using this project's own methodology. It produced 95
+distinct findings, of which **54 were novel against BOTH the control and this 472-item audit**.
+This section records what was fixed. `docs/BMAD-EVALUATION.md` §6 is the finding-by-finding
+ledger; this section is the audit-facing view of it.
+
+### 13.1 What this audit missed, and why
+
+The six defects fixed below were all reachable from files §1–§10 read. This audit did not find
+them because it asked a different question. It asked *"does the code do what the documents say?"*
+— a fidelity question — and every one of these six passes that test. The `trace_index` upsert
+faithfully implements an upsert. `get_killswitch_overlay` faithfully queries `killswitch_state`.
+`iter_export_rows` faithfully exports every row the project owns. What none of them does is
+survive an adversary, and BMAD's Edge Case Hunter layer asked *that* question mechanically —
+enum members against every guard, float domains, sentinel values against every predicate that
+consumes them. **Four of the six sit at exactly the seam this audit is structurally weakest at:
+a value that is well-formed, non-NULL, correctly typed, and semantically wrong.**
+`ABSENT_SIGNATURE` is 40 legitimate bytes. A NULL `agent_type_id` is a legitimate scope. `SELECT
+*` is legitimate SQL.
+
+### 13.2 The one that generalises
+
+Four of the five chunks reported the same residue independently: **a mechanism that is complete,
+tested, and reaches no call site.** D-132 shipped a complete, correct, per-transaction
+`statement_timeout` and nothing passed it. D-136 shipped `include_absent_signatures` and nothing
+passed `True`. In both cases every gate read green and the property was enforced nowhere. This
+is a worse failure mode than an unfixed bug, because the fix's own test suite certifies the
+mechanism truthfully while the system does not have the property. **The integration pass's main
+work was arguments, not mechanisms** (D-139).
+
+The same shape appeared in a gate. `tests/phase4/test_known_gaps_are_current.py` exists to catch
+a stale gap list, and it went red claiming the phase-1 gate declared a gap the code no longer
+has. The gap was still real; the *predicate* was a file-wide substring search for `"embedding"`
+in `repo.py`, and D-133's export fix falsified it by naming that column in order to keep it OUT
+of the export. A gate that measures a proxy for its claim fails on edits five hundred lines from
+its subject. It now reads the `INSERT INTO memory_item` column list itself.
+
+### 13.3 Three test-integrity defects the fixes' own suites had
+
+Recorded because they are the same class as §4.4, and because in each case the fix was correct
+and its control was not:
+
+1. **`tests/phase0/test_repo_isolation_offline.py`** accepted a statement as project-scoped as
+   soon as its PARAMS bound `project_id`, without checking the SQL referenced the binding.
+   Deleting `WHERE project_id = %(project_id)s` from `get_killswitch_overlay` while leaving the
+   now-unused parameter survived the whole suite. PLAN §5 makes the query builder the PRIMARY
+   isolation control and RLS the backstop; the belt could be satisfied with no belt. Now requires
+   `%(project_id)s` in the statement text for all ~60 `Repo` methods, no allowlist, zero
+   offenders.
+2. **`tests/phase0/test_trace_index_monotonicity.py`** recognised the upsert by substring and
+   then applied a HARDCODED merge, commented as "the property under test". It never read the `DO
+   UPDATE SET` clause, so reverting the fix left every behavioural test green. It now interprets
+   the real SET clause and carries a permanent anti-tautology control that replays the pre-fix
+   text and asserts it produces the wrong answer.
+3. **`tests/phase0/test_export_column_list.py`** asserted on module constants, never on the
+   statement. Restoring `SELECT * FROM {table}` verbatim left all 21 new tests green.
+
+A fourth, found by the integration pass: **`tests/phase0/test_trace_writer.py`'s fake
+`ScopedRepo.upsert_trace_index`** applied unconditional-EXCLUDED semantics — i.e. it modelled the
+defect, not the statement — which is why the ordering the regression actually travels through
+(non-`run_start` batch first, `run_start` second) had no test at all. It now mirrors the three
+identity rules, and that ordering is driven end to end through the real `TraceWriter`.
+
+### 13.4 Still open after this pass
+
+The insert door is the significant one. `Repo.insert_memory_item` runs `assert_legal_creation_
+status` (status membership) and `validate_provenance` (per-class fields) and never `apply(None,
+status, evidence, limits)`, so **every PLAN §5 creation-edge guard is convention at the
+repository boundary rather than mechanism** — Tier, `scan_passed`, `provenance_complete`,
+`operator_created`. That is the general form of the human-verdict finding (D-137) and it also
+covers BMAD's B19. Closing it requires the creation evidence four worker modules assemble, so it
+is not a `repo.py` change. PLAN §11.2.
+
+Roughly eleven other REAL-NEW findings are untouched and enumerated in
+`docs/BMAD-EVALUATION.md` §6.2 — including the latency-measurement window (A28), telemetry
+failure orphaning `injection_log` rows (A27), and proposal caps being opt-in by call site (C14).
+
+### 13.5 Verified after this pass
+
+```
+pytest -q                          4,276 passed / 45 skipped / 0 failed   (was 4,066 / 45 at §12.5)
+mypy                               clean, 151 source files
+ruff check src tests harness scripts   clean
+scripts/raw_sql_lint.py            PASS
+scripts/purity_check.py            PASS
+scripts/license_check.py           PASS (49 distributions)
+scripts/image_check.py             PASS (5 image references)
+harness/closed_loop.py             9/9 hops · the loop CLOSES (offline, against fakes)
+dashboard: npx tsc --noEmit        clean
+dashboard: npm run build           clean
+DECISIONS.md                       139 entries, no duplicate ids (D-129 … D-139 added)
+```
+
+**No gate verdict improved and none regressed.** The `INCOMPLETE` verdicts have the same single
+cause they have had since the original audit: no Docker/Postgres/Valkey on this machine.
+
+**What a sceptic should distrust.** Every fix above is proved offline against fakes. The
+`statement_timeout` GUC has never cancelled a real query here; the one-way sentinel `CASE` has
+never been executed by Postgres; the kill-switch predicate has never returned a real row. Each is
+asserted at the level of *the SQL that would be issued*, which is the strongest claim this
+environment supports and is strictly weaker than "it works". §9's list of what cannot be verified
+without the stack is unchanged and now has three more entries on it.
