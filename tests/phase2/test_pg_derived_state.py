@@ -356,3 +356,37 @@ class TestCrossProjectDenialUnderApp:
 
         after = list(owner_store.recent_versions(_PROJECT_A, _AGENT, _KEY))
         assert [r.version for r in after] == [1, 2, 3, 4, 5]
+
+
+# --------------------------------------------------------------------------- #
+# (c) Read-predicate discrimination under the OWNER pool (BYPASSRLS).
+# --------------------------------------------------------------------------- #
+
+
+class TestRecentVersionsDiscriminatesUnderOwner:
+    """Under the OWNER pool RLS is BYPASSED, so `recent_versions`'s explicit
+    `project_id = %(project_id)s` conjunct is the sole control confining the read to one project's
+    partition. Seeding the SAME (agent_type, key, version) numbers in BOTH projects, with distinct
+    values, makes the read go RED if that predicate is dropped or made constant: A's read would
+    then surface B's rows too (`_row_to_derived_state_version` turns that project mismatch into a
+    raise, so the test fails either way). The denial-under-app class cannot catch this — under
+    `tracebed_app` RLS masks a missing predicate."""
+
+    def test_owner_read_returns_only_the_scoped_projects_versions(
+        self, store: DerivedStateStore
+    ) -> None:
+        # `store` is a DerivedStateStore over the OWNER pool (BYPASSRLS). Same version numbers in
+        # both projects — the PK (project_id, agent_type_id, key, version) permits it.
+        for v in (1, 2, 3):
+            store.append_version(_version(_PROJECT_A, v, 100.0 + v))
+            store.append_version(_version(_PROJECT_B, v, 200.0 + v))
+
+        a = list(store.recent_versions(_PROJECT_A, _AGENT, _KEY))
+        assert [r.version for r in a] == [1, 2, 3]
+        assert [r.value for r in a] == [101.0, 102.0, 103.0]
+        assert all(r.project_id == _PROJECT_A for r in a)
+
+        b = list(store.recent_versions(_PROJECT_B, _AGENT, _KEY))
+        assert [r.version for r in b] == [1, 2, 3]
+        assert [r.value for r in b] == [201.0, 202.0, 203.0]
+        assert all(r.project_id == _PROJECT_B for r in b)

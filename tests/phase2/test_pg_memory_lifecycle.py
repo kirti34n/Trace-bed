@@ -555,3 +555,46 @@ def test_app_role_scoped_to_a_does_see_a_row_guarding_the_guard(env: _Env) -> No
     raw = _read_raw(env, a, row.id)
     assert raw["status"] == Status.ARCHIVED.value
     assert raw["status_changed_at"] == now
+
+
+# --------------------------------------------------------------------------- #
+# (c) Read-predicate discrimination under the OWNER pool (BYPASSRLS).
+# --------------------------------------------------------------------------- #
+
+
+def test_owner_scoped_reads_return_only_the_scoped_projects_rows(env: _Env) -> None:
+    """Under the OWNER pool RLS is BYPASSED, so each read's explicit `project_id = %(project_id)s`
+    conjunct is the sole control confining it to one project's partition. Seeding a matching row
+    in BOTH projects (autouse `_clean` guarantees these two are the only rows) makes every read go
+    RED if that predicate is dropped or made constant: A's read would surface B's row, which
+    `_require_scoped` turns into a raise. The denial-under-app test cannot catch this — under
+    `tracebed_app` RLS masks a missing predicate, so it would stay green against a constant predicate.
+    """
+    a, b = env.project_a, env.project_b
+    trace = RunId(uuid.uuid4())
+    sig = b"\xaa\xbb\xcc"
+    prov = _provenance(tool_refs=("shared-tool",), trace_ids=(trace,), input_sig_hashes=(sig,))
+    a_row = _seed(env, a, mem_id=_mid(0xA01), status=Status.VALIDATED, provenance=prov,
+                  last_retrieved_at=None, created_at=EPOCH)
+    b_row = _seed(env, b, mem_id=_mid(0xB01), status=Status.VALIDATED, provenance=prov,
+                  last_retrieved_at=None, created_at=EPOCH)
+    store = MemoryLifecycleRepo(env.owner_pool)  # type: ignore[arg-type]  # OWNER — BYPASSRLS
+
+    # select_by_status
+    assert {r.id for r in store.select_by_status(a, [Status.VALIDATED])} == {a_row.id}
+    assert {r.id for r in store.select_by_status(b, [Status.VALIDATED])} == {b_row.id}
+
+    # select_by_provenance — identical selectors match both rows on content; only the predicate
+    # confines each read to its own project.
+    prov_kwargs: dict[str, object] = {
+        "tool_refs": ("shared-tool",),
+        "trace_ids": (trace,),
+        "input_sig_hashes": (sig,),
+    }
+    assert {r.id for r in store.select_by_provenance(a, **prov_kwargs)} == {a_row.id}  # type: ignore[arg-type]
+    assert {r.id for r in store.select_by_provenance(b, **prov_kwargs)} == {b_row.id}  # type: ignore[arg-type]
+
+    # select_due_for_revalidation — both rows are equally due; only the predicate separates them.
+    older = EPOCH + timedelta(days=3650)
+    assert {r.id for r in store.select_due_for_revalidation(a, older_than=older)} == {a_row.id}
+    assert {r.id for r in store.select_due_for_revalidation(b, older_than=older)} == {b_row.id}

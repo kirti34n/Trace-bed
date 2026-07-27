@@ -449,3 +449,37 @@ class TestCrossProjectDenialUnderApp:
         status, changed_at = _read_status(scratch.owner_pool, pid_a, mem_id)  # type: ignore[misc]
         assert status == Status.QUARANTINED.value
         assert changed_at == _EARLIER
+
+
+# --------------------------------------------------------------------------- #
+# (c) Read-predicate discrimination under the OWNER pool (BYPASSRLS).
+# --------------------------------------------------------------------------- #
+
+
+class TestSelectQuarantinedDiscriminatesUnderOwner:
+    """Under the OWNER pool RLS is BYPASSED, so `select_quarantined`'s explicit
+    `project_id = %(project_id)s` conjunct is the sole control confining the scan to one project.
+    Seeding a quarantined row in BOTH projects, then reading each scope, goes RED if that
+    predicate is dropped or made constant: A's read would then surface B's row (the row parser's
+    `_require_scoped` turns that leak into a raise, so the test fails either way). The
+    denial-under-app class cannot catch this — under `tracebed_app` RLS masks a missing predicate.
+    """
+
+    def test_owner_select_returns_only_the_scoped_projects_quarantined_rows(
+        self, scratch: _Scratch
+    ) -> None:
+        pid_a, pid_b = scratch.project_a, scratch.project_b
+        mem_a = MemoryId(uuid.uuid4())
+        mem_b = MemoryId(uuid.uuid4())
+        prov = Provenance(cls=ProvenanceClass.DISTILLER, trace_ids=(RunId(uuid.uuid4()),))
+        _seed_quarantined(scratch.owner_pool, pid_a, memory_id=mem_a, provenance=prov)
+        _seed_quarantined(scratch.owner_pool, pid_b, memory_id=mem_b, provenance=prov)
+        store = _store(scratch.owner_pool)
+
+        a_ids = {r.id for r in store.select_quarantined(pid_a)}
+        assert mem_a in a_ids
+        assert mem_b not in a_ids  # B's quarantined row must never surface in A's scope
+
+        b_ids = {r.id for r in store.select_quarantined(pid_b)}
+        assert mem_b in b_ids
+        assert mem_a not in b_ids  # and vice versa

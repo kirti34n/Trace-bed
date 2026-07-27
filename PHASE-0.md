@@ -10,7 +10,7 @@ Conventions used throughout:
 ---
 
 ## Task 1 — Repo scaffold + license gate (must pass on commit one)
-**Build:** `pyproject.toml` (py3.13; deps per DECISIONS D-036), `scripts/license_check.py`: walks the resolved dependency tree (`importlib.metadata`), classifies each distribution's license against `scripts/license_policy.toml` — allowlist `[PostgreSQL, Apache-2.0, BSD-2/3, MIT, ISC]`, conditional `[LGPL-3.0-only]` requiring an entry in the `lgpl_rationale` table (seeded with `psycopg`), denylist `[SSPL, BSL, RSAL, Elastic-2.0]`. Non-zero exit on unknown or denied. Wire as CI step 1. `docker/compose.yaml`: `pgvector/pgvector`-based **PG18** image with `pg_textsearch` installed, `valkey`, `seaweedfs` (S3 test target), api, dashboard placeholders.
+**Build:** `pyproject.toml` (py3.13; deps per DECISIONS D-036), `scripts/license_check.py`: walks the resolved dependency tree (`importlib.metadata`), classifies each distribution's license against `scripts/license_policy.toml` — allowlist `[PostgreSQL, Apache-2.0, BSD-2/3, MIT, ISC]`, conditional `[LGPL-3.0-only]` requiring an entry in the `lgpl_rationale` table (seeded with `psycopg`), denylist `[SSPL, BSL, RSAL, Elastic-2.0]`. Non-zero exit on unknown or denied. Wire as CI step 1. `docker/compose.yaml`: `pgvector/pgvector`-based **PG18** image with the BM25 extension stack installed — `vchord_bm25` + `pg_tokenizer` (superseded: `pg_textsearch` was a phantom extension that does not exist; replaced per D-140) — plus `valkey`, `seaweedfs` (S3 test target), api, dashboard placeholders.
 **Files:** `pyproject.toml`, `scripts/license_check.py`, `scripts/license_policy.toml`, `docker/compose.yaml`, `.gitlab-ci.yml`/`.github/workflows/ci.yml`.
 **Test:** CI run on the initial commit is green; adding a fake SSPL dist to a test fixture makes it fail.
 **Depends on:** nothing.
@@ -70,8 +70,8 @@ Layered resolution API: `ConfigResolver.effective(project_id, agent_type_id) -> 
 **Depends on:** Tasks 2, 3.
 
 ## Task 5 — Migrations: registries, epochs, embedding pin
-**Build:** yoyo setup (`migrations/`), `0001_registries.sql`: `CREATE EXTENSION vector; CREATE EXTENSION pg_textsearch;` + `project`, `principal`, `agent_type`, `agent_registration` (UNIQUE(principal_id)), `embedding_model`, `scoring_epoch`, `project_config`, `agent_type_config`, `killswitch_state` — DDL per PLAN.md §5. Seed: `embedding_model` row from config pin.
-**Test:** `yoyo apply` then `yoyo rollback` clean on the compose PG18; both extensions present; inserting a second `agent_registration` for one principal fails.
+**Build:** yoyo setup (`migrations/`), `0001_registries.sql`: `CREATE EXTENSION vector;` (the originally planned `CREATE EXTENSION pg_textsearch;` named a phantom extension — superseded: BM25 is now provided by `vchord_bm25` + `pg_tokenizer`, created in migration 0001 (their tokenizer config and the `content_bm25` ranking column arrive in 0005), with per-term document frequency read from a `lexemes` tsvector column; D-140) + `project`, `principal`, `agent_type`, `agent_registration` (UNIQUE(principal_id)), `embedding_model`, `scoring_epoch`, `project_config`, `agent_type_config`, `killswitch_state` — DDL per PLAN.md §5. Seed: `embedding_model` row from config pin.
+**Test:** migrations apply then roll back clean on the compose PG18; the extensions are present (`vector`, and the BM25 stack `vchord_bm25` + `pg_tokenizer` (created in migration 0001) — superseded from the phantom `pg_textsearch`, D-140); inserting a second `agent_registration` for one principal fails.
 **Depends on:** Tasks 1, 2.
 
 ## Task 6 — Migrations: partitioned learning-plane tables + partition manager + RLS

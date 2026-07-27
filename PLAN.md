@@ -54,7 +54,7 @@ flowchart LR
         TS --> EX["extractors (Tier A parsers)"]
         TS --> DI["distiller (LLMProviderPort)"]
         SCN["core/scans (shared gate suite)"]
-        EX --> SCN --> ST[("Postgres 18: memory store\npgvector + pg_textsearch\nLIST-partitioned by project")]
+        EX --> SCN --> ST[("Postgres 18: memory store\npgvector + vchord_bm25\nLIST-partitioned by project")]
         DI --> SCN
         SC["scorer (Q, scoring_epoch)"] --> ST
         SV["shadow_validator"] --> ST
@@ -187,14 +187,14 @@ tracebed/
   migrations/               # plain SQL, yoyo-migrations
   tests/
   scripts/                  # license_check, raw_sql_lint (AST), purity_check
-  docker/                   # compose: pg18(pgvector+pg_textsearch), valkey, seaweedfs, api, dashboard
+  docker/                   # compose: pg18(pgvector+vchord_bm25+pg_tokenizer), valkey, seaweedfs, api, dashboard
 ```
 
 ---
 
 ## §5 Data model
 
-Postgres 18. Extensions: `vector` (pgvector, `halfvec`), `pg_textsearch` (true BM25, PostgreSQL License). All learning-plane tables **LIST-partitioned by `project_id`**.
+Postgres 18. Extensions: `vector` (pgvector, `halfvec`), `vchord_bm25` (true BM25) with `pg_tokenizer` for tokenization — the mandated `pg_textsearch` was a phantom extension that does not exist and was replaced — the `vchord_bm25`/`pg_tokenizer` extensions ship in migration 0001, their tokenizer config and the `content_bm25` ranking column in 0005 (D-140). All learning-plane tables **LIST-partitioned by `project_id`**.
 
 ### DDL sketch
 
@@ -224,7 +224,7 @@ memory_item(
   content text, content_hash text, token_count int,
   embedding halfvec(768),                    -- dimension from embedding pin; <= 768
   embedding_model_id text, embedding_model_version text,   -- stamped per row; NOT NULL when embedding set
-  lexemes tsvector,                          -- BM25 side maintained by pg_textsearch index
+  lexemes tsvector,                          -- BM25 side; per-term document frequency for the vchord_bm25 arm (D-140)
   subject_tag text,                          -- user | third_party:<id> | entity:<id> | environment
   q_value float, confidence float,
   scored_use_count int, last_scored_at, strike_count int,
@@ -414,7 +414,7 @@ Retrofitting these is expensive; all of them land here. Deliverables: migrations
 
 ### Phase 1 — Hot path
 
-Deliverables: Valkey working memory (lifetime knob) + tool cache with the §5 key spec and `cache_flush` invalidation; semantic/episodic stores with pinned Gemini embeddings (`halfvec`, model stamped per row) and BM25 lexemes; hybrid retrieval (BM25 arm + ANN arm, RRF k=60 for ordering); **abstention computed from calibrated raw signals** (cosine + normalized BM25 + rarity gate from pg_textsearch IDF; cold-start abstains); assembler (budgets, dedup) + template renderer; the full degradation ladder (200ms embed → lexical-only; 300ms total → prefix-only; then nothing); `retrieval_event` written for every call; holdout plumbing (salted deterministic hash, session-stable, logged on trace, not yet acting); **JIT retrieval SDK hook** (`on_operational_event` — hook only, returns None; trigger logic Phase 2; CUTTABLE improvement 5); dashboard v0 (Injections view); latency bench built (**50 projects × 100k items, concurrent load** — the single-project warm fixture certifies a condition production never has).
+Deliverables: Valkey working memory (lifetime knob) + tool cache with the §5 key spec and `cache_flush` invalidation; semantic/episodic stores with pinned Gemini embeddings (`halfvec`, model stamped per row) and BM25 lexemes; hybrid retrieval (BM25 arm + ANN arm, RRF k=60 for ordering); **abstention computed from calibrated raw signals** (cosine + normalized BM25 + rarity gate from per-term document frequency over the lexemes tsvector via the `@@`/`plainto_tsquery` operator — not vchord_bm25, which exposes no IDF accessor (D-140); cold-start abstains); assembler (budgets, dedup) + template renderer; the full degradation ladder (200ms embed → lexical-only; 300ms total → prefix-only; then nothing); `retrieval_event` written for every call; holdout plumbing (salted deterministic hash, session-stable, logged on trace, not yet acting); **JIT retrieval SDK hook** (`on_operational_event` — hook only, returns None; trigger logic Phase 2; CUTTABLE improvement 5); dashboard v0 (Injections view); latency bench built (**50 projects × 100k items, concurrent load** — the single-project warm fixture certifies a condition production never has).
 
 **Gate:** negative probes: 0 dynamic injections. Purity test green (§2 inv. 1). Render property tests green. Fail-open drill green with correct outcome codes. Holdout: same (session, agent_type, salt) → same arm across restarts; working memory unaffected in holdout arm. Bench report produced and attached (informational). **STOP.**
 
@@ -695,6 +695,14 @@ names every remaining worker and the exact port that blocks it, and `harness/clo
 already exercises each of those workers' logic against an in-memory implementation of the port
 that has to be written.
 
-**One measurement nobody has taken.** Not a single `@pytest.mark.integration` test in this
-repository has ever executed. Every SQL statement in `stores/pg/` — including the eight added by
-the integration pass — has been parsed, structurally asserted, and never run against Postgres.
+**One measurement nobody had taken (now taken).** As of the integration pass this read: not a
+single `@pytest.mark.integration` test in this repository had ever executed, and every SQL
+statement in `stores/pg/` — including the eight added by that pass — had been parsed, structurally
+asserted, and never run against Postgres.
+
+**Superseded — live bring-up, 2026-07-27.** That measurement has now been taken. A live
+Postgres 18.3 stack is up; migrations 0001..0006 apply against it; the full suite runs green
+against the live stack (4,403 passed / 1 skipped — the S3-env case / 0 failed), with `mypy
+--strict` (158 files) and `ruff` clean; and the cross-project leak suite passes 7/7 under the
+`NOBYPASSRLS` app role. The SQL in `stores/pg/` is no longer only structurally asserted — it
+executes against a real database.

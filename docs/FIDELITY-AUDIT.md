@@ -479,6 +479,12 @@ they will not call an unrun test green, but they will call a different test the 
 Running Docker/Postgres would newly prove — or disprove — exactly these. Everything else in this
 document was decidable from the tree.
 
+> *Superseded (live-DB bringup): the stack now runs. Postgres 18.3 + Valkey are up, migrations
+> 0001..0006 apply, and the full suite is green against the live stack with the cross-project
+> isolation suite passing 7/7. Items 1 (runtime isolation) and 2 (the lexical/BM25 SQL surface,
+> now `vchord_bm25` — see the item-2 note) are therefore resolved rather than merely unverifiable.
+> The list is preserved as the audit recorded it on 2026-07-26.*
+
 1. **Cross-project isolation at runtime.** 7 leak-probe groups are integration-marked
    (`harness/leak_suite/test_leaks.py:124,191,210,266,343,403,462`). The single most load-bearing
    clause — "repo bypass with the RLS GUC unset returns zero rows" (`:462`) — has never executed.
@@ -490,6 +496,11 @@ document was decidable from the tree.
    and never verified. The entire lexical arm — and with it the IDF basis for the rarity gate — rests
    on that inference. Also unverified: `halfvec(768)`, the HNSW `halfvec_cosine_ops` opclass, and
    whether the per-project partition templates produce constraints matching their parents.
+   > *Superseded: `pg_textsearch` was a phantom extension that does not exist. The lexical arm now
+   > uses real BM25 via the `vchord_bm25` extension (with `pg_tokenizer`), with per-term document
+   > frequency taken from a `lexemes` tsvector column rather than an inferred `@@@` operator
+   > (D-140, migration 0005). The live stack now runs against this surface — migrations 0001..0006
+   > apply on Postgres 18 and the suite is green — so this item is resolved, not merely unverifiable.*
 3. **Any latency number.** No p99 for the real pipeline exists anywhere in the repo. Even with
    Postgres, the bench's vector arm would measure zero rows (S23), so a green bench would prove the
    lexical path only.
@@ -899,3 +910,11 @@ never been executed by Postgres; the kill-switch predicate has never returned a 
 asserted at the level of *the SQL that would be issued*, which is the strongest claim this
 environment supports and is strictly weaker than "it works". §9's list of what cannot be verified
 without the stack is unchanged and now has three more entries on it.
+
+> *Superseded (live-DB bringup): a live Postgres 18.3 + Valkey stack is now up — migrations
+> 0001..0006 apply and the full suite is green against it, with cross-project isolation passing
+> 7/7 and the lexical arm running on real `vchord_bm25` (D-140). The offline-only caveats in this
+> paragraph, and the "unverifiable without the stack" framing of §9, no longer hold as current
+> fact for the paths the live suite exercises. This paragraph is preserved as written at the
+> 2026-07-27 BMAD pass; the per-pass verification blocks above (§11.5, §12.5, §13.5) remain the
+> dated snapshots they were.*

@@ -94,7 +94,7 @@ sequenceDiagram
   else timeout or error
     TB->>TB: degrade to lexical-only
   end
-  TB->>PG: BM25 (pg_textsearch) + ANN (pgvector), project-scoped, FORCE RLS
+  TB->>PG: BM25 (vchord_bm25 + pg_tokenizer, DF via lexemes tsvector) + ANN (pgvector), project-scoped, FORCE RLS
   TB->>TB: RRF order → calibrated score → abstention + rarity gate
   alt abstain (target ≥50% of runs)
     TB-->>G: run_id + static prefix only

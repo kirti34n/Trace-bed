@@ -493,6 +493,46 @@ class TestCrossProjectDenial:
 
 
 # --------------------------------------------------------------------------------------- #
+# (c) Read-predicate discrimination under the OWNER pool (BYPASSRLS).
+# --------------------------------------------------------------------------------------- #
+
+
+class TestReadPredicateDiscriminatesUnderOwner:
+    """Under the OWNER pool RLS is BYPASSED, so the explicit `project_id = %(project_id)s`
+    conjunct in every read is the ONLY control confining a query to its project's partition.
+    Seeding the SAME memory_id in BOTH project A and project B, with distinct Q/event payloads,
+    makes each read go RED if that predicate is dropped or made constant: `id = %(memory_id)s`
+    alone would then match BOTH partitions' rows. (The cross-project-denial class above cannot
+    catch this — under `tracebed_app`'s RLS a missing predicate is masked.)"""
+
+    def test_owner_scoped_reads_return_only_their_own_projects_rows(self, scratch: _Scratch) -> None:
+        a, b = scratch.project_a, scratch.project_b
+        mid = mint_memory_id()  # the SAME id lives in both project partitions (PK is (project_id, id))
+        _seed_memory(scratch.owner_pool, a, mid)
+        _seed_memory(scratch.owner_pool, b, mid)
+        store = ScorerRepo(scratch.owner_pool)
+
+        ea, eb = uuid4(), uuid4()
+        store.apply_q_update(a, _q(mid, event_id=ea, scored_at=_NOW, new_q=0.61))
+        store.apply_q_update(b, _q(mid, event_id=eb, scored_at=_NOW, new_q=0.42))
+
+        # current_q: each scope reads its own partition's distinct value. Dropping the predicate
+        # leaves `WHERE id = mid` matching two rows -> fetchone returns the wrong one for one scope.
+        assert store.current_q(a, mid) == pytest.approx(0.61)
+        assert store.current_q(b, mid) == pytest.approx(0.42)
+
+        # applied_event_ids: exactly this project's ledger event. Without the predicate the set
+        # would union both partitions' events -> {ea, eb}.
+        assert store.applied_event_ids(a, mid) == {ea}
+        assert store.applied_event_ids(b, mid) == {eb}
+
+        # scored_updates_today: count within this partition only. Without the predicate the
+        # count(*) spans both partitions' rows for this id and day -> 2.
+        assert store.scored_updates_today(a, mid, _NOW.date()) == 1
+        assert store.scored_updates_today(b, mid, _NOW.date()) == 1
+
+
+# --------------------------------------------------------------------------------------- #
 # Small helpers.
 # --------------------------------------------------------------------------------------- #
 

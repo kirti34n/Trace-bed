@@ -4,7 +4,7 @@
 > kill switch and its lift report, the review queue, erasure, backup/restore, and what each
 > gate report means.
 >
-> Rev. 2026-07-26 · API `:8110` · Dashboard `:8111` · Companion to `docs/ADAPTER-GUIDE.md`
+> Rev. 2026-07-27 · API `:8110` · Dashboard `:8111` · Companion to `docs/ADAPTER-GUIDE.md`
 > (the integration seam) and `docs/MEMORY-FLOW.md` (the read/write/lifecycle model).
 
 ---
@@ -12,10 +12,11 @@
 ## 1. Bringing the stack up
 
 Local dev stack (`docker/compose.yaml`): Postgres 18 (`tensorchord/vchord-suite:pg18-latest`
-— pgvector + `pg_textsearch` bundled; **image tags are unverified**, this file was authored
-on a machine with no Docker daemon, confirm on first `docker compose up` and pin by digest),
-Valkey 8, SeaweedFS (generic S3 target for the trace store), and — only under the `full`
-profile — the `api` and `dashboard` containers:
+— pgvector + `vchord_bm25` + `pg_tokenizer` bundled; the stack is verified to come up on this
+image against Postgres 18.3, migrations `0001`..`0006` apply, and the full suite runs green
+against it — still pin by digest for a reproducible deployment), Valkey 8, SeaweedFS (generic
+S3 target for the trace store), and — only under the `full` profile — the `api` and
+`dashboard` containers:
 
 ```bash
 docker compose -f docker/compose.yaml up -d                  # postgres, valkey, seaweedfs
@@ -63,9 +64,21 @@ from tracebed.stores.pg.migrate import apply_migrations
 apply_migrations(dsn)   # dsn = TB_STORAGE__PG_DSN
 ```
 
-For interactive/manual use against a local database, `migrations/yoyo.ini` is provided for
-the `yoyo` CLI directly (it deliberately has no `database =` line committed — a checked-in
-DSN reads as a checked-in credential):
+For interactive/manual use against a local database, `migrate` now ships a real CLI over the
+same functions — `python -m tracebed.stores.pg.migrate <apply|rollback|rollback-all|list>`,
+DSN from `--dsn` or `$TB_STORAGE__PG_DSN` (migrations run as the owner role, never the app
+role). This is the runbook command that actually touches the database; the module previously
+had no `__main__`, so `python -m ... apply` imported and exited 0 without applying anything:
+
+```bash
+python -m tracebed.stores.pg.migrate apply         # DSN from $TB_STORAGE__PG_DSN
+python -m tracebed.stores.pg.migrate rollback      # roll back the most recent migration
+python -m tracebed.stores.pg.migrate rollback-all  # roll back every applied migration
+python -m tracebed.stores.pg.migrate list          # ids currently applied
+```
+
+`migrations/yoyo.ini` remains for driving the `yoyo` CLI directly (it deliberately has no
+`database =` line committed — a checked-in DSN reads as a checked-in credential):
 
 ```bash
 yoyo apply    -c migrations/yoyo.ini --database "$TB_STORAGE__PG_DSN"
@@ -73,12 +86,17 @@ yoyo rollback -c migrations/yoyo.ini --database "$TB_STORAGE__PG_DSN"
 yoyo list     -c migrations/yoyo.ini --database "$TB_STORAGE__PG_DSN"
 ```
 
-Three migrations ship: `0001_registries.sql` (project/principal/agent_type/agent_registration,
+Six migrations ship: `0001_registries.sql` (project/principal/agent_type/agent_registration,
 embedding/scoring-epoch pins, config tables — unpartitioned, small), `0002_partitioned.sql`
 (the full learning-plane DDL, `LIST PARTITION BY (project_id)`, plus `work_queue`/
 `dead_letter`), `0003_rls.sql` (`ENABLE ROW LEVEL SECURITY` + `FORCE ROW LEVEL SECURITY` on
 every partitioned table, and the app role's grants — the app role is **not** table owner and
-holds **no** `BYPASSRLS`). Each has a matching `.rollback.sql`. Migrations are plain SQL by
+holds **no** `BYPASSRLS`), `0004_lifecycle.sql`, `0005_bm25.sql` (the BM25 ranking setup —
+the `tracebed_lexical` tokenizer config and the `content_bm25` column; the `vchord_bm25` +
+`pg_tokenizer` extensions themselves ship in `0001`. Per-term document frequency comes from a
+`lexemes` tsvector column; this stack **replaced the phantom `pg_textsearch` extension**, which
+does not exist — see DECISIONS D-140), and `0006_q_update_ledger.sql`. Each has a matching `.rollback.sql`.
+Migrations are plain SQL by
 design (D-034: "Alembic drags SQLAlchemy against the lean-deps rule; a first-party runner
 reinvents ordering/locking yoyo already solved") — there is no ORM layer to fight when reading
 them.
@@ -324,6 +342,13 @@ INCOMPLETE 6/7` and `harness/phase1_gate.py → INCOMPLETE 6/7`: the leak suite 
 bench both need a live Postgres this build environment does not have, and reporting them as
 `PASS` anyway would be exactly the lie this section exists to rule out. **`INCOMPLETE` is not
 `PASS`, and a report claiming otherwise is the defect, not the environment.**
+
+**Superseded (2026-07):** a live Postgres 18.3 / Valkey stack is now up in dev, migrations
+`0001`..`0006` apply, the cross-project leak suite passes **7/7** under the `NOBYPASSRLS` app
+role, and the full suite is green — so those `INCOMPLETE 6/7` baselines describe the *no-stack
+CI path*, not a run against the live stack, where Phase 0/1's leak suite and latency bench do
+execute. The verdict semantics above are unchanged; only the "this environment has no Docker"
+premise no longer holds for the dev bring-up.
 
 Phase 2 and Phase 3 gates (`phase2_gate.py` → `PASS 7/7`, `phase3_gate.py` → `PASS 9/9`) run
 fully offline against fakes — their invariants (staleness injection, guessed-reward, red-team
