@@ -55,7 +55,7 @@ import random
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -272,7 +272,13 @@ def run_dependence_drill(
 ) -> DependenceReport:
     rng = random.Random(seed)
     salt = "dependence-test-salt"
-    agent_type_id = AgentTypeId(uuid4())
+    # DETERMINISTIC per `seed`, not `uuid4()`: `assign_arm` hashes `agent_type_id` (with the
+    # session_key + salt) to decide holdout membership, so a random agent_type_id makes the
+    # holdout slice — and hence its small-sample completion rate — vary run-to-run and flake the
+    # MIN_ACCEPTABLE_COMPLETION_RATE floor. Deriving it from `seed` makes the whole drill
+    # reproducible (the completion sampling via `rng` already was); the several-seeds test then
+    # exercises a fixed, distinct split per seed.
+    agent_type_id = AgentTypeId(UUID(int=seed))
     on_pipeline = _pipeline(_HelpfulAssembly())
     off_pipeline = _pipeline(_EmptyAssembly())
 

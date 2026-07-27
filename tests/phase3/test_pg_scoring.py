@@ -533,6 +533,60 @@ class TestReadPredicateDiscriminatesUnderOwner:
 
 
 # --------------------------------------------------------------------------------------- #
+# (d) The per-MEMORY ledger predicate (scoring.py:86 and :98).
+# --------------------------------------------------------------------------------------- #
+
+
+class TestLedgerReadsAreScopedPerMemory:
+    """`_APPLIED_EVENT_IDS_SQL` (scoring.py:86) and `_SCORED_UPDATES_TODAY_SQL` (scoring.py:98)
+    each carry `AND memory_id = %(memory_id)s` besides the `project_id` conjunct: the ledger is
+    keyed `(project_id, memory_id, event_id)`, so within ONE project two memories share a
+    partition. Dropping the memory_id conjunct would make each read union EVERY memory's ledger
+    rows in the project -- the replay set of one memory would carry another's applied events, and
+    one memory's daily count would carry another's updates, silently defeating the per-memory
+    replay guard and the per-memory daily cap.
+
+    Every other test here seeds a single memory per project, so a dropped memory_id conjunct stays
+    invisible: `project_id` alone still selects the one memory's rows. This seeds TWO distinct
+    memories in the SAME project with DIFFERENT ledger payloads, so each read goes RED the moment
+    the memory_id conjunct is removed. (Proven by the sibling mutation harness that monkeypatches
+    each SQL constant to its conjunct-stripped form and asserts these very assertions turn red.)
+    """
+
+    def test_applied_events_and_daily_count_never_bleed_between_memories(
+        self, scratch: _Scratch
+    ) -> None:
+        pid = scratch.project_a
+        mem_a = mint_memory_id()
+        mem_b = mint_memory_id()  # a SECOND memory in the SAME project/partition
+        _seed_memory(scratch.owner_pool, pid, mem_a)
+        _seed_memory(scratch.owner_pool, pid, mem_b)
+        store = ScorerRepo(scratch.owner_pool)
+
+        # mem_a: two distinct events applied today; mem_b: one -- distinct payloads and distinct
+        # daily counts, so BOTH a dropped conjunct in _APPLIED_EVENT_IDS_SQL and one in
+        # _SCORED_UPDATES_TODAY_SQL change an observed value here.
+        ea1, ea2, eb = uuid4(), uuid4(), uuid4()
+        store.apply_q_update(pid, _q(mem_a, event_id=ea1, scored_at=_NOW, new_q=0.61))
+        store.apply_q_update(pid, _q(mem_a, event_id=ea2, scored_at=_NOW, new_q=0.62))
+        store.apply_q_update(pid, _q(mem_b, event_id=eb, scored_at=_NOW, new_q=0.63))
+
+        # applied_event_ids is per-MEMORY: mem_a's replay set is exactly its own two events, mem_b's
+        # exactly its own one. Dropping the memory_id conjunct unions all three onto both -> RED.
+        assert store.applied_event_ids(pid, mem_a) == {ea1, ea2}
+        assert store.applied_event_ids(pid, mem_b) == {eb}
+
+        # scored_updates_today is per-MEMORY: mem_a counted two today, mem_b one. Dropping the
+        # memory_id conjunct counts all three rows for both memories -> 3 != 2 and 3 != 1 -> RED.
+        assert store.scored_updates_today(pid, mem_a, _NOW.date()) == 2
+        assert store.scored_updates_today(pid, mem_b, _NOW.date()) == 1
+
+        # Sanity: the two memories really are distinct rows, each with its own scored_use_count.
+        assert _scored_use_count(scratch.owner_pool, pid, mem_a) == 2
+        assert _scored_use_count(scratch.owner_pool, pid, mem_b) == 1
+
+
+# --------------------------------------------------------------------------------------- #
 # Small helpers.
 # --------------------------------------------------------------------------------------- #
 

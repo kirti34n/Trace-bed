@@ -474,12 +474,17 @@ _KNOWN_GAPS: tuple[str, ...] = (
     "plateaued', because this is a reporting convention for the projection, not a governed "
     "threshold; a different threshold moves the projected date without moving the "
     "underlying (real, measured) trend.",
-    "This machine has no Docker/Postgres/Valkey, so nothing below exercises a real "
-    "`stores.pg.repo.Repo`; every drill in this report (staleness injection, sweep cost, "
-    "the soak, the baseline walk) runs against the in-memory `MemoryLifecycleRepoPort` / "
-    "`DerivedStateStorePort` doubles the Phase 2 worker chunks themselves were built and "
-    "tested against -- consistent with those chunks' own reported contract gaps (no "
-    "Postgres-backed implementation of either port exists yet anywhere in the tree).",
+    "The narrative DRILLS in this report (staleness injection, sweep cost, the soak, the "
+    "baseline walk) run against the in-memory `MemoryLifecycleRepoPort` / `DerivedStateStorePort` "
+    "doubles the Phase 2 worker chunks were built and tested against, BY CONSTRUCTION -- those "
+    "drills never drive a live `stores.pg.repo.Repo`, regardless of whether a stack is present. "
+    "The gate's SEPARATE `pytest -m phase2` run does exercise the real stores against a database "
+    "when one is reachable: Postgres-backed implementations of both ports now exist "
+    "(`stores.pg.memory_lifecycle`, `stores.pg.derived_state_store`, on `LearningPlane`) and "
+    "carry `@pytest.mark.integration` coverage (tests/phase2/test_pg_memory_lifecycle.py, "
+    "test_scheduled_sweep_isolation_live.py). Both workers nonetheless remain unscheduled in "
+    "production for the reasons `workers.composition.UNSCHEDULED_WORKERS` names, not for want of "
+    "a store.",
     "`invalidation_event`/`derived_state` have no queue topic or scheduled drain wiring "
     "the real-time webhook/poller path into `Invalidator.process_event` /"
     "`DerivedStateWriter.update` in the live process (reported by the `invalidator` and "
@@ -621,21 +626,27 @@ def render_markdown(run: GateRun) -> str:
     w(f"## Overall verdict: **{run.overall_verdict}**")
     w("")
     if run.overall_verdict == "PASS":
-        # S34 (fidelity audit): the verdict rule keys on skipped tests, so the phases with the
-        # LEAST real-stack exposure get the greenest verdicts -- this phase reads PASS partly
-        # BECAUSE it contains no integration-marked tests to skip. Disclosed here, beside the
-        # verdict, rather than in prose 300 lines below it.
+        # S34 (fidelity audit), updated at live bring-up: the verdict rule forces INCOMPLETE if
+        # ANY `-m phase2` case skips, so a PASS is only reachable when every case RAN. This phase
+        # now DOES carry @pytest.mark.integration tests against the new Postgres stores, so a
+        # PASS here means those integration tests actually executed against a live stack -- it is
+        # no longer the "no integration tests, nothing to skip" green the earlier prose claimed.
         w(
-            "> **What this PASS does and does not mean.** Every clause below executed and "
-            "passed against in-memory doubles. This phase contributes no integration-marked "
-            "tests. Four of the ten worker ports M3 enumerates now DO have a Postgres "
-            "implementation (`EmbeddingRepoPort`, `CorroborationRepoPort`, "
-            "`MemoryEditRepoPort`, `ForensicsRepoPort` -- D-128), and not one of those "
-            "statements has ever been EXECUTED: no Docker/Postgres on this machine, and their "
-            "integration tests skip. The other six ports (PLAN.md §11 M3) still have no "
-            "implementation at all. So a green verdict here is evidence about LOGIC, and is "
-            "not evidence that any of it has ever run against a database. The verdict rule "
-            "keys on skipped tests, and a phase with no integration tests has none to skip."
+            "> **What this PASS does and does not mean.** Every `-m phase2` case executed and "
+            "passed, with 0 SKIPPED -- and because the overall verdict rule forces INCOMPLETE "
+            "(never PASS) the moment any `-m phase2` case skips, a PASS here is only reachable "
+            "when this phase's `@pytest.mark.integration` tests against the new Postgres stores "
+            "(tests/phase2/test_pg_memory_lifecycle.py, test_scheduled_sweep_isolation_live.py) "
+            "actually RAN against a live database this run, not merely against in-memory doubles. "
+            "Several of the worker ports M3 enumerates now have a Postgres implementation on "
+            "`LearningPlane` (`stores.pg.{scoring,shadow_validator,promotion,killswitch,"
+            "memory_lifecycle,derived_state_store,distillation}`, plus the D-128 "
+            "`EmbeddingRepoPort` / `CorroborationRepoPort` / `MemoryEditRepoPort` / "
+            "`ForensicsRepoPort`). The narrative DRILLS rendered below additionally exercise the "
+            "worker logic against in-memory doubles by construction. So a green verdict is "
+            "evidence both that the logic composes and that the integration SQL executed; the "
+            "remaining production gap is scheduling, which `workers.composition."
+            "UNSCHEDULED_WORKERS` names, not a missing store."
         )
         w("")
     if run.overall_verdict == "INCOMPLETE":

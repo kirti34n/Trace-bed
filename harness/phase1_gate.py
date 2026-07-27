@@ -434,16 +434,17 @@ _KNOWN_GAPS: tuple[str, ...] = (
     "A write path for memory_item.embedding/embedding_model_id/embedding_model_version now "
     "exists -- stores.pg.learning.EmbeddingRepo, driven by workers.embedder.Embedder on the "
     "workers.embedding_interval_minutes cadence (D-128) -- so the chain memory -> embedding -> "
-    "ANN hit is no longer structurally broken. TWO CAVEATS, both real: the statement has never "
-    "been EXECUTED (no Postgres on this machine; its @pytest.mark.integration test skips), and "
-    "harness/latency_bench.py still seeds through Repo.insert_memory_item, which writes no "
-    "embedding, so this bench's vector arm still measures zero rows. Repo also still has no "
-    "bulk-insert primitive and no lexemes writer.",
-    "This machine has no Docker/Postgres/Valkey, so the latency bench above ran at a "
-    "drastically reduced 'smoke' scale (2 projects x 50 items) by default here, not the real "
-    "50 x 100,000 PLAN.md Section 7 names -- informational only, per D-035, and explicitly "
-    "excluded from the overall verdict either way. Run `python harness/latency_bench.py "
-    "--projects 50 --items-per-project 100000` by hand against a real stack for real numbers.",
+    "ANN hit is no longer structurally broken. TWO CAVEATS, both real: this write statement's "
+    "`@pytest.mark.integration` test EXECUTES only when a live Postgres is reachable (reporting "
+    "SKIPPED-NO-STACK otherwise -- see the integration-coverage gap below for this run's actual "
+    "status), and harness/latency_bench.py still seeds through Repo.insert_memory_item, which "
+    "writes no embedding, so this bench's vector arm still measures zero rows. Repo also still "
+    "has no bulk-insert primitive and no lexemes writer.",
+    "The latency bench above ran at a drastically reduced 'smoke' scale (2 projects x 50 items) "
+    "by default here, not the real 50 x 100,000 PLAN.md Section 7 names -- informational only, "
+    "per D-035, and explicitly excluded from the overall verdict either way. Run `python "
+    "harness/latency_bench.py --projects 50 --items-per-project 100000` by hand against a real "
+    "stack for real numbers.",
     "The whole hot path is proven end to end OFFLINE only "
     "(tests/phase1/test_hotpath_end_to_end.py drives HTTP -> auth -> scope -> pipeline -> "
     "retriever -> arms -> fusion -> assembly -> abstention -> assembler -> renderer -> "
@@ -470,6 +471,50 @@ _KNOWN_GAPS: tuple[str, ...] = (
     "field to compare against -- so it is a capacity policy, not a bound on Valkey memory "
     "(D-051).",
 )
+
+
+def _live_stack_reachable() -> bool:
+    """Best-effort Postgres reachability probe, mirroring
+    `harness/failopen_drill.py::_postgres_reachable` -- never raises, never blocks more than a
+    1s connect timeout. Used to phrase the integration-coverage gap below from the ACTUAL run
+    state rather than a hardcoded 'this machine has no stack' claim."""
+    dsn = os.environ.get("TB_STORAGE__PG_DSN")
+    if not dsn:
+        return False
+    try:
+        import psycopg
+
+        with psycopg.connect(dsn, connect_timeout=1):
+            return True
+    except Exception:
+        return False
+
+
+def _integration_coverage_gap(tally: Tally, *, stack_reachable: bool) -> str:
+    """The integration-coverage caveat, COMPUTED from this run. The no-stack disclosure still
+    appears whenever it is genuinely true (cases skipped, or no live Postgres reachable); when
+    the stack was present and nothing skipped, it says so instead."""
+    if tally.skipped > 0:
+        return (
+            f"Integration coverage: {tally.skipped} `-m phase1` case(s) reported SKIPPED-NO-STACK "
+            "in this run -- `@pytest.mark.integration` assertions (e.g. `test_search_sql.py` / "
+            "`test_scope_sql_predicate.py`'s real-Postgres SQL) whose store dependency was not "
+            "reachable. Re-run against the compose stack (docker/compose.yaml) before trusting a "
+            "PASS."
+        )
+    if not stack_reachable:
+        return (
+            "Integration coverage: no live Postgres was reachable at gate time "
+            "(TB_STORAGE__PG_DSN unset or refused), yet 0 `-m phase1` cases reported SKIPPED -- "
+            "confirm the `@pytest.mark.integration` SQL-surface assertions were not deselected "
+            "before trusting a PASS."
+        )
+    return (
+        "Integration coverage: a live Postgres was reachable at gate time and 0 `-m phase1` "
+        "cases reported SKIPPED -- the `@pytest.mark.integration` SQL-surface assertions "
+        "(`test_search_sql.py` / `test_scope_sql_predicate.py`) executed against the stack "
+        "rather than reporting SKIPPED-NO-STACK."
+    )
 
 _TRACKED_CLASSNAME_KEYWORDS: tuple[str, ...] = (
     "negative_probes.test_negative_probes",
@@ -585,7 +630,10 @@ def run_gate(
         purity_result=purity_combined,
         license_result=license_combined,
         raw_sql_result=raw_sql_combined,
-        known_gaps=_KNOWN_GAPS,
+        known_gaps=(
+            *_KNOWN_GAPS,
+            _integration_coverage_gap(pytest_tally, stack_reachable=_live_stack_reachable()),
+        ),
         untracked_failures=untracked_failures,
         untracked_skips=untracked_skips,
     )

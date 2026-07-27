@@ -86,9 +86,10 @@ __all__ = ["create_pool", "register_typed_id_adapters", "scoped"]
 # against a registry. Without the registration below, EVERY parameterised query in `repo.py`
 # fails at execution time with:
 #     psycopg.ProgrammingError: cannot adapt type 'ProjectId' using placeholder '%s'
-# There is no Postgres on the build machine, so nothing else in Phase 0 can catch this --
+# This dumper resolution needs no database at all, so
 # `tests/phase0/test_repo_isolation_offline.py::test_typed_ids_are_adaptable_by_psycopg`
-# exercises the dumper resolution directly, with no database.
+# exercises it directly and catches a missing registration whether or not a live Postgres is
+# reachable -- it does not depend on a stack being present or absent.
 #
 # Registered against the `TypedId` BASE class: psycopg's `AdaptersMap.get_dumper` walks the MRO,
 # so one registration covers every present and future id subclass -- a new id type can never

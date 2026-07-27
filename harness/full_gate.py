@@ -232,10 +232,10 @@ def render_markdown(run: FullGateRun) -> str:
         w("> At least one phase gate FAILED (or its runner crashed). The project is NOT feature-complete.")
     elif run.overall_verdict == "INCOMPLETE":
         w(
-            "> No phase gate FAILED, but at least one could not be fully verified in "
-            "this environment (most commonly: no Docker/Postgres/Valkey/S3 here, so "
-            "integration-marked tests legitimately skip). This is **not** a pass -- see "
-            "each phase's own report below for exactly what was and was not verified."
+            "> No phase gate FAILED, but at least one could not be fully verified. This is "
+            "**not** a pass -- see each phase's own report below for exactly what was and was "
+            "not verified, and (for any integration-coverage caveat) whether it reflects an "
+            "actual skip observed in this run rather than an assumed absent stack."
         )
     else:
         w("> All five phase gates read PASS.")

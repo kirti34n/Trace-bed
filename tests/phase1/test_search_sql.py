@@ -766,3 +766,138 @@ def test_lexical_arm_writes_and_ranks_under_the_app_role(pg: str) -> None:
     finally:
         app_pool.close()
         owner_pool.close()
+
+
+# --------------------------------------------------------------------------- #
+# Integration — document_frequency's stopword CASE (search.py:376), proven against a live corpus.
+# --------------------------------------------------------------------------- #
+
+# A retrievable memory_item (validated / Tier A) with its `lexemes` tsvector populated exactly the
+# way the write path (repo._INSERT_MEMORY_ITEM_SQL) computes it -- `to_tsvector('english', content)`
+# -- so `document_frequency`'s `lexemes @@ plainto_tsquery('english', term)` counting sees a real
+# corpus. content_bm25/embedding are left NULL: this exercise is the tsvector DF path, not BM25.
+_DF_SEED_SQL = """
+INSERT INTO memory_item (
+    id, project_id, scope_type, mem_type, kind, lane, trust_tier, status,
+    content, content_hash, token_count, provenance, scan_verdict_id, lexemes
+) VALUES (
+    %(id)s, %(project_id)s, 'project_shared', 'lesson', 'k', 'operational', 'A', 'validated',
+    %(content)s, %(content_hash)s, %(token_count)s, '{}'::jsonb, %(verdict)s,
+    to_tsvector('english', %(content)s)
+)
+""".strip()
+
+
+@pytest.fixture
+def df_scratch(pg: str) -> Iterator[tuple[str, ProjectId]]:
+    """A throwaway database (never the shared tracebed DB the integrate phase owns), migrated,
+    with one provisioned project, dropped on teardown regardless of outcome. Skips cleanly if the
+    schema cannot be brought current or the pgvector/vchord_bm25 access methods a project partition
+    needs are unavailable -- a provisioning gap on this machine, not evidence about the SQL."""
+    import psycopg
+
+    from tracebed.stores.pg.migrate import apply_migrations
+    from tracebed.stores.pg.partitions import create_project_partitions
+
+    db_name = f"tb_df_{uuid.uuid4().hex}"
+    base = pg.rsplit("/", 1)[0]
+    owner_url = f"{base}/{db_name}"
+
+    admin = psycopg.connect(pg, autocommit=True)
+    try:
+        admin.execute(f'CREATE DATABASE "{db_name}"')
+    finally:
+        admin.close()
+
+    try:
+        try:
+            apply_migrations(owner_url)
+        except Exception as exc:
+            pytest.skip(f"could not bring the schema current: {exc.__class__.__name__}")
+        project_id = ProjectId(uuid.uuid4())
+        try:
+            with psycopg.connect(owner_url) as conn:
+                create_project_partitions(conn, project_id)
+                conn.commit()
+        except psycopg.errors.UndefinedObject as exc:
+            pytest.skip(f"pgvector/vchord_bm25 access method unavailable: {exc}")
+        except Exception as exc:  # pragma: no cover - environment-dependent
+            pytest.skip(f"could not provision a test project: {exc.__class__.__name__}")
+        yield owner_url, project_id
+    finally:
+        drop = psycopg.connect(pg, autocommit=True)
+        try:
+            drop.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (db_name,),
+            )
+            drop.execute(f'DROP DATABASE IF EXISTS "{db_name}"')
+        finally:
+            drop.close()
+
+
+@pytest.mark.integration
+def test_document_frequency_reports_a_stopword_at_the_full_corpus_count(
+    df_scratch: tuple[str, ProjectId],
+) -> None:
+    """`search.py:376`'s CASE, proven end-to-end against a live corpus rather than SQL text.
+
+    `plainto_tsquery('english', 'the')` is EMPTY -- English stopwords produce no lexeme -- so a
+    naive `COUNT` of `lexemes @@ plainto_tsquery(...)` matches zero rows and would report df=0. The
+    abstention rarity gate reads df=0 as "0% of the corpus == maximally rare", which would invert
+    the corpus's commonest words into its rarest and let two shared stopwords clear
+    `rarity_min_shared_terms` (search.py:359-366). The
+    `WHEN plainto_tsquery('english', t.term)::text = '' THEN (SELECT n FROM corpus)` branch instead
+    reports the term at the FULL retrievable corpus count (its true ~100% frequency).
+
+    Three assertions pin the branch from both sides:
+      * a stopword ("the") reports EXACTLY `corpus_size` -- deleting the CASE line, or flipping its
+        condition to `IS NULL` (an empty tsvector is `''`, never NULL, so the branch would never
+        fire), drops df('the') to 0 and fails here;
+      * a genuinely rare present term ("retry", in one of three rows) reports `0 < df < corpus_size`
+        -- so the stopword assertion is not passing merely because everything reports corpus_size;
+      * a non-present, non-stopword term ("photosynthesis") reports 0 -- so the ELSE arm still
+        counts real matches and the stopword count is the CASE branch, not an artifact.
+    """
+    from tracebed.stores.pg.pool import create_pool, scoped
+
+    owner_url, project_id = df_scratch
+    # Every row shares the stopword "the"; "retry" is unique to the first row; "photosynthesis"
+    # appears nowhere. English stemming maps "retry" -> "retri" on both sides, so it still matches.
+    contents = [
+        "the retry budget guards the flaky external tool",
+        "the cache invalidation strategy for the shared service",
+        "the deployment pipeline runs the smoke suite twice",
+    ]
+    pool = create_pool(owner_url)
+    try:
+        with scoped(pool, project_id) as conn:
+            for content in contents:
+                conn.execute(
+                    _DF_SEED_SQL,
+                    {
+                        "id": uuid.uuid4(),
+                        "project_id": project_id,
+                        "content": content,
+                        "content_hash": uuid.uuid4().hex,
+                        "token_count": len(content.split()),
+                        "verdict": uuid.uuid4(),
+                    },
+                )
+
+        store = SearchStore(pool)
+        corpus = store.corpus_size(project_id)
+        assert corpus == len(contents), f"expected {len(contents)} retrievable rows, got {corpus}"
+
+        df = store.document_frequency(project_id, ["the", "retry", "photosynthesis"])
+        # The stopword: empty plainto_tsquery -> the CASE reports the full retrievable corpus count.
+        assert df["the"] == corpus, (
+            f"stopword df must be the full corpus count {corpus} (search.py:376 CASE); got {df['the']}"
+        )
+        # A real, rare term matches its one row -- strictly between nothing and the whole corpus.
+        assert 0 < df["retry"] < corpus, f"rare-term df must be 0 < df < {corpus}; got {df['retry']}"
+        # A non-present, non-stopword term is genuinely zero (the ELSE arm still counts matches).
+        assert df["photosynthesis"] == 0, f"absent-term df must be 0; got {df['photosynthesis']}"
+    finally:
+        pool.close()

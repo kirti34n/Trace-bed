@@ -28,13 +28,22 @@ Three Postgres round trips, not one per candidate: the content fetch, the docume
 lookup for the query's terms, and the corpus count. That is a fixed cost independent of
 `retrieval.fused_top_n`, which is the property that keeps this inside a 300ms p99 budget.
 
-BUDGET NOTE (honest limitation, not a silent one): this module has no deadline of its own — its
-signature comes from `CandidateAssemblyPort` and carries no budget. `hotpath.pipeline` checks the
-total budget before the retriever, after the retriever, and again after this call, so an assembly
-that overruns is correctly REPORTED (the call degrades to `timeout_prefix_only` rather than
-claiming `injected` at 400ms) but is not PRE-EMPTED mid-statement. Pre-empting needs a
-`statement_timeout` derived from the remaining deadline, which is a `stores.pg` concern and is
-recorded as remaining work rather than faked here.
+BUDGET NOTE (invariant 2, D-139): this module still has no client-side deadline of its own — its
+signature comes from `CandidateAssemblyPort` and carries no elapsed reading — so `hotpath.pipeline`
+remains the layer that REPORTS an overrun, checking the total budget before the retriever, after
+the retriever, and again after this call (a call that overran degrades to `timeout_prefix_only`
+rather than claiming `injected` at 400ms). What this module now ALSO does is bound its three store
+round trips SERVER-side: `run` derives a `statement_timeout_ms` from `cfg.retrieval.total_budget_ms`
+— the exact source `hotpath.retriever` derives every arm bound from — and passes it into
+`SearchStore.fetch_candidates`/`corpus_size`/`document_frequency`, which forward it to
+`stores.pg.pool.scoped()` as a transaction-scoped `set_config` exactly as the arms do. Before this,
+a wedged Postgres ran an assembly query unbounded after the pipeline had already given up on the
+call; the client-side report was correct but the backend stayed busy. The bound is deliberately the
+WHOLE budget, not the remaining sliver — the port carries no `started_at_ms`, so this module cannot
+know how much of the 300ms the retriever already spent — which is coarser than the retriever's own
+per-statement derivation but still un-wedges the backend, and never bounds TIGHTER than the caller's
+own total budget. Non-hot-path callers of those store methods (`hotpath.jit`, background workers)
+pass nothing and keep the unbounded default.
 
 SCOPE VISIBILITY: every fetched row is also checked against `domain.visibility.scope_visible`
 before it can become a `Candidate` (MEMORY_PLAN §5's ownership model). The arms return ids only,
@@ -53,6 +62,7 @@ crypto, no provider SDK — `scripts/purity_check.py` proves it by reachability.
 
 from __future__ import annotations
 
+import inspect
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -130,12 +140,24 @@ class CandidateStorePort(Protocol):
     """
 
     def fetch_candidates(
-        self, project_id: ProjectId, memory_ids: Sequence[MemoryId]
+        self,
+        project_id: ProjectId,
+        memory_ids: Sequence[MemoryId],
+        *,
+        statement_timeout_ms: int | None = None,
     ) -> list[CandidateRow]: ...
 
-    def document_frequency(self, project_id: ProjectId, terms: Sequence[str]) -> dict[str, int]: ...
+    def document_frequency(
+        self,
+        project_id: ProjectId,
+        terms: Sequence[str],
+        *,
+        statement_timeout_ms: int | None = None,
+    ) -> dict[str, int]: ...
 
-    def corpus_size(self, project_id: ProjectId) -> int: ...
+    def corpus_size(
+        self, project_id: ProjectId, *, statement_timeout_ms: int | None = None
+    ) -> int: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,12 +210,45 @@ def slot_for(row: CandidateRow) -> Slot:
     return _SLOT_BY_MEM_TYPE[row.mem_type]
 
 
+def _store_bounds_statements(store: CandidateStorePort) -> bool:
+    """True when every one of the store's three read methods accepts `statement_timeout_ms`.
+
+    `CandidateStorePort` is `@runtime_checkable`, which proves the three method NAMES exist but
+    says nothing about their signatures, so a store can satisfy the port and still not accept the
+    optional D-139 bound (`hotpath.jit`'s tests, `hotpath.assembly`'s tests, a future non-pg
+    retrieval driver). Feature-detecting the bound here — rather than passing it unconditionally
+    — is what lets `run()` bound the production `stores.pg.search.SearchStore` server-side while
+    calling any other store with the exact argument list it accepted before this change. All
+    three are checked, not just one, because `run` forwards the same keyword to all three; a store
+    that grew it on one method only would still raise on the other two.
+    """
+    for name in ("fetch_candidates", "document_frequency", "corpus_size"):
+        try:
+            params = inspect.signature(getattr(store, name)).parameters
+        except (TypeError, ValueError):  # pragma: no cover - store methods are always introspectable
+            return False
+        if "statement_timeout_ms" not in params:
+            return False
+    return True
+
+
 class CandidateAssembly:
     """`CandidateAssemblyPort`: fused candidates -> a decided outcome + packed slot list."""
 
     def __init__(self, store: CandidateStorePort, clock: Clock) -> None:
         self._store = store
         self._clock = clock
+        # Whether this store accepts the optional `statement_timeout_ms` bound (D-139). The
+        # production `stores.pg.search.SearchStore` does — its three read methods pass the value
+        # straight into `stores.pg.pool.scoped()`, so a wedged Postgres cannot run an assembly
+        # query unbounded server-side after the caller's synchronous budget has already elapsed.
+        # A store that has NOT grown the parameter (an offline test double, an alternative
+        # retrieval driver) is called WITHOUT the keyword rather than with one it cannot accept —
+        # the same opt-in, None-default discipline `scoped()` and the two retrieval arms already
+        # follow, so bounding the assembly stage never changes the call shape a non-hot-path
+        # collaborator sees. Resolved once here, not per call, because a store's shape is fixed
+        # for its lifetime and `run()` is on the 300ms p99 path.
+        self._store_bounds_statements = _store_bounds_statements(store)
 
     def run(
         self,
@@ -216,10 +271,18 @@ class CandidateAssembly:
                 outcome_code=OutcomeCode.EMPTY_RESULT, slots=(), top_score=None, injections=()
             )
 
+        # The assembly stage's three store round trips run on the SAME synchronous 300ms budget
+        # the two retrieval arms run under (`retrieval.total_budget_ms`, the number the retriever
+        # derives every one of its own bounds from), so they carry the same server-side bound the
+        # arms carry — otherwise a wedged Postgres runs them unbounded after the caller has given
+        # up (assembly.py's own BUDGET NOTE, D-139). Passed as `**timeout` so a store that has not
+        # grown the parameter is called with the exact same argument list it saw before this
+        # change (see `__init__`).
+        timeout = self._statement_timeout_kwargs(cfg)
         rows = {
             row.memory_id: row
             for row in self._store.fetch_candidates(
-                scope.project_id, [c.memory_id for c in candidates]
+                scope.project_id, [c.memory_id for c in candidates], **timeout
             )
         }
         if not rows:
@@ -230,7 +293,7 @@ class CandidateAssembly:
                 outcome_code=OutcomeCode.EMPTY_RESULT, slots=(), top_score=None, injections=()
             )
 
-        rarity = self._rarity_lookup(scope.project_id, query_text, list(rows.values()))
+        rarity = self._rarity_lookup(scope.project_id, query_text, list(rows.values()), timeout)
         now_ms = self._clock.now_ms()
         # `agent_type_id` is server-derived (`Repo.resolve_project`), never caller-asserted;
         # the other two references have no resolver yet and therefore match nothing (see
@@ -355,17 +418,39 @@ class CandidateAssembly:
             injections=injections,
         )
 
+    def _statement_timeout_kwargs(self, cfg: EffectiveConfig) -> dict[str, int]:
+        """The `statement_timeout_ms` keyword to hand each store call, or `{}`.
+
+        `retrieval.total_budget_ms` is the exact source `hotpath.retriever` derives its own arm
+        bounds from, so the assembly queries and the arm queries cannot drift apart on how long
+        Postgres may run one statement (D-139). Returns `{}` — no keyword at all — when the store
+        does not accept the bound, so the call shape a non-hot-path collaborator sees is unchanged
+        (see `__init__`); passing `statement_timeout_ms=None` would still be an unexpected keyword
+        to such a store.
+        """
+        if not self._store_bounds_statements:
+            return {}
+        return {"statement_timeout_ms": cfg.retrieval.total_budget_ms}
+
     def _rarity_lookup(
-        self, project_id: ProjectId, query_text: str, rows: Sequence[CandidateRow]
+        self,
+        project_id: ProjectId,
+        query_text: str,
+        rows: Sequence[CandidateRow],
+        timeout: dict[str, int],
     ) -> dict[MemoryId, RarityEvidence]:
         """Per-candidate rarity evidence, from ONE `document_frequency` call for the whole query.
 
         Document frequency is a property of a TERM and the corpus, not of a candidate, so the
         lookup is per query, not per candidate; what differs per candidate is only WHICH of the
         query's terms it shares.
+
+        `timeout` is `run`'s already-resolved `statement_timeout_ms` keyword (or `{}`), forwarded
+        so the corpus count and the df lookup carry the same server-side bound as the content
+        fetch — all three are the assembly stage's own store round trips on one budget.
         """
         terms = query_terms(query_text)
-        corpus = self._store.corpus_size(project_id)
+        corpus = self._store.corpus_size(project_id, **timeout)
         if corpus <= 0 or not terms:
             # No corpus is the cold-start case `abstention.rarity_gate_passes` already refuses
             # unconditionally; issuing a df query against it would be work whose answer cannot
@@ -375,7 +460,7 @@ class CandidateAssembly:
                 for row in rows
             }
 
-        frequencies = self._store.document_frequency(project_id, terms)
+        frequencies = self._store.document_frequency(project_id, terms, **timeout)
         evidence: dict[MemoryId, RarityEvidence] = {}
         for row in rows:
             content_terms = set(query_terms(row.content))

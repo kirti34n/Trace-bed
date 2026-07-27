@@ -203,8 +203,9 @@ UNSCHEDULED_WORKERS: Final[Mapping[str, str]] = MappingProxyType(
         "FIDELITY-AUDIT.md M3/M7.",
         "shadow_validator": "ShadowValidatorRepoPort is now implemented "
         "(stores.pg.shadow_validator, LearningPlane.shadow_validator_repo) and the evidence "
-        "half is live (corroboration is scheduled and writes shadow_confirm_runs). Still "
-        "unscheduled because ShadowValidator.run_once needs a host-supplied "
+        "half exists (the corroboration writer records shadow_confirm_runs whenever it runs -- "
+        "it is host-gated on a CorroborationCandidateSource, so it is NOT part of the default "
+        "wiring). Still unscheduled because ShadowValidator.run_once needs a host-supplied "
         "TracePrincipalLookupPort + a ScoringEpoch source -- FIDELITY-AUDIT.md M3.",
         "promotion": "PromotionRepoPort's write half (persist + insert_review_item) is "
         "implemented (stores.pg.promotion, LearningPlane.promotion_repo), but its two select_* "
@@ -488,12 +489,23 @@ def build_scheduled_jobs(
 
     scheduled = {job.name for job in jobs}
     unscheduled = dict(UNSCHEDULED_WORKERS)
-    if corroboration is None or candidate_source is None:
+    # Derive the reason from the ACTUAL state, not a single assumed cause: corroboration is
+    # left out of the schedule either because no source was supplied at all, or because a
+    # source was handed to the scheduler while the LearningPlane was built without one (so its
+    # writer is None). Asserting "no source supplied" in the second case would be a false claim.
+    if candidate_source is None:
         unscheduled["corroboration"] = (
-            "constructed, but not scheduled: no CorroborationCandidateSource was supplied. "
+            "not scheduled: no CorroborationCandidateSource was supplied to build_scheduled_jobs. "
             "Deciding WHICH runs corroborate WHICH quarantined memory is a declared "
             "host-supplied seam (D-121), not this repository's invention -- without one there "
             "is nothing for the writer to record."
+        )
+    elif corroboration is None:
+        unscheduled["corroboration"] = (
+            "not scheduled: a CorroborationCandidateSource was supplied to build_scheduled_jobs, "
+            "but the LearningPlane was built without one, so plane.corroboration is None and "
+            "there is no writer to run. Build the plane and the schedule with the same source "
+            "(D-121)."
         )
     validate_worker_coverage(scheduled, unscheduled=unscheduled)
     for name, reason in sorted(unscheduled.items()):

@@ -737,7 +737,11 @@ class SearchStore:
         return [_row_to_arm_hit(r) for r in rows]
 
     def fetch_candidates(
-        self, project_id: ProjectId, memory_ids: Sequence[MemoryId]
+        self,
+        project_id: ProjectId,
+        memory_ids: Sequence[MemoryId],
+        *,
+        statement_timeout_ms: int | None = None,
     ) -> list[CandidateRow]:
         """The content/score columns for already-retrieved candidate ids, in ONE statement.
 
@@ -753,11 +757,21 @@ class SearchStore:
         no-longer-retrievable memory into a prompt. Rows are returned in whatever order Postgres
         produces; the caller re-joins them to the fused order by id (it must, since a row can be
         legitimately absent).
+
+        `statement_timeout_ms` is the SERVER-side bound of invariant 2, passed into `scoped()`
+        exactly as `lexical_arm`/`vector_arm` pass their own (D-139). This is the assembly stage's
+        query, issued by `hotpath.assembly.CandidateAssembly.run` on the same synchronous 300ms
+        budget the arms run under; without the bound a wedged Postgres runs it unbounded
+        server-side even after the caller has stopped waiting. `None` (the default, and every
+        non-hot-path caller — `hotpath.jit`, tests) leaves the pre-D-139 behaviour untouched.
         """
         ids = [memory_id.value for memory_id in dict.fromkeys(memory_ids)][:_MAX_ARM_TOP_N]
         if not ids:
             return []
-        with scoped(self._pool, project_id) as conn, conn.cursor(row_factory=dict_row) as cur:
+        with (
+            scoped(self._pool, project_id, statement_timeout_ms=statement_timeout_ms) as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
             cur.execute(
                 _FETCH_CANDIDATES_SQL,
                 {"project_id": project_id, "ids": ids, **_retrievability_params()},
@@ -765,7 +779,13 @@ class SearchStore:
             rows = cur.fetchall()
         return [_row_to_candidate(r) for r in rows]
 
-    def document_frequency(self, project_id: ProjectId, terms: Sequence[str]) -> dict[str, int]:
+    def document_frequency(
+        self,
+        project_id: ProjectId,
+        terms: Sequence[str],
+        *,
+        statement_timeout_ms: int | None = None,
+    ) -> dict[str, int]:
         """Per-term document frequency among retrievable rows — the IDF source the rarity gate
         needs (`hotpath.abstention.RarityEvidence`, D-003/D-140). Counted off the `lexemes`
         tsvector (`m.lexemes @@ plainto_tsquery('english', term)`), not the vchord_bm25 ranking
@@ -778,11 +798,17 @@ class SearchStore:
         every query term's df, including the ones nothing matched. Empty `terms` returns `{}`
         without issuing a statement, and the deduplicated term list is bounded by `_MAX_DF_TERMS`
         because `terms` is derived from caller-supplied query text (see that constant).
+
+        `statement_timeout_ms`: see `fetch_candidates` — the assembly stage's rarity lookup runs
+        on the same hot-path budget, and is bounded server-side by the same D-139 mechanism.
         """
         deduped = list(dict.fromkeys(terms))[:_MAX_DF_TERMS]
         if not deduped:
             return {}
-        with scoped(self._pool, project_id) as conn, conn.cursor(row_factory=dict_row) as cur:
+        with (
+            scoped(self._pool, project_id, statement_timeout_ms=statement_timeout_ms) as conn,
+            conn.cursor(row_factory=dict_row) as cur,
+        ):
             cur.execute(
                 _DOCUMENT_FREQUENCY_SQL,
                 {
@@ -794,10 +820,19 @@ class SearchStore:
             rows = cur.fetchall()
         return {str(r["term"]): int(r["df"]) for r in rows}
 
-    def corpus_size(self, project_id: ProjectId) -> int:
+    def corpus_size(
+        self, project_id: ProjectId, *, statement_timeout_ms: int | None = None
+    ) -> int:
         """Count of retrievable rows in this project — the cold-start abstention floor's
-        denominator (`abstention.rarity_min_corpus_docs`, PLAN.md §6)."""
-        with scoped(self._pool, project_id) as conn, conn.cursor() as cur:
+        denominator (`abstention.rarity_min_corpus_docs`, PLAN.md §6).
+
+        `statement_timeout_ms`: see `fetch_candidates` — the assembly stage's corpus count runs on
+        the same hot-path budget, and is bounded server-side by the same D-139 mechanism.
+        """
+        with (
+            scoped(self._pool, project_id, statement_timeout_ms=statement_timeout_ms) as conn,
+            conn.cursor() as cur,
+        ):
             cur.execute(_CORPUS_SIZE_SQL, {"project_id": project_id, **_retrievability_params()})
             row = cur.fetchone()
         return int(row[0]) if row is not None else 0

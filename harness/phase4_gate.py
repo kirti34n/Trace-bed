@@ -43,9 +43,10 @@ CLAUSE 5 ("full CI green") RUNS THE WHOLE PROJECT, NOT ONLY `-m phase4`. Per thi
 own brief, "full CI green" means the baseline that must not regress: the FULL `pytest -q`
 (every marker, every phase), `mypy`, `ruff check src tests harness scripts`, and the three
 static gates (license/raw-SQL/purity). Expected integration-marked skips in that full run
-(no Docker/Postgres/Valkey/S3/LLM in this environment -- documented baseline "3258 passed,
-40 skipped") are NOT treated as a failure for clause 5: they are a pre-existing, accepted
-condition of this environment, distinct from clause 1-4's OWN `-m phase4` tests, which
+(whichever cases could not reach Postgres/Valkey/S3/LLM in the environment the gate ran in --
+the actual count is read from THIS run's tally and reported by clause 5, never a fixed
+baseline) are NOT treated as a failure for clause 5: they are a pre-existing, accepted
+condition, distinct from clause 1-4's OWN `-m phase4` tests, which
 PLAN.md section 7 states must be fixture-only with NO host dependency at all -- a skip
 there has no legitimate excuse and is what makes the overall verdict INCOMPLETE.
 
@@ -415,9 +416,10 @@ def _assertion_full_ci_green(
     """"full CI green." Per this task's own brief, the baseline that must not regress:
     the FULL `pytest -q` (every marker, not only `-m phase4`), `mypy`, `ruff check src
     tests harness scripts`, and the three static gates. Expected integration-marked
-    skips in THIS run (no Docker/Postgres/Valkey/S3/LLM in this environment) are not a
-    failure here -- see this module's docstring for why that is a deliberately
-    different rule than clause 1-4's own `-m phase4` no-skip requirement.
+    skips in THIS run (whichever cases could not reach their store/LLM dependency; the
+    count comes from the run's own tally) are not a failure here -- see this module's
+    docstring for why that is a deliberately different rule than clause 1-4's own
+    `-m phase4` no-skip requirement.
     """
     ok = (
         full_pytest.ok
@@ -611,16 +613,62 @@ _KNOWN_GAPS: tuple[str, ...] = (
     "STOP, not something this mechanical parse can settle. Clause 6 above verifies only "
     "that DECISIONS.md is well-formed (unique ids, every entry dated), not that its "
     "content is complete.",
-    "This machine has no Docker/Postgres/Valkey/S3 and no real LLM endpoint. Every "
-    "drill in this report (the contention drill, the workflow-scope drill, the Sybil "
-    "probe) runs entirely offline against in-memory fakes; the full pytest run behind "
-    "clause 5 legitimately skips every @pytest.mark.integration test for the same "
-    "reason (documented baseline: '3258 passed, 40 skipped'), which is why clause 5 "
-    "does not apply the same zero-skip rule clauses 1-4's own -m phase4 tests are held "
-    "to (PLAN.md section 7 states THIS phase's own new tests must be fixture-only with "
-    "no host dependency at all -- the pre-existing integration-marked tests from "
-    "earlier phases carry no such promise and never have).",
+    "The narrative DRILLS in this report (the contention drill, the workflow-scope "
+    "drill, the Sybil probe) run against in-memory fakes BY CONSTRUCTION -- those "
+    "drills never drive a live stack, regardless of whether one is present. The gate's "
+    "SEPARATE full `pytest -q` run behind clause 5 does exercise integration-marked "
+    "tests against the stack when one is reachable, and may skip them when it is not; "
+    "that skip count is reported from the actual tally (see the computed "
+    "integration-coverage gap below), never a fixed baseline, and is why clause 5 does "
+    "not apply the same zero-skip rule clauses 1-4's own -m phase4 tests are held to "
+    "(PLAN.md section 7 states THIS phase's own new tests must be fixture-only with no "
+    "host dependency at all -- the pre-existing integration-marked tests from earlier "
+    "phases carry no such promise and never have).",
 )
+
+
+def _live_stack_reachable() -> bool:
+    """Best-effort Postgres reachability probe, mirroring
+    `harness/failopen_drill.py::_postgres_reachable` -- never raises, never blocks more than a
+    1s connect timeout. Used to phrase clause 5's integration-skip caveat from the ACTUAL run
+    state rather than a hardcoded 'no stack in this environment' baseline."""
+    dsn = os.environ.get("TB_STORAGE__PG_DSN")
+    if not dsn:
+        return False
+    try:
+        import psycopg
+
+        with psycopg.connect(dsn, connect_timeout=1):
+            return True
+    except Exception:
+        return False
+
+
+def _clause5_skip_caveat(full_tally: Tally, *, stack_reachable: bool) -> str:
+    """Clause 5's integration-skip disclosure, COMPUTED from the full-suite tally rather than
+    the retired '3258 passed, 40 skipped' baseline. The no-stack caveat still appears whenever
+    skips genuinely occurred (or no live Postgres was reachable); when the stack was present and
+    nothing skipped, it says so instead of asserting a skip count that did not happen."""
+    if full_tally.skipped > 0:
+        return (
+            f"Clause 5 (full CI): the full `pytest -q` run reported {full_tally.passed} passed / "
+            f"{full_tally.skipped} skipped this run. Those skips are integration-marked cases "
+            "whose Postgres/Valkey/S3/LLM dependency was not reachable here; they are a "
+            "pre-existing, accepted condition (clauses 1-4's own `-m phase4` tests are held to a "
+            "stricter zero-skip rule, PLAN.md section 7). Re-run against the compose stack to "
+            "clear them. This count is read from the actual run, not a fixed baseline."
+        )
+    reachable = (
+        "a live Postgres was reachable at gate time"
+        if stack_reachable
+        else "no live Postgres was reachable at gate time"
+    )
+    return (
+        f"Clause 5 (full CI): the full `pytest -q` run reported {full_tally.passed} passed / 0 "
+        f"skipped this run -- every integration-marked test that would otherwise skip either "
+        f"executed or was absent ({reachable}). This count is read from the actual run, not a "
+        "fixed baseline."
+    )
 
 # Only classnames covered by a FULL-FILE (no test-name filter) pytest selection belong
 # here. `test_blackboard.py` (assertion 2) and `test_agent_control.py` (assertion 4) are
@@ -649,9 +697,10 @@ def _untracked_skips(cases: list[Case]) -> tuple[Case, ...]:
     line -- but they are reported apart, because they mean different things and the
     earlier wording conflated them:
 
-    - NO-STACK: the case is `@pytest.mark.integration` and skipped because this
-      machine has no Postgres/Valkey/S3. Legitimate, identical in kind to the Phase
-      0-3 integration skips, and cleared by running against the compose stack.
+    - NO-STACK: the case is `@pytest.mark.integration` and skipped because its
+      Postgres/Valkey/S3 dependency was not reachable in this run. Legitimate,
+      identical in kind to the Phase 0-3 integration skips, and cleared by running
+      against the compose stack.
     - NO EXCUSE: the case is NOT integration-marked. PLAN.md section 7 Phase 4 says
       the contention tests are FIXTURE-ONLY with no host dependency, so an unmarked
       skip here is a test that was disabled rather than a stack that was absent.
@@ -668,7 +717,8 @@ def _untracked_skips(cases: list[Case]) -> tuple[Case, ...]:
 
 
 def _skip_is_no_stack(case: Case) -> bool:
-    """True when a skip is the documented "no Docker on this machine" case.
+    """True when a skip is the documented "no-stack" case (its store/LLM dependency
+    was not reachable in this run).
 
     Keyed on the skip MESSAGE rather than on the marker, because the JUnit XML this
     module parses carries the reason text but not the marker set. Every such fixture
@@ -761,7 +811,10 @@ def run_gate(
         license_result=license_result,
         raw_sql_result=raw_sql_result,
         purity_result=purity_result,
-        known_gaps=_KNOWN_GAPS,
+        known_gaps=(
+            *_KNOWN_GAPS,
+            _clause5_skip_caveat(full_pytest_tally, stack_reachable=_live_stack_reachable()),
+        ),
         untracked_failures=untracked_failures,
         untracked_skips=untracked_skips,
     )
@@ -900,9 +953,10 @@ def render_markdown(run: GateRun) -> str:
                 w(f"- `{classname}` -- {len(group)} skipped: {reason}")
 
         if no_stack:
-            w("**SKIPPED-NO-STACK** -- integration-marked, skipped because this machine has no "
-              "Postgres/Valkey/S3. Legitimate and identical in kind to the Phase 0-3 integration "
-              "skips; cleared by re-running against `docker/compose.yaml`.")
+            w("**SKIPPED-NO-STACK** -- integration-marked, skipped because their "
+              "Postgres/Valkey/S3 dependency was not reachable in this run. Legitimate and "
+              "identical in kind to the Phase 0-3 integration skips; cleared by re-running "
+              "against `docker/compose.yaml`.")
             w("")
             _group(no_stack)
             w("")

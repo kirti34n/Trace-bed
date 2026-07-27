@@ -22,9 +22,10 @@ a reimplementation:
 
 HOW HONEST IS IT? Precisely this honest, stated up front so no reader has to infer it:
 
-  * There is NO Postgres, Valkey or S3 on this machine (PHASE0-CONTRACT.md §12). Every hop
-    that needs a store runs against an in-memory `_Vault` that implements the worker's own
-    declared `Protocol`, plus — for hops 1 and 9 — the fakes the existing test suites already
+  * This drill runs against in-memory doubles BY CONSTRUCTION, regardless of whether a live
+    Postgres/Valkey/S3 stack is present — it never probes or drives one. Every hop that needs a
+    store runs against an in-memory `_Vault` that implements the worker's own declared
+    `Protocol`, plus — for hops 1 and 9 — the fakes the existing test suites already
     use (`tests.phase0.test_trace_writer`'s `FakeQueue`/`FakeTraceRepo`/`FakeTraceStore`, and a
     statement-recording fake pool of exactly the shape `tests/phase1/test_search_sql.py` uses).
   * Hop 9 therefore proves that `LifecycleWriter` ISSUES the correct `UPDATE memory_item` and
@@ -34,10 +35,13 @@ HOW HONEST IS IT? Precisely this honest, stated up front so no reader has to inf
     refused it at every earlier status. It does not execute a `WHERE` clause, because a fake
     cursor cannot. `tests/phase1/test_learning_repos.py` and `tests/phase1/test_search_sql.py`
     carry the `@pytest.mark.integration` versions of both claims; neither has ever run here.
-  * Hops 5, 6 and 7 use in-memory repos for ports that have NO Postgres implementation at all
-    (`ShadowValidatorRepoPort`, `ScorerRepoPort`, `PromotionRepoPort` — audit finding M3, still
-    open). Those three hops prove the LOGIC composes. They do not prove a deployed process runs
-    them, and `workers.composition.UNSCHEDULED_WORKERS` says so by name.
+  * Hops 5, 6 and 7 use in-memory repos for `ShadowValidatorRepoPort`, `ScorerRepoPort` and
+    `PromotionRepoPort`. Those ports NOW have Postgres implementations on `LearningPlane`
+    (`stores.pg.{shadow_validator,scoring,promotion}` — audit finding M3's store half is
+    closed); this drill uses in-memory doubles by construction rather than for want of a store.
+    Those three hops prove the LOGIC composes. They do not prove a deployed process runs them:
+    the workers remain UNSCHEDULED in production, and `workers.composition.UNSCHEDULED_WORKERS`
+    says why by name (host-supplied ports / unspecified schema, not a missing store).
 
 So: a PASS here means "the loop closes when every store method exists", not "the loop closes in
 production today". The gap between those two sentences is exactly `UNSCHEDULED_WORKERS`, and
@@ -168,7 +172,8 @@ class Hop:
     proven_against: str
     """What the assertion actually ran against -- "real in-memory port", "recording fake
     pool", "pure function". Printed beside every hop so a reader never has to guess how much
-    of the claim is database-backed. None of it is, on this machine."""
+    of the claim is database-backed. None of it is here: this drill uses in-memory doubles by
+    construction, regardless of whether a live stack is present."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "checks", dict(self.checks))
@@ -945,7 +950,7 @@ def run_closed_loop() -> ClosedLoopReport:
                 f"{sorted(o.independent_count for o in shadow_result.outcomes)}; "
                 f"reasons: {[o.reason for o in shadow_result.outcomes if o.reason]}"
             ),
-            proven_against="real in-memory ShadowValidatorRepoPort (NO Postgres impl exists)",
+            proven_against="in-memory ShadowValidatorRepoPort double (a Postgres impl now exists: stores.pg.shadow_validator, LearningPlane)",
         )
     )
 
@@ -985,7 +990,7 @@ def run_closed_loop() -> ClosedLoopReport:
                 "the scorer reported the update it applied": score_result.applied is not None,
             },
             detail=f"Q {q_before:.4f} -> {q_after:.4f} from one unambiguous verdict outcome",
-            proven_against="real in-memory ScorerRepoPort (NO Postgres impl exists)",
+            proven_against="in-memory ScorerRepoPort double (a Postgres impl now exists: stores.pg.scoring, LearningPlane)",
         )
     )
 
@@ -1026,7 +1031,7 @@ def run_closed_loop() -> ClosedLoopReport:
                 f"row is now {vault.rows[quarantine_pre_id].status.value}"
                 + (f"; guard said: {promotion_reason}" if promotion_reason else "")
             ),
-            proven_against="real in-memory PromotionRepoPort (NO Postgres impl exists)",
+            proven_against="in-memory PromotionRepoPort double (a Postgres impl now exists: stores.pg.promotion, LearningPlane)",
         )
     )
 
@@ -1176,11 +1181,12 @@ def render_text(report: ClosedLoopReport) -> str:
     )
     lines.append("")
     lines.append(
-        "SCOPE OF THIS RESULT — read before quoting it. Every hop above ran OFFLINE against "
-        "in-memory fakes; there is no Postgres/Valkey/S3 on this machine. A PASS means the "
-        "production functions compose: the row each stage writes is the row the next stage "
-        "reads. It does NOT mean a deployed process runs them. These workers are complete and "
-        "still NOT SCHEDULED in production, each blocked on a named missing store port:"
+        "SCOPE OF THIS RESULT — read before quoting it. Every hop above ran against in-memory "
+        "fakes BY CONSTRUCTION, regardless of whether a live Postgres/Valkey/S3 stack is present "
+        "(this drill never probes or drives one). A PASS means the production functions compose: "
+        "the row each stage writes is the row the next stage reads. It does NOT mean a deployed "
+        "process runs them. These workers are complete and still NOT SCHEDULED in production, "
+        "each blocked on the named dependency below:"
     )
     for name in report.unscheduled_in_production:
         lines.append(f"  - {name}: {UNSCHEDULED_WORKERS[name].splitlines()[0]}")

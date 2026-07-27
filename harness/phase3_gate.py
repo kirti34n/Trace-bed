@@ -586,11 +586,12 @@ def _assertion_closed_loop(cases: list[Case]) -> AssertionReport:
         verdict,
         _fmt_tally(t) + f"; direct drill: {passed}/{len(report.hops)} hops",
         (
-            "OFFLINE AGAINST FAKES -- no Postgres/Valkey/S3 on this machine. Every hop runs "
-            "against in-memory implementations of the worker's own declared Protocol (plus the "
-            "recording fake pool for the status write, which proves the statements are ISSUED, "
-            "not that a database accepted them). A PASS is 'the loop closes when every store "
-            "method exists', not 'the loop closes in production today'.",
+            "AGAINST FAKES BY CONSTRUCTION -- every hop runs against in-memory implementations "
+            "of the worker's own declared Protocol (plus the recording fake pool for the status "
+            "write, which proves the statements are ISSUED, not that a database accepted them), "
+            "whether or not a live stack is present; this drill does not probe or drive one. A "
+            "PASS is 'the loop closes when every store method exists', not 'the loop closes in "
+            "production today'.",
             render_text(report),
         ),
     )
@@ -650,13 +651,18 @@ _KNOWN_GAPS: tuple[str, ...] = (
     "having never invoked `independent_confirmations`) and is now closed in "
     "`_guard_archived_to_validated`; the broader case is recorded as DECISIONS D-085 and "
     "pinned by `tests/phase3/test_learning_loop_seams.py`.",
-    "This machine has no Docker/Postgres/Valkey/S3 and no real LLM endpoint. Every drill in "
-    "this report (guessed-reward, the four-probe red team, the Sybil probe, the retirement "
-    "probe, the lift sim, the ledger audit, the dependence drill) runs entirely offline "
-    "against in-memory fakes satisfying the Protocol ports the Phase 3 worker chunks "
-    "themselves were built and tested against -- consistent with those chunks' own reported "
-    "contract gaps (no Postgres-backed ScorerRepoPort/ShadowValidatorRepoPort/"
-    "PromotionRepoPort/KillswitchStorePort exists anywhere in the tree yet).",
+    "The narrative DRILLS in this report (guessed-reward, the four-probe red team, the Sybil "
+    "probe, the retirement probe, the lift sim, the ledger audit, the dependence drill) run "
+    "against in-memory fakes satisfying the Protocol ports the Phase 3 worker chunks were built "
+    "and tested against, BY CONSTRUCTION -- those drills never drive a live stack, regardless of "
+    "whether one is present. The gate's SEPARATE `pytest -m phase3` run does exercise the real "
+    "stores against a database when one is reachable: Postgres-backed implementations of "
+    "ScorerRepoPort / ShadowValidatorRepoPort / PromotionRepoPort / KillswitchStorePort now "
+    "exist (`stores.pg.{scoring,shadow_validator,promotion,killswitch}`, on `LearningPlane`) and "
+    "carry `@pytest.mark.integration` coverage (tests/phase3/test_pg_scoring.py, "
+    "test_pg_promotion.py, test_pg_killswitch_writer.py, test_status_persistence.py). Those "
+    "workers nonetheless remain unscheduled in production for the reasons "
+    "`workers.composition.UNSCHEDULED_WORKERS` names, not for want of a store.",
     "`hotpath.pipeline.Pipeline` does not yet withhold or relabel injection on the holdout "
     "arm (`workers/lift.py`'s own docstring: 'hotpath.pipeline also returns the rendered "
     "block to the caller on the holdout arm rather than discarding it'). "
@@ -829,21 +835,27 @@ def render_markdown(run: GateRun) -> str:
     w(f"## Overall verdict: **{run.overall_verdict}**")
     w("")
     if run.overall_verdict == "PASS":
-        # S34 (fidelity audit): the verdict rule keys on skipped tests, so the phases with the
-        # LEAST real-stack exposure get the greenest verdicts -- this phase reads PASS partly
-        # BECAUSE it contains no integration-marked tests to skip. Disclosed here, beside the
-        # verdict, rather than in prose 300 lines below it.
+        # S34 (fidelity audit), updated at live bring-up: the verdict rule forces INCOMPLETE if
+        # ANY `-m phase3` case skips, so a PASS is only reachable when every case RAN. This phase
+        # now DOES carry @pytest.mark.integration tests against the new Postgres stores, so a
+        # PASS here means those integration tests actually executed against a live stack -- it is
+        # no longer the "no integration tests, nothing to skip" green the earlier prose claimed.
         w(
-            "> **What this PASS does and does not mean.** Every clause below executed and "
-            "passed against in-memory doubles. This phase contributes no integration-marked "
-            "tests. Four of the ten worker ports M3 enumerates now DO have a Postgres "
-            "implementation (`EmbeddingRepoPort`, `CorroborationRepoPort`, "
-            "`MemoryEditRepoPort`, `ForensicsRepoPort` -- D-128), and not one of those "
-            "statements has ever been EXECUTED: no Docker/Postgres on this machine, and their "
-            "integration tests skip. The other six ports (PLAN.md §11 M3) still have no "
-            "implementation at all. So a green verdict here is evidence about LOGIC, and is "
-            "not evidence that any of it has ever run against a database. The verdict rule "
-            "keys on skipped tests, and a phase with no integration tests has none to skip."
+            "> **What this PASS does and does not mean.** Every `-m phase3` case executed and "
+            "passed, with 0 SKIPPED -- and because the overall verdict rule forces INCOMPLETE "
+            "(never PASS) the moment any `-m phase3` case skips, a PASS here is only reachable "
+            "when this phase's `@pytest.mark.integration` tests against the new Postgres stores "
+            "(tests/phase3/test_pg_scoring.py, test_pg_promotion.py, test_pg_killswitch_writer.py, "
+            "test_status_persistence.py) actually RAN against a live database this run, not "
+            "merely against in-memory doubles. Several of the worker ports M3 enumerates now have "
+            "a Postgres implementation on `LearningPlane` (`stores.pg.{scoring,shadow_validator,"
+            "promotion,killswitch,memory_lifecycle,derived_state_store,distillation}`, plus the "
+            "D-128 `EmbeddingRepoPort` / `CorroborationRepoPort` / `MemoryEditRepoPort` / "
+            "`ForensicsRepoPort`). The narrative DRILLS rendered below additionally exercise the "
+            "worker logic against in-memory doubles by construction. So a green verdict is "
+            "evidence both that the logic composes and that the integration SQL executed; the "
+            "remaining production gap is scheduling, which `workers.composition."
+            "UNSCHEDULED_WORKERS` names, not a missing store."
         )
         w("")
     if run.overall_verdict == "INCOMPLETE":

@@ -702,7 +702,7 @@ asserted, and never run against Postgres.
 
 **Superseded — live bring-up, 2026-07-27.** That measurement has now been taken. A live
 Postgres 18.3 stack is up; migrations 0001..0006 apply against it; the full suite runs green
-against the live stack (4,403 passed / 1 skipped — the S3-env case / 0 failed), with `mypy
+against the live stack (4,420 passed / 1 skipped — the S3-env case / 0 failed), with `mypy
 --strict` (158 files) and `ruff` clean; and the cross-project leak suite passes 7/7 under the
 `NOBYPASSRLS` app role. The SQL in `stores/pg/` is no longer only structurally asserted — it
 executes against a real database.

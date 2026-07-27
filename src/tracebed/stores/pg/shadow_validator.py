@@ -2,8 +2,10 @@
 the JUDGMENT half of shadow validation (`quarantined -> candidate`).
 
 The EVIDENCE half (`CorroborationRepoPort`, which appends `shadow_confirm_runs`) is already
-live in `stores.pg.learning.CorroborationRepo`; this module is the missing judgment writer
-`harness/phase3_gate.py` and `harness/closed_loop.py` both name as having "NO Postgres impl".
+live in `stores.pg.learning.CorroborationRepo`; this module is the judgment writer that
+`harness/phase3_gate.py` and `harness/closed_loop.py` now name as HAVING its Postgres impl here
+(the worker itself still awaits a host-supplied `TracePrincipalLookupPort` + a `ScoringEpoch`
+source before it can be scheduled).
 
 WHY A SEPARATE CLASS. `ShadowValidatorRepoPort.select_quarantined` collides by NAME with
 `CorroborationRepoPort.select_quarantined` but returns a DIFFERENT type

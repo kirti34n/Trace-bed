@@ -7,7 +7,7 @@
 Memory whose purpose is that agents *get better at their job over time* — not a knowledge base
 with a vector index bolted on.
 
-[![tests](https://img.shields.io/badge/tests-4%2C403%20passed%20%C2%B7%20live%20stack-2ea44f)](#testing)
+[![tests](https://img.shields.io/badge/tests-4%2C420%20passed%20%C2%B7%20live%20stack-2ea44f)](#testing)
 [![mypy](https://img.shields.io/badge/mypy--strict-clean%20%C2%B7%20158%20files-2ea44f)](#testing)
 [![ruff](https://img.shields.io/badge/ruff-clean-2ea44f)](#testing)
 [![isolation](https://img.shields.io/badge/cross--project%20leak%20suite-7%2F7-2ea44f)](#the-eight-invariants)
@@ -91,8 +91,10 @@ just asserted against SQL text.
   from a `tsvector` column.
 - **The learning-plane store layer** — every worker's Postgres store port is implemented and wired
   into the composition root, so each worker can be constructed against its live store.
-- **The periodic scheduler runs** and drives five jobs per project: `embedder`, `gc`,
-  `corroboration` (given a host candidate source), `sweeps`, and `prefix_builder`.
+- **The periodic scheduler runs.** The deployed `run()` schedules four jobs: `embedder`, `sweeps`
+  and `prefix_builder` once per project, plus `gc` process-wide (queue health is unpartitioned);
+  `corroboration` is added only when the host supplies a `CorroborationCandidateSource`, and
+  `run()` passes `None`.
 
 **Complete but not yet running end-to-end**
 
@@ -128,7 +130,7 @@ actually go red if the invariant broke.
 | # | Invariant | Enforced by | Proof |
 |---|---|---|---|
 | 1 | **Hot-path purity** — no generative client reachable from `hotpath/` | `scripts/purity_check.py`, import-graph reachability with a third-party allowlist | CI-blocking |
-| 2 | **Fail-open, budgeted** — 300 ms p99, degradation ladder, never blocks a run | `hotpath/pipeline.py` + `budget.py`; client wait **and** server `statement_timeout` | 6-way fail-open drill |
+| 2 | **Fail-open, budgeted** — 300 ms p99, degradation ladder, never blocks a run | `hotpath/pipeline.py` + `budget.py`; client wait on the arms **and** server `statement_timeout` across both arms and the assembly stage | 6-way fail-open drill |
 | 3 | **Render-as-data** — memory enters context as a labelled data block, never instructions | `hotpath/templates.py` closed grammar | 40-payload fuzz corpus |
 | 4 | **Project isolation** — enforced at query construction, in RLS, and in partitioning | Typed repo + `FORCE ROW LEVEL SECURITY` + LIST partitions | **7-probe leak suite, green on the live DB under `tracebed_app`** |
 | 5 | **Async writes** — nothing on the write side is awaited | SDK ring buffer | 0.04 ms p99 with the API down |
@@ -140,6 +142,11 @@ actually go red if the invariant broke.
 > one. Delimiting is the weakest spotlighting variant — ~50% ASR reduction non-adaptive, >95% ASR
 > adaptive ([arXiv:2403.14720](https://arxiv.org/abs/2403.14720)). The code says so where an engineer
 > will read it.
+>
+> **On invariants 6–7, precisely:** provenance completeness (`validate_provenance` + the `NOT NULL`
+> backstop) and status membership are enforced as *mechanism* at the insert door; the state
+> machine's *creation* guard is enforced by convention — it holds because callers route through
+> `apply()` first, not because `insert_memory_item` re-checks it (Current gaps §3).
 
 ---
 
@@ -158,7 +165,7 @@ export TB_STORAGE__PG_DSN="postgresql://tracebed_owner:tracebed_dev_only@localho
 python -m tracebed.stores.pg.migrate apply           # applies 0001..0006 (roles are created by initdb)
 
 export TB_STORAGE__VALKEY_URL="valkey://localhost:6389/0" TB_EMBEDDING__MODEL_VERSION=dev-pin
-pytest -q                                            # 4,403 passed · 1 skipped (S3 env-gated)
+pytest -q                                            # 4,420 passed · 1 skipped (S3 env-gated)
 python harness/closed_loop.py                        # the learning loop, composed, with its scope note
 ```
 
@@ -188,7 +195,7 @@ The full suite runs offline **and** against the live stack; RLS-sensitive tests 
 non-privileged `tracebed_app` role (the owner bypasses RLS and would hide a leak).
 
 ```bash
-pytest -q                            # 4,403 passed · 1 skipped, against live PG + Valkey
+pytest -q                            # 4,420 passed · 1 skipped, against live PG + Valkey
 mypy                                 # strict, 158 files, clean
 ruff check src tests harness scripts # clean
 python scripts/license_check.py      # dependency policy (Apache/permissive + one logged LGPL)
@@ -298,8 +305,8 @@ per-worker reasons in `workers/composition.py::UNSCHEDULED_WORKERS`.
    `invalidator`, `killswitch`, `consolidator` and `derived_state` each await a host-supplied port, an
    under-specified evidence schema, or (consolidator) one store still to design. See Status above.
 2. **The 300 ms p99 is not yet load-proven.** The fail-open drill's stalls are a `FakeClock`; the
-   bound is now wired end-to-end (client wait + server `statement_timeout`) but wants a populated
-   vector arm under real load to measure.
+   bound is now wired end-to-end (client wait on the arms + server `statement_timeout` across both
+   arms and the assembly stage) but wants a populated vector arm under real load to measure.
 3. **The insert door enforces creation guards by convention, not mechanism.** `insert_memory_item`
    checks status membership and provenance fields, not the state machine's creation guard; the guard
    holds on callers that route through `apply()` first.

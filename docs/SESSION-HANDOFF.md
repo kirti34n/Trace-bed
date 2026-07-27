@@ -12,7 +12,7 @@ measurement and update this file** — a stale handoff is worse than none, becau
 |---|---|
 | Working copy | `/home/kirito/Trace-bed` (WSL2, Ubuntu, native ext4 — not `/mnt/c`) |
 | Remote | https://github.com/kirti34n/Trace-bed |
-| Branch | `live-db-bringup` (four commits ahead of `main`; merged into `main` in this session) |
+| Branch | `live-db-bringup` (six commits ahead of `main` at `ff618bf`; merged into `main` in this session) |
 | venv | `uv`-managed CPython 3.13 — always use `.venv/bin/python`, never bare `python3` |
 | Stack | `docker/compose.yaml`: Postgres 18 (pgvector + vchord_bm25) on **5442**, Valkey on **6389**, SeaweedFS on **8333** |
 
@@ -35,7 +35,7 @@ Measured against the live stack (fresh `down -v` → migrate → run):
 
 | Check | Result |
 |---|---|
-| `pytest -q` (offline + integration) | **4,403 passed, 1 skipped** (S3 env-gated), 0 failed |
+| `pytest -q` (offline + integration) | **4,420 passed, 1 skipped** (S3 env-gated), 0 failed |
 | `mypy` (strict) | clean, **158 source files** |
 | `ruff check src tests harness scripts` | clean |
 | Cross-project leak suite (probes 1–7, as `tracebed_app`) | **7/7** — isolation holds on a real DB |
@@ -44,7 +44,7 @@ Measured against the live stack (fresh `down -v` → migrate → run):
 
 ---
 
-## 3. What this session did (four commits, all pushed)
+## 3. What this session did (six commits, all pushed)
 
 1. **Live DB bring-up + greened the never-run suite.** Fixed the PG18 compose volume mount
    (docker-library #1259) so the stack boots; migrations now apply against real Postgres; the
@@ -60,6 +60,12 @@ Measured against the live stack (fresh `down -v` → migrate → run):
 4. **Scheduled `sweeps` + `prefix_builder`** via the reused `ConfigResolver` + new
    `Repo.list_agent_type_ids` + a Valkey `StaticPrefixCachePort`. Kept the host-/spec-blocked workers
    honestly unscheduled.
+5. **Added a real `migrate` CLI** and brought the README + this handoff current for the merge.
+6. **Hardened the isolation tests + swept stale `pg_textsearch` prose** (`ff618bf`). Made the four
+   Postgres-store isolation tests discriminative — seed both projects under the owner (BYPASSRLS)
+   pool so a dropped `project_id` predicate goes red — and replaced phantom-`pg_textsearch` /
+   "nothing has run against a real DB" prose across the reference docs with the real `vchord_bm25` +
+   `pg_tokenizer` story (genuinely historical passages kept behind dated superseding notes).
 
 ---
 
@@ -70,11 +76,15 @@ Measured against the live stack (fresh `down -v` → migrate → run):
   `ContributionJudgePort`, `TracePrincipalLookupPort`, `LLMProviderPort`), under-specified evidence
   schemas (promotion `select_*`, the scorer M7 join, an `invalidation_event` drain cursor, a
   day-bucketed lift feed), and one store to design (`MemoryLinkStorePort` for the consolidator).
-- **Review follow-ups (open):** three LOW isolation-test-fidelity gaps (the store tests would pass even
-  with a `project_id` predicate removed — seed both projects under the owner pool to make them
-  discriminative); the `shadow_validator` `is_failure_lesson` fail-safe (needs a trusted column, a
-  schema decision); regenerate the phase-gate reports against the live DB; sweep stale `pg_textsearch`
-  prose from `PLAN.md`/`PHASE-0.md`/`docs/{FIDELITY-AUDIT,MEMORY-FLOW,OPERATIONS}.md`.
+- **Review follow-ups (open):** the `shadow_validator` `is_failure_lesson` fail-safe (needs a trusted
+  column, a schema decision); the gate runners (`harness/phase*_gate.py`) still emit hardcoded "no
+  Docker/Postgres, tests skip" boilerplate that is false when run against a live stack — the reports
+  were regenerated in `ff618bf` but the runners' caveat must be made conditional on the real stack.
+- **Review follow-ups (closed in `ff618bf`, see §3.6):** the isolation-test-fidelity gaps are closed —
+  the four Postgres-store tests (`scoring`, `shadow_validator`, `memory_lifecycle`, `derived_state`)
+  now seed both projects under the owner pool and go red if a `project_id` predicate is dropped; and
+  the stale `pg_textsearch` prose has been swept from `PLAN.md` / `PHASE-0.md` /
+  `docs/{FIDELITY-AUDIT,MEMORY-FLOW,OPERATIONS}.md`.
 - **Nobody has read this code by hand.** Agents wrote, audited, and adversarially reviewed it; the
   reviews found real bugs, but a human read of the hot path, state machine and isolation layer is
   still owed.

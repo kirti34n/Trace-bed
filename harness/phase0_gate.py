@@ -499,10 +499,51 @@ _KNOWN_GAPS: tuple[str, ...] = (
     "of the seven assertions or not (`_untracked_skips`). Before integration only untracked "
     "FAILURES moved the verdict, so a run with two dozen unexecuted isolation tests could have "
     "printed PASS. `tests/phase0/test_gate_smoke.py` pins this.",
-    "This machine has no Docker/Postgres/Valkey, so every `@pytest.mark.integration` "
-    "assertion below reports SKIPPED-NO-STACK here. Re-run this gate against the compose "
-    "stack (docker/compose.yaml) or CI's service containers before trusting a PASS.",
 )
+
+
+def _live_stack_reachable() -> bool:
+    """Best-effort Postgres reachability probe, mirroring
+    `harness/failopen_drill.py::_postgres_reachable` -- never raises, never blocks more than a
+    1s connect timeout. Used to phrase the integration-coverage gap below from the ACTUAL run
+    state rather than a hardcoded 'this machine has no stack' claim (which stopped being true
+    once the live bring-up landed)."""
+    dsn = os.environ.get("TB_STORAGE__PG_DSN")
+    if not dsn:
+        return False
+    try:
+        import psycopg
+
+        with psycopg.connect(dsn, connect_timeout=1):
+            return True
+    except Exception:
+        return False
+
+
+def _integration_coverage_gap(tally: Tally, *, stack_reachable: bool) -> str:
+    """The integration-coverage caveat, COMPUTED from this run rather than asserted. The
+    no-stack disclosure still appears whenever it is genuinely true (cases skipped, or no live
+    Postgres reachable); when the stack was present and nothing skipped, it says so instead of
+    falsely claiming every `@pytest.mark.integration` assertion was skipped."""
+    if tally.skipped > 0:
+        return (
+            f"Integration coverage: {tally.skipped} `-m phase0` case(s) reported SKIPPED-NO-STACK "
+            "in this run -- `@pytest.mark.integration` assertions whose Postgres/Valkey/S3 "
+            "dependency was not reachable. Re-run this gate against the compose stack "
+            "(docker/compose.yaml) or CI's service containers before trusting a PASS."
+        )
+    if not stack_reachable:
+        return (
+            "Integration coverage: no live Postgres was reachable at gate time "
+            "(TB_STORAGE__PG_DSN unset or refused), yet 0 `-m phase0` cases reported SKIPPED -- "
+            "confirm the `@pytest.mark.integration` assertions were not deselected before "
+            "trusting a PASS."
+        )
+    return (
+        "Integration coverage: a live Postgres was reachable at gate time and 0 `-m phase0` "
+        "cases reported SKIPPED -- the `@pytest.mark.integration` assertions executed against "
+        "the stack rather than reporting SKIPPED-NO-STACK."
+    )
 
 # The exact `classname_contains` keywords each of assertions 1-5 select on, kept in one
 # place so `_untracked_failures` can compute "every case any assertion looked at" without
@@ -659,7 +700,10 @@ def run_gate(
         raw_sql_result=raw_sql_combined,
         purity_result=purity_combined,
         fake_runtime_report=fake_runtime_report,
-        known_gaps=_KNOWN_GAPS,
+        known_gaps=(
+            *_KNOWN_GAPS,
+            _integration_coverage_gap(pytest_tally, stack_reachable=_live_stack_reachable()),
+        ),
         untracked_failures=untracked_failures,
         untracked_skips=untracked_skips,
     )
