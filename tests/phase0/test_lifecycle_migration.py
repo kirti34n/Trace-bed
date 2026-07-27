@@ -113,6 +113,7 @@ class TestMigrationPairExists:
             "0003_rls",
             "0004_lifecycle",
             "0005_bm25",
+            "0006_q_update_ledger",
         ]
 
     def test_rollback_has_no_more_statements_than_the_migration(self) -> None:

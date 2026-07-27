@@ -577,16 +577,28 @@ def test_exactly_one_status_writing_statement_exists_in_the_lifecycle_module() -
     assert source.count("SET status = %(to_status)s") == 1, (
         "a second status-writing statement has appeared in stores/pg/lifecycle.py"
     )
-    # And nowhere else in stores/pg/ either -- the whole of M1's closure is that there is ONE.
+    # And nowhere else in stores/pg/ except the ONE sanctioned exception. M1's closure was
+    # "there is exactly one status UPDATE"; the MemoryLifecycleRepoPort store adds the ONE
+    # reviewed exception (integration CONVENTION 7): `memory_lifecycle.py`'s persist has a wider
+    # SET clause (strike_count/q_value/last_revalidated_at + conditional status_changed_at +
+    # from==to field-touch) that genuinely cannot compose `LifecycleWriter.persist_status`, so it
+    # writes its own status statement. Every OTHER status-changing store (promotion,
+    # shadow_validator, edit_ops, forensics) still delegates to lifecycle.py -- so the writer set
+    # is these two files, both reviewed, and a third would be an unreviewed status writer.
     import pathlib as _pathlib
 
     package = _pathlib.Path(lifecycle_module.__file__ or "").parent
-    writers = [
+    writers = sorted(
         path.name
         for path in package.glob("*.py")
         if "SET status = %(to_status)s" in path.read_text(encoding="utf-8")
-    ]
-    assert writers == ["lifecycle.py"], writers
+    )
+    assert writers == ["lifecycle.py", "memory_lifecycle.py"], writers
+    # The sanctioned exception carries exactly one status statement too -- not a growing surface.
+    memory_lifecycle_src = (package / "memory_lifecycle.py").read_text(encoding="utf-8")
+    assert memory_lifecycle_src.count("SET status = %(to_status)s") == 1, (
+        "a second status-writing statement has appeared in stores/pg/memory_lifecycle.py"
+    )
 
 
 def test_get_memory_by_id_is_a_projection_over_the_real_repo_not_a_new_query() -> None:

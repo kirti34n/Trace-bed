@@ -178,6 +178,16 @@ def _plane(**kw: Any) -> Any:
         "preferences": object(),
         "embedder": _Embedder(),
         "corroboration": None,
+        # The now-constructed Postgres store implementations of the store-blocked workers'
+        # ports (FIDELITY-AUDIT.md M3). Present on every real plane; still not scheduled,
+        # so `build_scheduled_jobs` never reads them and `object()` stand-ins suffice here.
+        "memory_lifecycle": object(),
+        "derived_state_store": object(),
+        "scorer_repo": object(),
+        "promotion_repo": object(),
+        "shadow_validator_repo": object(),
+        "killswitch_writer": object(),
+        "known_distillations": object(),
     }
     defaults.update(kw)
     return LearningPlane(**defaults)

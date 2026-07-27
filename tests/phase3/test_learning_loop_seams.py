@@ -244,6 +244,11 @@ class TestExactlyOneModuleImplementsTheFormula:
             "src/tracebed/stores/pg/search.py",  # read-only row hydration
             "src/tracebed/stores/pg/reports.py",  # read-only Q-trajectory row hydration (D-093)
             "src/tracebed/api/reports.py",  # read-only Q-trajectory response projection (D-093)
+            # The MemoryLifecycleRepoPort store (serves invalidator/revalidation/sweeps). The
+            # only `q_value=` KEYWORD here is read-only row hydration (_row_to_lifecycle_row);
+            # its SQL q_value write is the COALESCE UPDATE executed ON BEHALF OF sweeps.decay_sweep
+            # (already allowed above, idle-decay downward only) -- not a new learning rule.
+            "src/tracebed/stores/pg/memory_lifecycle.py",  # decay-sweep SQL update + read-only hydration
         }
         offenders: list[str] = []
         for path in _modules(_SRC):

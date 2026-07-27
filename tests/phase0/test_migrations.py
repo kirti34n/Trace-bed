@@ -34,7 +34,14 @@ pytestmark = pytest.mark.phase0
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 
-MIGRATION_IDS = ("0001_registries", "0002_partitioned", "0003_rls", "0004_lifecycle", "0005_bm25")
+MIGRATION_IDS = (
+    "0001_registries",
+    "0002_partitioned",
+    "0003_rls",
+    "0004_lifecycle",
+    "0005_bm25",
+    "0006_q_update_ledger",
+)
 
 REGISTRY_TABLES = (
     "project",

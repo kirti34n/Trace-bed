@@ -38,10 +38,15 @@ now has `stores.pg.learning.EmbeddingRepo`), `workers.corroboration` (its
 `CorroborationRepoPort` now has `stores.pg.learning.CorroborationRepo`, and only when the host
 supplies the `CorroborationCandidateSource` that decides which runs corroborate which memory —
 a declared seam, D-121), and `workers.gc` (`stores.pg.queue.WorkQueue` already satisfies
-`QueueObservabilityPort` structurally). The other ten periodic workers are complete, tested,
-and unschedulable because the Postgres implementation of the port each one takes does not
-exist — audit finding M3, still open, now enumerated one worker at a time instead of as a
-paragraph.
+`QueueObservabilityPort` structurally). The other ten periodic workers are complete and tested.
+Their Postgres store ports are now IMPLEMENTED (`stores.pg.memory_lifecycle`, `.scoring`,
+`.promotion`, `.shadow_validator`, `.derived_state_store`, `.killswitch`, `.distillation`) and
+constructed on `LearningPlane` here, so each worker CAN now be built against its live store —
+audit finding M3's store half is closed. They stay unscheduled because the remaining blocker on
+each is a NON-store driver (a per-project `EffectiveConfig` resolver, an upstream readings /
+candidate feed, or a host-supplied port such as `RevalidationCheckPort` / `ContributionJudgePort`
+/ `LLMProviderPort`), enumerated one worker at a time in `UNSCHEDULED_WORKERS` below;
+`consolidator` alone is still store-blocked (`MemoryLinkStorePort` does not exist, RISK 1).
 """
 
 from __future__ import annotations
@@ -65,8 +70,15 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from tracebed.domain.clock import Clock
     from tracebed.domain.config import WorkersConfig
     from tracebed.domain.ids import ProjectId
+    from tracebed.stores.pg.derived_state_store import DerivedStateStore
+    from tracebed.stores.pg.distillation import KnownDistillationRepo
+    from tracebed.stores.pg.killswitch import KillswitchWriter
     from tracebed.stores.pg.lifecycle import LifecycleWriter
+    from tracebed.stores.pg.memory_lifecycle import MemoryLifecycleRepo
+    from tracebed.stores.pg.promotion import PromotionRepo
     from tracebed.stores.pg.repo import Repo
+    from tracebed.stores.pg.scoring import ScorerRepo
+    from tracebed.stores.pg.shadow_validator import ShadowValidatorRepo
     from tracebed.workers.corroboration import (
         CorroborationCandidateSource,
         CorroborationWriter,
@@ -154,33 +166,55 @@ NON_PERIODIC_WORKERS: Final[Mapping[str, str]] = MappingProxyType(
 # than as an apology.
 UNSCHEDULED_WORKERS: Final[Mapping[str, str]] = MappingProxyType(
     {
-        "sweeps": "run_all_sweeps takes a MemoryLifecycleRepoPort-shaped store "
-        "(select_by_status / persist); no Postgres implementation exists -- FIDELITY-AUDIT.md "
-        "M3. Its TTL, decay and archive-floor arithmetic is complete and tested offline.",
-        "revalidation": "Invalidator-shaped MemoryLifecycleRepoPort plus a host-supplied "
-        "RevalidationCheckPort ('what counts as re-verified' is deliberately not this "
-        "repository's decision, D-113); neither exists -- FIDELITY-AUDIT.md M3.",
-        "invalidator": "MemoryLifecycleRepoPort (select_by_provenance / select_by_status / "
-        "persist) has no Postgres implementation -- FIDELITY-AUDIT.md M3.",
-        "consolidator": "needs a store that can read near-duplicate candidates and write "
-        "memory_link rows; memory_link has no writer at all -- FIDELITY-AUDIT.md M4.",
-        "prefix_builder": "needs MemoryStorePort plus a StaticPrefixCachePort; no class "
-        "implements StaticPrefixPort anywhere -- FIDELITY-AUDIT.md M5.",
-        "derived_state": "DerivedStateStorePort has no Postgres implementation and the "
-        "derived_state table has no writer -- FIDELITY-AUDIT.md M3/M4.",
-        "scorer": "ScorerRepoPort has no Postgres implementation, and the outcome -> "
-        "trace_index -> injection_log -> memory_item join that would feed it is written "
-        "nowhere -- FIDELITY-AUDIT.md M3/M7.",
-        "shadow_validator": "ShadowValidatorRepoPort has no Postgres implementation. The "
-        "EVIDENCE half is now live (workers.corroboration is scheduled below and writes "
-        "shadow_confirm_runs); what is missing is the store that reads a quarantined row "
-        "and persists the promotion -- FIDELITY-AUDIT.md M3.",
-        "promotion": "PromotionRepoPort has no Postgres implementation -- FIDELITY-AUDIT.md M3.",
-        "killswitch": "KillswitchStorePort has no Postgres implementation and killswitch_state "
-        "has no writer; the grid evaluation and its Benjamini-Hochberg correction are complete "
-        "-- FIDELITY-AUDIT.md M3/M4.",
-        "distiller": "needs a TraceIndexPort + KnownDistillationPort pair and an "
-        "LLMProviderPort; the first two have no Postgres implementation -- FIDELITY-AUDIT.md M3.",
+        "sweeps": "MemoryLifecycleRepoPort is now implemented (stores.pg.memory_lifecycle, "
+        "carried on LearningPlane.memory_lifecycle), so the store half is closed. Still "
+        "unscheduled because run_all_sweeps takes a per-project EffectiveConfig, and this "
+        "composition root receives no project_config -> EffectiveConfig resolver to drive it "
+        "-- a non-store driver, deferred to the scheduling pass (FIDELITY-AUDIT.md M3).",
+        "revalidation": "MemoryLifecycleRepoPort is implemented (LearningPlane.memory_lifecycle) "
+        "but RevalidationWorker.run_once is driven by a host-supplied RevalidationCheckPort "
+        "('what counts as re-verified' is deliberately not this repository's decision, D-113), "
+        "which is not ours to build and is not wired here -- FIDELITY-AUDIT.md M3.",
+        "invalidator": "MemoryLifecycleRepoPort is implemented (LearningPlane.memory_lifecycle), "
+        "but the Invalidator is event-driven off the invalidation-event queue and needs a "
+        "cache-flush callable (ValkeyClient); it has no per-project cadence and no queue/flush "
+        "driver is wired into this composition root -- FIDELITY-AUDIT.md M3.",
+        "consolidator": "still unbuildable: MemoryLinkStorePort does not exist anywhere -- no "
+        "Protocol, no fake, no caller (the Consolidator injects only a Clock). Designing the "
+        "port + near-duplicate candidate read is a §6 contract decision, not store wiring -- "
+        "FIDELITY-AUDIT.md M4 (escalated, RISK 1).",
+        "prefix_builder": "MemoryStorePort (Repo.list_memories) and StaticPrefixCachePort "
+        "(ValkeyClient, Valkey-backed by D-016) are already shipped, so no Postgres store is "
+        "missing; it stays unscheduled because run() is per-(project, agent_type) and needs a "
+        "ValkeyClient + ConfigProvider + agent-type enumeration wired in -- FIDELITY-AUDIT.md M5.",
+        "derived_state": "DerivedStateStorePort is now implemented "
+        "(stores.pg.derived_state_store, LearningPlane.derived_state_store). Still unscheduled "
+        "because DerivedStateWriter.update takes a specific (agent_type_id, key, raw_value) "
+        "reading -- there is no periodic per-project sweep entry point and no upstream readings "
+        "feed is wired here -- FIDELITY-AUDIT.md M3/M4.",
+        "scorer": "ScorerRepoPort is now implemented (stores.pg.scoring, migration 0006, "
+        "LearningPlane.scorer_repo). Still unscheduled because run_scorer_batch needs a "
+        "host-supplied ContributionJudgePort AND the M7 outcome_event -> trace_index -> "
+        "injection_log -> memory_item candidate join, which is written nowhere -- "
+        "FIDELITY-AUDIT.md M3/M7.",
+        "shadow_validator": "ShadowValidatorRepoPort is now implemented "
+        "(stores.pg.shadow_validator, LearningPlane.shadow_validator_repo) and the evidence "
+        "half is live (corroboration is scheduled and writes shadow_confirm_runs). Still "
+        "unscheduled because ShadowValidator.run_once needs a host-supplied "
+        "TracePrincipalLookupPort + a ScoringEpoch source -- FIDELITY-AUDIT.md M3.",
+        "promotion": "PromotionRepoPort's write half (persist + insert_review_item) is "
+        "implemented (stores.pg.promotion, LearningPlane.promotion_repo), but its two select_* "
+        "methods raise NotImplementedError pending the §6 promotion-evidence schema "
+        "(distinct_scoring_principals, outcome_consistent, open_contradiction) -- so the worker "
+        "cannot run end-to-end -- FIDELITY-AUDIT.md M3 (RISK 2).",
+        "killswitch": "KillswitchStorePort is now implemented (stores.pg.killswitch, "
+        "LearningPlane.killswitch_writer). Still unscheduled because KillswitchGridEvaluator "
+        "needs its daily-lift snapshot data source and a KillswitchAuditPort wired in to drive "
+        "the grid evaluation -- non-store drivers, deferred -- FIDELITY-AUDIT.md M3/M4.",
+        "distiller": "KnownDistillationPort is now implemented (stores.pg.distillation, "
+        "LearningPlane.known_distillations) and TraceIndexPort is Repo.get_trace_index (already "
+        "shipped). Still unscheduled because the Distiller needs a host-supplied LLMProviderPort "
+        "plus SpendRecorderPort/EpochStorePort wiring -- FIDELITY-AUDIT.md M3.",
     }
 )
 
@@ -207,6 +241,23 @@ class LearningPlane:
     embedder: Embedder
     corroboration: CorroborationWriter | None
 
+    # The Postgres store implementations of the ten previously-store-blocked periodic
+    # workers' ports (FIDELITY-AUDIT.md M3), now constructed on every real deployment so
+    # each worker CAN be built against its live store. They are exposed here rather than
+    # scheduled because the remaining blocker on every one of them is a NON-store driver
+    # (a per-project EffectiveConfig resolver, an upstream readings/candidate feed, or a
+    # host-supplied port such as RevalidationCheckPort/ContributionJudgePort/LLMProviderPort)
+    # that this composition root does not yet receive -- see UNSCHEDULED_WORKERS for the
+    # exact per-worker gap. `memory_lifecycle` is the ONE store serving invalidator,
+    # revalidation and all four sweeps (a single stateless instance, reused).
+    memory_lifecycle: MemoryLifecycleRepo
+    derived_state_store: DerivedStateStore
+    scorer_repo: ScorerRepo
+    promotion_repo: PromotionRepo
+    shadow_validator_repo: ShadowValidatorRepo
+    killswitch_writer: KillswitchWriter
+    known_distillations: KnownDistillationRepo
+
 
 def build_learning_plane(
     *,
@@ -231,8 +282,15 @@ def build_learning_plane(
     constructed. That is the point of M1's closure -- `persist_status`, whose only
     implementations were three test fakes, now has a real one on every path that calls it.
     """
+    from tracebed.stores.pg.derived_state_store import DerivedStateStore
+    from tracebed.stores.pg.distillation import KnownDistillationRepo
+    from tracebed.stores.pg.killswitch import KillswitchWriter
     from tracebed.stores.pg.learning import CorroborationRepo, EmbeddingRepo
     from tracebed.stores.pg.lifecycle import ForensicsRepo, LifecycleWriter, MemoryEditRepo
+    from tracebed.stores.pg.memory_lifecycle import MemoryLifecycleRepo
+    from tracebed.stores.pg.promotion import PromotionRepo
+    from tracebed.stores.pg.scoring import ScorerRepo
+    from tracebed.stores.pg.shadow_validator import ShadowValidatorRepo
     from tracebed.workers.corroboration import CorroborationWriter
     from tracebed.workers.edit_ops import EditOps
     from tracebed.workers.embedder import Embedder
@@ -265,6 +323,15 @@ def build_learning_plane(
         preferences=PreferenceManager(edit_repo, clock),
         embedder=embedder,
         corroboration=corroboration,
+        # One MemoryLifecycleRepo instance, reused across invalidator/revalidation/sweeps
+        # (it is stateless -- SEAMS: "Build it once ... do not fork per-worker").
+        memory_lifecycle=MemoryLifecycleRepo(pool),
+        derived_state_store=DerivedStateStore(pool),
+        scorer_repo=ScorerRepo(pool),
+        promotion_repo=PromotionRepo(pool, repo, lifecycle),
+        shadow_validator_repo=ShadowValidatorRepo(pool, lifecycle),
+        killswitch_writer=KillswitchWriter(pool),
+        known_distillations=KnownDistillationRepo(pool),
     )
 
 

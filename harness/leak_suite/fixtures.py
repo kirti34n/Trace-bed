@@ -899,6 +899,18 @@ SEED_ROW_SQL: dict[str, str] = {
         "INSERT INTO memory_status_log (project_id, memory_id, from_status, to_status)"
         " VALUES (%(pid)s, gen_random_uuid(), 'quarantined', 'candidate')"
     ),
+    # memory_q_update: the 15th partitioned table (migrations/0006_q_update_ledger.sql), the
+    # ScorerRepo Q-update ledger, added to PARTITIONED_TABLES after this fixture was written.
+    # Every column is NOT NULL. Without this seed the probe-7 fixture aborts on
+    # `seed_all_partitioned_tables`'s completeness assertion before it can make its RLS claim,
+    # leaving the cross-project wall on this table unverified.
+    "memory_q_update": (
+        "INSERT INTO memory_q_update"
+        " (project_id, memory_id, event_id, principal_id, previous_q, new_q,"
+        " contribution, epoch_id, scored_at)"
+        " VALUES (%(pid)s, gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),"
+        " 0.5, 0.6, 0.1, 1, now())"
+    ),
 }
 
 

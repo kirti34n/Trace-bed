@@ -44,7 +44,7 @@ __all__ = [
     "partition_rls_statements",
 ]
 
-# The 13 LIST-partitioned learning-plane tables (PLAN.md §5), one place.
+# The 15 LIST-partitioned learning-plane tables (PLAN.md §5), one place.
 # Order matters only for readability — none of these tables has a foreign
 # key to another partitioned table, so partition creation order is free.
 PARTITIONED_TABLES: tuple[str, ...] = (
@@ -67,6 +67,12 @@ PARTITIONED_TABLES: tuple[str, ...] = (
     # partition every one of those INSERTs fails with "no partition of relation
     # found for row" and takes the status write down with it.
     "memory_status_log",
+    # 15th, added with migrations/0006_q_update_ledger.sql. `stores.pg.scoring
+    # .ScorerRepo` appends one row here per fresh Q update (the replay-idempotency
+    # + per-day-cap + distinct-principals ledger invariant 8 needs); without a
+    # per-project partition every ledger INSERT fails with "no partition of relation
+    # found for row" and takes the scorer's status write down with it.
+    "memory_q_update",
 )
 
 # Grantee for every per-partition GRANT below. Must match the role created in
@@ -266,6 +272,12 @@ _INDEX_SPECS: dict[str, tuple[tuple[str, str], ...]] = {
     # this the read is a partition scan whose cost grows with every transition the
     # project has ever made, not with the one memory being inspected.
     "memory_status_log": (("mem", "(memory_id, changed_at DESC)"),),
+    # The per-day cap counter `ScorerRepo.scored_updates_today` buckets a memory's
+    # Q updates by (project_id, memory_id) over a half-open UTC-day range on
+    # scored_at; without this the count is a partition scan whose cost grows with
+    # every Q update the project has ever made, not with the one memory and day
+    # being capped.
+    "memory_q_update": (("scored", "(project_id, memory_id, scored_at)"),),
 }
 
 

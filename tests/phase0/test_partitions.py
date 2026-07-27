@@ -97,8 +97,8 @@ def test_ddl_partitioned_tables_match_migration() -> None:
 
 
 def test_fourteen_tables_exactly() -> None:
-    assert len(PARTITIONED_TABLES) == 14
-    assert len(set(PARTITIONED_TABLES)) == 14  # no duplicate would be silently tolerated
+    assert len(PARTITIONED_TABLES) == 15
+    assert len(set(PARTITIONED_TABLES)) == 15  # no duplicate would be silently tolerated
 
 
 def test_partition_name_is_deterministic_and_stable() -> None:
@@ -520,6 +520,15 @@ _SEED_ROWS: dict[str, str] = {
     "memory_status_log": (
         "INSERT INTO memory_status_log (project_id, memory_id, from_status, to_status)"
         " VALUES (%(pid)s, gen_random_uuid(), 'quarantined', 'candidate')"
+    ),
+    # memory_q_update: the 15th partitioned table (migrations/0006_q_update_ledger.sql),
+    # added to PARTITIONED_TABLES after this dict was written; every column is NOT NULL.
+    "memory_q_update": (
+        "INSERT INTO memory_q_update"
+        " (project_id, memory_id, event_id, principal_id, previous_q, new_q,"
+        " contribution, epoch_id, scored_at)"
+        " VALUES (%(pid)s, gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),"
+        " 0.5, 0.6, 0.1, 1, now())"
     ),
 }
 
