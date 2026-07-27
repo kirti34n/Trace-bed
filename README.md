@@ -311,6 +311,7 @@ migrations/      plain SQL, yoyo
 | Document | What it is |
 |---|---|
 | [`PLAN.md`](PLAN.md) | Architecture, the eight invariants, the data model, the config surface, five phases. **Authoritative.** |
+| [`docs/SESSION-HANDOFF.md`](docs/SESSION-HANDOFF.md) | **Start here if you are picking this up.** Where the repo lives, verified state, what to do next, and the bugs worth not reintroducing. |
 | [`docs/FIDELITY-AUDIT.md`](docs/FIDELITY-AUDIT.md) | 472 items audited against the original spec. **Read §1 before trusting anything else.** |
 | [`DECISIONS.md`](DECISIONS.md) | 119 entries. Append-only; a reversal is superseded, never edited. |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Running it: migrations, the 1,000-project ceiling, erasure, reading a lift report. |
