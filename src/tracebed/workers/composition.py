@@ -33,20 +33,24 @@ added later fails this check until somebody decides which of the three it is. Th
 point: the failure mode being guarded is not "we scheduled the wrong thing", it is "we quietly
 scheduled nothing".
 
-WHAT IS SCHEDULABLE TODAY, and it is a minority: `workers.embedder` (its `EmbeddingRepoPort`
-now has `stores.pg.learning.EmbeddingRepo`), `workers.corroboration` (its
-`CorroborationRepoPort` now has `stores.pg.learning.CorroborationRepo`, and only when the host
-supplies the `CorroborationCandidateSource` that decides which runs corroborate which memory —
-a declared seam, D-121), and `workers.gc` (`stores.pg.queue.WorkQueue` already satisfies
-`QueueObservabilityPort` structurally). The other ten periodic workers are complete and tested.
-Their Postgres store ports are now IMPLEMENTED (`stores.pg.memory_lifecycle`, `.scoring`,
-`.promotion`, `.shadow_validator`, `.derived_state_store`, `.killswitch`, `.distillation`) and
-constructed on `LearningPlane` here, so each worker CAN now be built against its live store —
-audit finding M3's store half is closed. They stay unscheduled because the remaining blocker on
-each is a NON-store driver (a per-project `EffectiveConfig` resolver, an upstream readings /
-candidate feed, or a host-supplied port such as `RevalidationCheckPort` / `ContributionJudgePort`
-/ `LLMProviderPort`), enumerated one worker at a time in `UNSCHEDULED_WORKERS` below;
-`consolidator` alone is still store-blocked (`MemoryLinkStorePort` does not exist, RISK 1).
+WHAT IS SCHEDULABLE TODAY: `workers.embedder` (its `EmbeddingRepoPort` now has
+`stores.pg.learning.EmbeddingRepo`), `workers.corroboration` (its `CorroborationRepoPort` now has
+`stores.pg.learning.CorroborationRepo`, and only when the host supplies the
+`CorroborationCandidateSource` that decides which runs corroborate which memory — a declared seam,
+D-121), `workers.gc` (`stores.pg.queue.WorkQueue` already satisfies `QueueObservabilityPort`
+structurally), and — now that the per-project config driver is wired — `workers.sweeps` (once per
+project, handed `ConfigResolver.effective(project_id)`) and `workers.prefix_builder` (once per
+(project, agent_type), over `Repo.list_agent_type_ids` and the Valkey-backed `StaticPrefixCachePort`,
+D-016). Every periodic worker's Postgres store port is now IMPLEMENTED (`stores.pg.memory_lifecycle`,
+`.scoring`, `.promotion`, `.shadow_validator`, `.derived_state_store`, `.killswitch`,
+`.distillation`) and constructed on `LearningPlane` here — audit finding M3's store half is closed.
+Each still-unscheduled periodic worker stays so on a NON-store driver: a host-supplied port
+(`RevalidationCheckPort` D-113, `ContributionJudgePort`, `TracePrincipalLookupPort`,
+`LLMProviderPort`), an under-specified §6 schema (`promotion`'s `select_*`; the scorer's M7
+outcome→trace→injection→memory join; `invalidator`'s absent invalidation-event drain cursor;
+`killswitch`'s day-bucketed lift feed), or an upstream readings feed (`derived_state`) — enumerated
+one worker at a time in `UNSCHEDULED_WORKERS` below; `consolidator` alone is still store-blocked
+(`MemoryLinkStorePort` does not exist, RISK 1).
 """
 
 from __future__ import annotations
@@ -69,7 +73,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from tracebed.adapters.ports import EmbeddingPort
     from tracebed.domain.clock import Clock
     from tracebed.domain.config import WorkersConfig
-    from tracebed.domain.ids import ProjectId
+    from tracebed.domain.ids import AgentTypeId, ProjectId
     from tracebed.stores.pg.derived_state_store import DerivedStateStore
     from tracebed.stores.pg.distillation import KnownDistillationRepo
     from tracebed.stores.pg.killswitch import KillswitchWriter
@@ -88,6 +92,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from tracebed.workers.forensics import Forensics
     from tracebed.workers.gc import QueueObservabilityPort
     from tracebed.workers.preferences import PreferenceManager
+    from tracebed.workers.prefix_builder import (
+        ConfigProvider,
+        MemoryStorePort,
+        StaticPrefixCachePort,
+    )
 
 __all__ = [
     "NON_PERIODIC_WORKERS",
@@ -166,27 +175,22 @@ NON_PERIODIC_WORKERS: Final[Mapping[str, str]] = MappingProxyType(
 # than as an apology.
 UNSCHEDULED_WORKERS: Final[Mapping[str, str]] = MappingProxyType(
     {
-        "sweeps": "MemoryLifecycleRepoPort is now implemented (stores.pg.memory_lifecycle, "
-        "carried on LearningPlane.memory_lifecycle), so the store half is closed. Still "
-        "unscheduled because run_all_sweeps takes a per-project EffectiveConfig, and this "
-        "composition root receives no project_config -> EffectiveConfig resolver to drive it "
-        "-- a non-store driver, deferred to the scheduling pass (FIDELITY-AUDIT.md M3).",
         "revalidation": "MemoryLifecycleRepoPort is implemented (LearningPlane.memory_lifecycle) "
         "but RevalidationWorker.run_once is driven by a host-supplied RevalidationCheckPort "
         "('what counts as re-verified' is deliberately not this repository's decision, D-113), "
         "which is not ours to build and is not wired here -- FIDELITY-AUDIT.md M3.",
-        "invalidator": "MemoryLifecycleRepoPort is implemented (LearningPlane.memory_lifecycle), "
-        "but the Invalidator is event-driven off the invalidation-event queue and needs a "
-        "cache-flush callable (ValkeyClient); it has no per-project cadence and no queue/flush "
-        "driver is wired into this composition root -- FIDELITY-AUDIT.md M3.",
+        "invalidator": "MemoryLifecycleRepoPort is implemented (LearningPlane.memory_lifecycle) "
+        "and an in-repo cache-flush callable exists (stores.valkey.flush.flush_project_cache), so "
+        "the store and flush halves are both closed. It stays unscheduled because "
+        "invalidation_event has no drain/consume protocol -- no processed/watermark column, and "
+        "Repo.list_invalidation_events is a newest-first reader whose own body states a reader "
+        "does not close that gap. A periodic drain would re-process every event and re-flush every "
+        "project's cache on every tick; a correct one needs a new consume-cursor migration, which "
+        "is a section 6 schema decision and out of scope -- FIDELITY-AUDIT.md M3.",
         "consolidator": "still unbuildable: MemoryLinkStorePort does not exist anywhere -- no "
         "Protocol, no fake, no caller (the Consolidator injects only a Clock). Designing the "
         "port + near-duplicate candidate read is a §6 contract decision, not store wiring -- "
         "FIDELITY-AUDIT.md M4 (escalated, RISK 1).",
-        "prefix_builder": "MemoryStorePort (Repo.list_memories) and StaticPrefixCachePort "
-        "(ValkeyClient, Valkey-backed by D-016) are already shipped, so no Postgres store is "
-        "missing; it stays unscheduled because run() is per-(project, agent_type) and needs a "
-        "ValkeyClient + ConfigProvider + agent-type enumeration wired in -- FIDELITY-AUDIT.md M5.",
         "derived_state": "DerivedStateStorePort is now implemented "
         "(stores.pg.derived_state_store, LearningPlane.derived_state_store). Still unscheduled "
         "because DerivedStateWriter.update takes a specific (agent_type_id, key, raw_value) "
@@ -207,10 +211,14 @@ UNSCHEDULED_WORKERS: Final[Mapping[str, str]] = MappingProxyType(
         "methods raise NotImplementedError pending the §6 promotion-evidence schema "
         "(distinct_scoring_principals, outcome_consistent, open_contradiction) -- so the worker "
         "cannot run end-to-end -- FIDELITY-AUDIT.md M3 (RISK 2).",
-        "killswitch": "KillswitchStorePort is now implemented (stores.pg.killswitch, "
-        "LearningPlane.killswitch_writer). Still unscheduled because KillswitchGridEvaluator "
-        "needs its daily-lift snapshot data source and a KillswitchAuditPort wired in to drive "
-        "the grid evaluation -- non-store drivers, deferred -- FIDELITY-AUDIT.md M3/M4.",
+        "killswitch": "KillswitchStorePort is implemented (LearningPlane.killswitch_writer) and "
+        "KillswitchAuditPort is optional (the evaluator accepts audit=None; no concrete audit "
+        "sink implementation exists anyway). It stays unscheduled because evaluate_grid needs a "
+        "per-cell/per-DAY DailyLiftSnapshot feed over a 14-day window and no in-repo producer "
+        "exists: ReportsRepo.lift_observations pools the whole window into one estimate and omits "
+        "the day, so a daily source requires new day-bucketed store SQL plus the same unspecified "
+        "M7 outcome join the scorer is blocked on; the safety grid additionally needs a "
+        "host-supplied policy judge -- FIDELITY-AUDIT.md M3/M7.",
         "distiller": "KnownDistillationPort is now implemented (stores.pg.distillation, "
         "LearningPlane.known_distillations) and TraceIndexPort is Repo.get_trace_index (already "
         "shipped). Still unscheduled because the Distiller needs a host-supplied LLMProviderPort "
@@ -343,6 +351,11 @@ def build_scheduled_jobs(
     queue_observability: QueueObservabilityPort,
     topics: Sequence[str],
     lease_seconds: int,
+    clock: Clock,
+    config_resolver: ConfigProvider,
+    memory_store: MemoryStorePort,
+    prefix_cache: StaticPrefixCachePort,
+    list_agent_type_ids: Callable[[ProjectId], Sequence[AgentTypeId]],
     candidate_source: CorroborationCandidateSource | None = None,
 ) -> tuple[ScheduledJob, ...]:
     """The `ScheduledJob`s a `workers.scheduler.Scheduler` should be constructed with.
@@ -361,6 +374,8 @@ def build_scheduled_jobs(
     process construction rather than shrinking the schedule.
     """
     from tracebed.workers.gc import run_gc_cycle
+    from tracebed.workers.prefix_builder import PrefixBuilder
+    from tracebed.workers.sweeps import run_all_sweeps
 
     jobs: list[ScheduledJob] = []
 
@@ -401,6 +416,58 @@ def build_scheduled_jobs(
                 ),
             )
         )
+
+    # sweeps: the three TTL / idle-decay passes. Per project, driven off the per-project
+    # EffectiveConfig the resolver rebuilds from scratch on every call (no config bleed --
+    # ConfigResolver.effective is not memoised, invariant 4). `agent_type_id=None` here: the
+    # sweeps read a project-wide overlay and carry no agent-type layer.
+    jobs.append(
+        ScheduledJob(
+            name="sweeps",
+            interval=timedelta(minutes=cfg.sweep_interval_minutes),
+            run=_per_project(
+                "sweeps",
+                lambda project_id: _drop(
+                    run_all_sweeps(
+                        project_id,
+                        plane.memory_lifecycle,
+                        clock,
+                        config_resolver.effective(project_id),
+                    )
+                ),
+            ),
+        )
+    )
+
+    # prefix_builder: per (project, agent_type). One PrefixBuilder, reused across every
+    # (project, agent_type) pair -- it is stateless, and `run()` resolves the per-pair
+    # EffectiveConfig internally. `list_agent_type_ids(pid)` is re-called every tick (like
+    # list_project_ids), so an agent type provisioned after start is picked up without a
+    # restart. The inner try/except keeps one agent type's failure -- including the
+    # MAX_ROW_LIMIT raise -- from stopping its siblings; a raise from list_agent_type_ids(pid)
+    # itself is caught one level up by `_per_project`, which logs and moves to the next project.
+    builder = PrefixBuilder(
+        store=memory_store, cache=prefix_cache, config=config_resolver
+    )
+
+    def _prefix_project(project_id: ProjectId) -> None:
+        for agent_type_id in list_agent_type_ids(project_id):
+            try:
+                builder.run(project_id, agent_type_id)
+            except Exception:
+                logger.exception(
+                    "scheduled job 'prefix_builder' failed for project %s agent_type %s",
+                    project_id,
+                    agent_type_id,
+                )
+
+    jobs.append(
+        ScheduledJob(
+            name="prefix_builder",
+            interval=timedelta(minutes=cfg.prefix_rebuild_interval_minutes),
+            run=_per_project("prefix_builder", _prefix_project),
+        )
+    )
 
     jobs.append(
         ScheduledJob(

@@ -200,6 +200,7 @@ def _calls(repo: Repo) -> dict[str, Any]:
         "create_principal": lambda: repo.create_principal("api_key", "ref", "hash"),
         "get_principal_by_external_ref": lambda: repo.get_principal_by_external_ref("ref"),
         "list_project_ids": lambda: repo.list_project_ids(),
+        "list_agent_type_ids": lambda: repo.list_agent_type_ids(PROJECT),
         "record_embedding_model": lambda: repo.record_embedding_model("m", "v", 768, "p"),
         "create_agent_type": lambda: repo.create_agent_type(PROJECT, "at"),
         "register_agent": lambda: repo.register_agent(PROJECT, PRINCIPAL, AGENT_TYPE),
@@ -450,6 +451,9 @@ def test_registry_guc_allowlist_is_a_superset_of_the_signature_allowlist() -> No
         "create_agent_type",
         "register_agent",
         "create_agent_registration",
+        # `list_agent_type_ids` takes a project_id (an FK value) but reads the unpartitioned
+        # `agent_type` registry, so it skips the GUC too — the same asymmetry the others show.
+        "list_agent_type_ids",
     } == REGISTRY_METHODS_WITHOUT_GUC - REGISTRY_METHODS_WITHOUT_PROJECT_ID
     assert _public_method_names() >= REGISTRY_METHODS_WITHOUT_GUC
 

@@ -138,7 +138,16 @@ REGISTRY_METHODS_WITHOUT_PROJECT_ID: frozenset[str] = frozenset(
 # against a fake connection and asserts that everything outside this set issues the GUC as the
 # first statement of its transaction. Without that test, "uses scoped()" is a docstring claim.
 REGISTRY_METHODS_WITHOUT_GUC: frozenset[str] = REGISTRY_METHODS_WITHOUT_PROJECT_ID | frozenset(
-    {"create_agent_type", "register_agent", "create_agent_registration"}
+    {
+        "create_agent_type",
+        "register_agent",
+        "create_agent_registration",
+        # `list_agent_type_ids` reads the unpartitioned `agent_type` registry (contract §5.0),
+        # so it takes a `project_id` FK value but issues no RLS GUC -- isolation is its explicit
+        # WHERE predicate, not a policy. It sits here for the same reason `create_agent_type`
+        # does, and NOT in REGISTRY_METHODS_WITHOUT_PROJECT_ID (it does take a project_id).
+        "list_agent_type_ids",
+    }
 )
 
 # Hard ceiling on any caller-supplied `limit`. Repo builders are reachable from `api/admin.py`
@@ -749,6 +758,25 @@ class Repo:
             cur.execute("SELECT project_id FROM project WHERE deleted_at IS NULL")
             rows = cur.fetchall()
         return [ProjectId(r[0]) for r in rows]
+
+    def list_agent_type_ids(self, project_id: ProjectId) -> list[AgentTypeId]:
+        """Every agent_type in a project (prefix_builder per-(project, agent_type) iteration).
+
+        `agent_type` is an unpartitioned registry table with NO RLS (0001_registries.sql; it is
+        absent from 0003_rls.sql's ENABLE list), so the `WHERE project_id` predicate is the ONLY
+        thing isolating one project's agent types from another's -- there is no GUC policy on this
+        table for RLS to fall back on. The predicate is therefore load-bearing and is asserted
+        directly by `tests/phase0/test_repo_isolation_offline.py`; do not remove it in the belief
+        that a GUC would catch the leak. Registry read, so it takes no GUC and belongs in
+        `REGISTRY_METHODS_WITHOUT_GUC`.
+        """
+        with _unscoped(self._pool) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT agent_type_id FROM agent_type WHERE project_id = %(project_id)s",
+                {"project_id": project_id},
+            )
+            rows = cur.fetchall()
+        return [AgentTypeId(r[0]) for r in rows]
 
     def record_embedding_model(
         self, model_id: str, model_version: str, dim: int, provider: str

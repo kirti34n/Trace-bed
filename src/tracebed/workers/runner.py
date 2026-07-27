@@ -361,11 +361,16 @@ def run() -> None:
         Tracebed today ingests traces and outcome events faithfully and
         learns nothing from either") and it now exists. The jobs it drives
         today are the embedding sweep, the shadow-confirmation writer (only
-        when a `CorroborationCandidateSource` is supplied -- see below) and
-        the queue GC pass; every other periodic worker is recorded in
-        `composition.UNSCHEDULED_WORKERS` with the exact store port it is
-        blocked on, and `build_scheduled_jobs` REFUSES TO RETURN if any
-        module under `workers/` is neither scheduled nor accounted for.
+        when a `CorroborationCandidateSource` is supplied -- see below), the
+        per-project TTL / idle-decay sweeps (`workers.sweeps.run_all_sweeps`,
+        driven by the per-project `EffectiveConfig` the shared `ConfigResolver`
+        resolves), the per-(project, agent_type) static-prefix rebuild
+        (`workers.prefix_builder.PrefixBuilder`, publishing into the Valkey
+        static-prefix cache), and the queue GC pass; every other periodic
+        worker is recorded in `composition.UNSCHEDULED_WORKERS` with the exact
+        dependency it is blocked on, and `build_scheduled_jobs` REFUSES TO
+        RETURN if any module under `workers/` is neither scheduled nor
+        accounted for.
 
     Cadences come from `domain.config.WorkersConfig`, which exists precisely
     because the previous version of this docstring recorded the contract gap
@@ -444,11 +449,16 @@ def run() -> None:
             "the proposal consumer was wired with a store that cannot enforce "
             "proposals.per_run_cap / per_project_daily_cap across processes"
         )
+    # One ConfigResolver, reused by the proposal intake AND the periodic plane below. It is
+    # stateless (`effective()` rebuilds its working copy from settings on every call), so a
+    # single instance is the same as N; naming it once keeps both consumers on identical
+    # resolution semantics.
+    resolver = ConfigResolver(settings, repo)
     proposal_intake = ProposalIntake(
         queue,
         agent_control,
         repo,
-        ConfigResolver(settings, repo),
+        resolver,
         batch_size=settings.queue.batch_size,
     )
 
@@ -470,9 +480,15 @@ def run() -> None:
         TOPIC_OUTCOME_EVENT,
         TOPIC_TRACE_EVENT,
     )
+    from tracebed.stores.valkey.client import ValkeyClient
     from tracebed.workers.composition import build_learning_plane, build_scheduled_jobs
     from tracebed.workers.scheduler import Scheduler
     from tracebed.workers.spend import SpendMeter
+
+    # The static-prefix cache (StaticPrefixCachePort) the prefix_builder publishes into. Built
+    # once here -- valkey-py is lazy, so no socket opens until the first command, and constructing
+    # it at wiring time is safe (contract §12).
+    valkey = ValkeyClient.from_url(settings.storage.valkey_url)
 
     plane = build_learning_plane(
         pool=pool,
@@ -499,6 +515,11 @@ def run() -> None:
             queue_observability=queue,
             topics=(TOPIC_TRACE_EVENT, TOPIC_OUTCOME_EVENT, TOPIC_MEMORY_PROPOSAL),
             lease_seconds=settings.queue.lease_seconds,
+            clock=clock,
+            config_resolver=resolver,
+            memory_store=repo,
+            prefix_cache=valkey,
+            list_agent_type_ids=repo.list_agent_type_ids,
             candidate_source=None,
         ),
     )

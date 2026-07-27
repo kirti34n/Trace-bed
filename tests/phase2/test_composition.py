@@ -20,7 +20,8 @@ import pytest
 from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import WorkersConfig
 from tracebed.domain.errors import ConfigError
-from tracebed.domain.ids import ProjectId
+from tracebed.domain.ids import AgentTypeId, ProjectId
+from tracebed.domain.state_machine import Status
 from tracebed.workers import composition
 from tracebed.workers.composition import (
     NON_PERIODIC_WORKERS,
@@ -105,7 +106,7 @@ def test_a_placeholder_reason_in_the_non_periodic_table_is_refused_too() -> None
 
 def test_the_shipped_classification_covers_every_worker_module() -> None:
     """The check that fires when somebody adds a worker and forgets to decide about it."""
-    validate_worker_coverage({"embedder", "corroboration", "gc"})
+    validate_worker_coverage({"embedder", "corroboration", "gc", "sweeps", "prefix_builder"})
 
 
 def test_discovery_walks_the_package_rather_than_a_hand_written_list() -> None:
@@ -168,6 +169,103 @@ class _Embedder:
         return object()
 
 
+def _effective_config() -> Any:
+    """A real `EffectiveConfig` from every section's documented default -- what the sweeps job's
+    `config_resolver.effective(project_id)` call returns in these tests. Built from concrete
+    section models rather than a stub so a sweep body that reached into it would see real
+    values, and so the cross-section validator (`q_start > archive_floor`) is exercised."""
+    from tracebed.domain.config import (
+        AbstentionConfig,
+        BudgetConfig,
+        CacheConfig,
+        DerivedConfig,
+        EffectiveConfig,
+        KillswitchConfig,
+        LifecycleConfig,
+        PromotionConfig,
+        ProposalConfig,
+        QueueConfig,
+        RetirementConfig,
+        RetrievalConfig,
+        ScoreConfig,
+        ScoringConfig,
+        SessionConfig,
+        SpendConfig,
+        TierAConfig,
+    )
+
+    return EffectiveConfig(
+        retrieval=RetrievalConfig(),
+        abstention=AbstentionConfig(),
+        score=ScoreConfig(),
+        budget=BudgetConfig(),
+        scoring=ScoringConfig(),
+        promotion=PromotionConfig(),
+        retirement=RetirementConfig(),
+        lifecycle=LifecycleConfig(),
+        derived=DerivedConfig(),
+        proposals=ProposalConfig(),
+        tier_a=TierAConfig(),
+        killswitch=KillswitchConfig(),
+        spend=SpendConfig(),
+        cache=CacheConfig(),
+        session=SessionConfig(),
+        queue=QueueConfig(),
+    )
+
+
+class _Resolver:
+    """`ConfigProvider` fake: records every `(project_id, agent_type_id)` it resolved so a test
+    can assert per-project resolution, and returns a fresh default `EffectiveConfig`."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[ProjectId, Any]] = []
+
+    def effective(self, project_id: ProjectId, agent_type_id: Any = None) -> Any:
+        self.calls.append((project_id, agent_type_id))
+        return _effective_config()
+
+
+class _MemoryStore:
+    """`MemoryStorePort` fake (the prefix_builder's `Repo.list_memories` shape)."""
+
+    def list_memories(
+        self, project_id: ProjectId, *, statuses: Any = None, limit: int = 100
+    ) -> list[Any]:
+        del project_id, statuses, limit
+        return []
+
+
+class _PrefixCache:
+    """`StaticPrefixCachePort` fake: records each publish so a test can assert both writes."""
+
+    def __init__(self) -> None:
+        self.published: list[tuple[str, ProjectId, Any, int]] = []
+
+    def static_prefix_set(
+        self,
+        project_id: ProjectId,
+        agent_type_id: Any,
+        prefix_version: int,
+        value: bytes,
+        *,
+        ttl_seconds: int,
+    ) -> None:
+        del value, ttl_seconds
+        self.published.append(("block", project_id, agent_type_id, prefix_version))
+
+    def current_prefix_version_set(
+        self,
+        project_id: ProjectId,
+        agent_type_id: Any,
+        prefix_version: int,
+        *,
+        ttl_seconds: int,
+    ) -> None:
+        del ttl_seconds
+        self.published.append(("pointer", project_id, agent_type_id, prefix_version))
+
+
 def _plane(**kw: Any) -> Any:
     from tracebed.workers.composition import LearningPlane
 
@@ -201,15 +299,20 @@ def _jobs(plane: Any, projects: Sequence[ProjectId], **kw: Any) -> Any:
         queue_observability=_Queue(),
         topics=("trace_event",),
         lease_seconds=30,
+        clock=kw.pop("clock", FakeClock()),
+        config_resolver=kw.pop("config_resolver", _Resolver()),
+        memory_store=kw.pop("memory_store", _MemoryStore()),
+        prefix_cache=kw.pop("prefix_cache", _PrefixCache()),
+        list_agent_type_ids=kw.pop("list_agent_type_ids", lambda pid: []),
         **kw,
     )
 
 
 def test_the_embedder_and_gc_are_scheduled_and_corroboration_is_not_without_a_source() -> None:
-    """The exact production state, asserted rather than described: two jobs, and the third
-    withheld for a reason the coverage check has seen."""
+    """The exact production state, asserted rather than described: the always-on jobs, and
+    corroboration withheld for a reason the coverage check has seen."""
     jobs = _jobs(_plane(), [])
-    assert [job.name for job in jobs] == ["embedder", "gc"]
+    assert [job.name for job in jobs] == ["embedder", "sweeps", "prefix_builder", "gc"]
 
 
 def test_corroboration_is_scheduled_once_a_host_supplies_a_candidate_source() -> None:
@@ -224,7 +327,13 @@ def test_corroboration_is_scheduled_once_a_host_supplies_a_candidate_source() ->
             return object()
 
     jobs = _jobs(_plane(corroboration=_Writer()), [], candidate_source=_Source())
-    assert [job.name for job in jobs] == ["embedder", "corroboration", "gc"]
+    assert [job.name for job in jobs] == [
+        "embedder",
+        "corroboration",
+        "sweeps",
+        "prefix_builder",
+        "gc",
+    ]
 
 
 def test_the_project_list_is_re_read_on_every_run_not_snapshotted() -> None:
@@ -313,6 +422,11 @@ def test_a_job_for_a_module_that_does_not_exist_fails_construction() -> None:
             queue_observability=_Queue(),
             topics=("trace_event",),
             lease_seconds=30,
+            clock=FakeClock(),
+            config_resolver=_Resolver(),
+            memory_store=_MemoryStore(),
+            prefix_cache=_PrefixCache(),
+            list_agent_type_ids=lambda pid: [],
         )
 
 
@@ -347,6 +461,11 @@ def test_the_gc_job_is_process_wide_rather_than_per_project() -> None:
         queue_observability=_CountingQueue(),
         topics=("trace_event", "outcome_event"),
         lease_seconds=30,
+        clock=FakeClock(),
+        config_resolver=_Resolver(),
+        memory_store=_MemoryStore(),
+        prefix_cache=_PrefixCache(),
+        list_agent_type_ids=lambda pid: [],
     )
     next(j for j in jobs if j.name == "gc").run()
     assert len(calls) == 2, "one depth read per topic, not per topic per project"
@@ -375,6 +494,187 @@ def test_the_scheduler_actually_fires_a_composed_job_on_its_configured_cadence()
     fired = scheduler.tick()
     assert fired.get("embedder") == 1
     assert [pid for pid, _ in embedder.calls] == [project]
+
+
+# --------------------------------------------------------------------------- #
+# sweeps: per-project isolation and per-project config resolution.
+# --------------------------------------------------------------------------- #
+
+
+class _SweepStore:
+    """A `MemoryLifecycleRepoPort`-shaped fake that records which project each sweep read, and
+    returns no rows so `run_all_sweeps` completes without a transition."""
+
+    def __init__(self) -> None:
+        self.status_calls: list[tuple[ProjectId, tuple[Any, ...]]] = []
+
+    def select_by_status(
+        self, project_id: ProjectId, statuses: Any, *, limit: int = 10_000
+    ) -> list[Any]:
+        del limit
+        self.status_calls.append((project_id, tuple(statuses)))
+        return []
+
+    def persist(self, project_id: ProjectId, write: Any) -> None:  # pragma: no cover - no rows
+        del project_id, write
+
+
+def test_the_sweeps_job_resolves_config_per_project_and_never_mixes_projects() -> None:
+    """PLAN.md §10: a sweep batch is one project. The job resolves an `EffectiveConfig` PER
+    project (project-scoped, agent_type_id=None -- sweeps carry no agent-type layer) and sweeps
+    each project's own status populations, never a merged one."""
+    import uuid
+
+    a = ProjectId(uuid.UUID(int=10))
+    b = ProjectId(uuid.UUID(int=11))
+    store = _SweepStore()
+    resolver = _Resolver()
+    jobs = _jobs(_plane(memory_lifecycle=store), [a, b], config_resolver=resolver)
+
+    next(j for j in jobs if j.name == "sweeps").run()
+
+    # One resolve per project, project-scoped with no agent-type layer.
+    assert resolver.calls == [(a, None), (b, None)]
+    # Each project swept exactly its own three status populations, one at a time.
+    assert store.status_calls == [
+        (a, (Status.QUARANTINED,)),
+        (a, (Status.CANDIDATE,)),
+        (a, (Status.VALIDATED,)),
+        (b, (Status.QUARANTINED,)),
+        (b, (Status.CANDIDATE,)),
+        (b, (Status.VALIDATED,)),
+    ]
+
+
+def test_one_projects_sweep_failure_does_not_stop_the_rest() -> None:
+    """The same one-broken-project-does-not-stop-the-loop rule the embedder job holds, for
+    sweeps: a project whose resolve raises is logged and skipped, the next is still swept."""
+    import uuid
+
+    good = ProjectId(uuid.UUID(int=12))
+    bad = ProjectId(uuid.UUID(int=13))
+    store = _SweepStore()
+
+    class _HalfBrokenResolver(_Resolver):
+        def effective(self, project_id: ProjectId, agent_type_id: Any = None) -> Any:
+            self.calls.append((project_id, agent_type_id))
+            if project_id == bad:
+                raise RuntimeError("this project's config is broken")
+            return _effective_config()
+
+    resolver = _HalfBrokenResolver()
+    jobs = _jobs(_plane(memory_lifecycle=store), [bad, good], config_resolver=resolver)
+    next(j for j in jobs if j.name == "sweeps").run()
+
+    assert [pid for pid, _ in resolver.calls] == [bad, good]
+    # `bad` raised before any store read; `good` swept its three populations.
+    assert {pid for pid, _ in store.status_calls} == {good}
+
+
+# --------------------------------------------------------------------------- #
+# prefix_builder: per-(project, agent_type) isolation and re-enumeration.
+# --------------------------------------------------------------------------- #
+
+
+def test_prefix_builder_runs_once_per_agent_type_per_project() -> None:
+    """The nested loop: for each project, for each of its agent types, one build+publish. The
+    agent-type list is passed as a callable and re-read each tick."""
+    import uuid
+
+    a = ProjectId(uuid.UUID(int=20))
+    at1 = AgentTypeId(uuid.UUID(int=1))
+    at2 = AgentTypeId(uuid.UUID(int=2))
+    cache = _PrefixCache()
+    resolver = _Resolver()
+    jobs = _jobs(
+        _plane(),
+        [a],
+        prefix_cache=cache,
+        config_resolver=resolver,
+        list_agent_type_ids=lambda pid: [at1, at2],
+    )
+
+    next(j for j in jobs if j.name == "prefix_builder").run()
+
+    # Each agent type resolved per-(project, agent_type) and published (block + pointer).
+    assert resolver.calls == [(a, at1), (a, at2)]
+    assert {atid for _, _, atid, _ in cache.published} == {at1, at2}
+
+
+def test_one_agent_types_prefix_failure_does_not_stop_sibling_agent_types() -> None:
+    """Inner isolation: one agent type raising (config error, the MAX_ROW_LIMIT refusal, ...)
+    must not stop the other agent types in the same project."""
+    import uuid
+
+    a = ProjectId(uuid.UUID(int=21))
+    at_bad = AgentTypeId(uuid.UUID(int=3))
+    at_ok = AgentTypeId(uuid.UUID(int=4))
+    cache = _PrefixCache()
+
+    class _AgentFailingResolver(_Resolver):
+        def effective(self, project_id: ProjectId, agent_type_id: Any = None) -> Any:
+            self.calls.append((project_id, agent_type_id))
+            if agent_type_id == at_bad:
+                raise RuntimeError("this agent type's config is broken")
+            return _effective_config()
+
+    resolver = _AgentFailingResolver()
+    jobs = _jobs(
+        _plane(),
+        [a],
+        prefix_cache=cache,
+        config_resolver=resolver,
+        list_agent_type_ids=lambda pid: [at_bad, at_ok],
+    )
+
+    next(j for j in jobs if j.name == "prefix_builder").run()
+
+    # Both attempted; only the healthy one published anything.
+    assert [atid for _, atid in resolver.calls] == [at_bad, at_ok]
+    assert {atid for _, _, atid, _ in cache.published} == {at_ok}
+
+
+def test_a_failing_agent_type_enumeration_does_not_stop_other_projects() -> None:
+    """Outer isolation: a project whose `list_agent_type_ids` itself raises is logged and
+    skipped by the per-project loop; the next project's agent types are still built."""
+    import uuid
+
+    bad = ProjectId(uuid.UUID(int=22))
+    good = ProjectId(uuid.UUID(int=23))
+    at = AgentTypeId(uuid.UUID(int=5))
+    cache = _PrefixCache()
+
+    def _ids(pid: ProjectId) -> list[AgentTypeId]:
+        if pid == bad:
+            raise RuntimeError("agent-type enumeration broke")
+        return [at]
+
+    jobs = _jobs(_plane(), [bad, good], prefix_cache=cache, list_agent_type_ids=_ids)
+    next(j for j in jobs if j.name == "prefix_builder").run()
+
+    assert {pid for _, pid, _, _ in cache.published} == {good}
+
+
+def test_the_agent_type_list_is_re_read_on_every_run_not_snapshotted() -> None:
+    """An agent type provisioned after the process started must be built without a restart --
+    the same re-read guarantee `list_project_ids` gets, one level down."""
+    import uuid
+
+    a = ProjectId(uuid.UUID(int=24))
+    agent_types: list[AgentTypeId] = []
+    cache = _PrefixCache()
+    jobs = _jobs(
+        _plane(), [a], prefix_cache=cache, list_agent_type_ids=lambda pid: list(agent_types)
+    )
+    job = next(j for j in jobs if j.name == "prefix_builder")
+
+    job.run()
+    assert cache.published == []
+
+    late = AgentTypeId(uuid.UUID(int=6))
+    agent_types.append(late)
+    job.run()
+    assert {atid for _, _, atid, _ in cache.published} == {late}
 
 
 def test_the_embedding_batch_limit_reaches_the_worker(embedder_limit: int = 3) -> None:
