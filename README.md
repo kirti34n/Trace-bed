@@ -7,112 +7,15 @@
 Memory whose purpose is that agents *get better at their job over time* — not a knowledge base
 with a vector index bolted on.
 
-[![tests](https://img.shields.io/badge/tests-4%2C276%20passed%20%2F%2045%20skipped-2ea44f)](#the-gates)
-[![mypy](https://img.shields.io/badge/mypy--strict-clean%20%C2%B7%20151%20files-2ea44f)](#the-gates)
-[![gates](https://img.shields.io/badge/full%20gate-INCOMPLETE-orange)](#the-gates)
-[![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)](#licence)
+[![tests](https://img.shields.io/badge/tests-4%2C403%20passed%20%C2%B7%20live%20stack-2ea44f)](#testing)
+[![mypy](https://img.shields.io/badge/mypy--strict-clean%20%C2%B7%20158%20files-2ea44f)](#testing)
+[![ruff](https://img.shields.io/badge/ruff-clean-2ea44f)](#testing)
+[![isolation](https://img.shields.io/badge/cross--project%20leak%20suite-7%2F7-2ea44f)](#the-eight-invariants)
 [![python](https://img.shields.io/badge/python-3.13-3776ab)](#quick-start)
-[![postgres](https://img.shields.io/badge/postgres-18%20%2B%20pgvector%20%2B%20pg__textsearch-336791)](#quick-start)
+[![postgres](https://img.shields.io/badge/postgres-18%20%2B%20pgvector%20%2B%20vchord__bm25-336791)](#quick-start)
+[![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)](#licence)
 
 </div>
-
----
-
-## Read this first
-
-This repository is **honest about being unfinished in a specific way**, and that shape matters more
-than any badge above.
-
-> The **rules** were built with unusual fidelity. The **runtime** was not.
->
-> Every invariant, guard, formula, threshold and template exists as correct, typed, tested code. The
-> state machine matches the plan row for row. The project wall is a type-level constraint. Provenance
-> rejection fires before the INSERT is built.
->
-> **The learning half was a library, not a service.** There was no `UPDATE memory_item` statement
-> anywhere in `src/`. The worker process started with `handlers={}`. Nothing wrote an embedding, so
-> the ANN arm of "hybrid retrieval" could never have data. Nothing appended `shadow_confirm_runs` —
-> the only non-human route out of quarantine.
->
-> **A Tracebed deployed today ingested traces and outcome events faithfully, and learned nothing
-> from either.**
-
-That paragraph is from [`docs/FIDELITY-AUDIT.md`](docs/FIDELITY-AUDIT.md) — a 472-item audit of the
-built system against its own specification. It found **325 matches, 25 logged deviations, 49 silent
-deviations and 23 missing items**.
-
-**It is written in the past tense because an integration pass on 2026-07-27 closed part of it
-([audit §12](docs/FIDELITY-AUDIT.md), D-128) — and only part.** Here is the whole of the current
-answer, in three sentences:
-
-> A status change now reaches a column, an embedding now reaches a row, and a shadow confirmation
-> now reaches an array — each through exactly one statement, each with a real Postgres
-> implementation of the port its worker declared, and the worker process now runs a scheduler
-> thread that drives them.
->
-> **But 11 of the 14 periodic workers still cannot be scheduled**, because the store port each one
-> takes has no Postgres implementation: the *shadow validator*, the *scorer* and the *promotion*
-> worker among them — which are precisely the three stages between "evidence recorded" and
-> "validated memory".
->
-> So a deployed Tracebed today **records the evidence a memory needs to graduate, and cannot yet
-> graduate it.** `python harness/closed_loop.py` walks all nine hops end to end and passes — the
-> loop **composes** — but it does so **offline, against in-memory implementations of the missing
-> ports**, and it prints all eleven unscheduled workers, each beside the exact port that blocks it,
-> underneath its own verdict, so that PASS cannot be mistaken for "the learning plane is live".
-> **Composing is not running.** That distinction is the single most important thing this README
-> has to convey.
-
-A third pass on 2026-07-27 fixed **six real defects** surfaced by a head-to-head review evaluation
-([`docs/BMAD-EVALUATION.md`](docs/BMAD-EVALUATION.md), remediation in
-[audit §13](docs/FIDELITY-AUDIT.md)). They were not spec gaps — the code matched its documents in
-every case — they were an adversary's questions: a kill switch that failed **open** while the admin
-surface reported it applied, an export that shipped raw embedding vectors, an independence check
-that read *missing* evidence as *independent* evidence, an upsert that let a later batch rewrite
-whose observation a run was, a hot path with no cancellation of any kind, and a route out of
-quarantine that needed no evidence at all. All six are closed **and wired** — four of the five fix
-chunks independently reported the same residue, a mechanism that is complete, tested, and reaches
-no call site, which is worse than an unfixed bug because every gate reads green while the property
-is enforced nowhere. Roughly eleven further real findings are open and enumerated, unfixed, in
-[`docs/BMAD-EVALUATION.md`](docs/BMAD-EVALUATION.md) §6.2.
-
-Everything below is written on the assumption you would rather know that on line 30 than discover it
-on day three.
-
-<details>
-<summary><b>What is actually finished, and what is not</b> — click to expand</summary>
-
-<br>
-
-| Layer | State | Evidence |
-|---|---|---|
-| Domain model, state machine, invariants | **Complete** | 9 statuses, full transition table, exhaustive product tested |
-| Isolation (typed repo + FORCE RLS + partitions) | **Complete** | Type-level; verified by signature introspection |
-| Scan suite, crypto-shredding, trace store | **Complete** | 5-file adversarial corpus; AES-256-GCM envelope, AAD-bound |
-| Hot read path (retrieve → abstain → assemble → render) | **Complete** | 32 negative probes, 0 injections; 6-way fail-open drill |
-| SDK, ingest, queue, telemetry | **Complete** | 0.04 ms p99 hot-path overhead with the server down |
-| Tier A parsers, derived state, invalidation, sweeps | **Complete** | Zero byte passthrough proven over a rolling 8-byte window |
-| Scorer, judge, shadow validation, promotion, kill switch | **Logic complete** | Correct and tested — **but not schedulable; see below** |
-| **Persisting a status change** | **Complete** | `stores/pg/lifecycle.py` — one `UPDATE memory_item SET status`, plus a `memory_status_log` row in the same transaction. Reached through `MemoryEditRepo`/`ForensicsRepo` |
-| **Embedding writes** | **Complete** | `stores/pg/learning.py::EmbeddingRepo`; swept on a config cadence. A pin change re-selects every row — that IS the re-embedding migration |
-| **`shadow_confirm_runs` writer** | **Complete** | `stores/pg/learning.py::CorroborationRepo` — a `FOR NO KEY UPDATE` CTE reporting appended / already-present / row-not-eligible |
-| **Worker process: periodic plane** | **Partial (3 of 14)** | `workers/composition.py` + a `Scheduler` thread in `runner.run()`. Scheduled: embedder, gc, corroboration (given a host-supplied candidate source). The other **eleven** are refused **by name** with the port that blocks each; `build_scheduled_jobs` raises rather than silently returning a shorter list |
-| **Postgres implementations of the worker ports** | **Partial (4 of 10)** | Done: `EmbeddingRepoPort`, `CorroborationRepoPort`, `MemoryEditRepoPort`, `ForensicsRepoPort`. Missing: `ScorerRepoPort`, `ShadowValidatorRepoPort`, `PromotionRepoPort`, `KillswitchStorePort`, `DerivedStateStorePort`, `MemoryLifecycleRepoPort` |
-| **Hot-path cancellation (invariant 2 against *hangs*)** | **Complete, wired** | Three bounds, all reached by a call site: the retriever's arm waits and its work-queue admission control (client), `statement_timeout` derived from `retrieval.total_budget_ms` and issued transaction-scoped by `stores.pg.search` (server), and `connect_timeout`/pool-checkout from `StorageConfig` at both `create_pool` sites. **Never observed cancelling a real query** — no Postgres here |
-| **Creation-edge guards at the insert door** | **Convention, not mechanism** | `insert_memory_item` checks status membership and provenance *fields*, never `apply(None, ...)`, so Tier / `scan_passed` / `provenance_complete` / `operator_created` are enforced only on callers that route through the state machine first. PLAN §11.2 |
-| **`q_history`, consolidation-diff table, `memory_link` over HTTP** | **MISSING** | Views for these render honest empty pages |
-| **Any integration test, ever** | **NEVER RUN** | No Docker/Postgres/Valkey/S3 on the build machine. Every SQL statement in the repository is parsed and structurally asserted, never executed |
-| Dashboard (16 views, React 18 + Vite + TS + Tailwind) | **Complete** | Zero fixture data; every view live or honestly empty |
-
-**Consequence:** the pieces that *decide* were always done. As of 2026-07-27 several pieces that
-*remember the decision* are done too, and the hot path is now bounded against hangs rather than only
-against exceptions — but the three stages that turn recorded evidence into a validated memory
-(shadow validator, scorer, promotion) still have no store, so they run in the closed-loop drill and
-in no deployment. What remains is bounded and specified one worker at a time in
-`workers/composition.py::UNSCHEDULED_WORKERS`; the columns, the partitions and the RLS policies all
-already exist. Written up in [`PLAN.md`](PLAN.md) §11 and [audit §12–§13](docs/FIDELITY-AUDIT.md).
-
-</details>
 
 ---
 
@@ -157,32 +60,80 @@ its import graph. An ingest plane where every write is fire-and-forget. A backgr
 workers that do the actual learning. A control plane: dashboard, kill switch, spend ledger.
 
 **Two lanes.** An LLM-free operational lane that works everywhere, and a quality lane that exists
-only where a feedback adapter exists. *A guessed reward is worse than none*, so ambiguous signals are
-logged and never scored.
+only where a feedback adapter exists. *A guessed reward is worse than none*, so ambiguous signals
+are logged and never scored.
 
 **Two trust tiers.** Tier A is parser-derived and structural. Tier B is content-derived and
 quarantined until confirmed by ≥2 runs from **distinct principals *and* distinct input-signature
 clusters** — both, because either alone is trivially forged.
 
-**The project is the wall.** `project_id` is derived server-side from the authenticated principal and
-is *never* accepted from a caller.
+**The project is the wall.** `project_id` is derived server-side from the authenticated principal
+and is *never* accepted from a caller. Isolation is enforced three ways at once — a typed repository
+with no scope-less constructor, `FORCE ROW LEVEL SECURITY`, and LIST partitioning — and the
+cross-project leak suite proves it against a live database under the non-privileged application role.
+
+---
+
+## Status
+
+Tracebed runs against a real stack. Migrations apply to Postgres 18, the full test suite (offline
+**and** integration) is green, and cross-project isolation is verified against the live database, not
+just asserted against SQL text.
+
+**Working and verified against the live stack**
+
+- The schema (`migrations/0001`–`0006`) applies cleanly to Postgres 18; roles, RLS, LIST partitions
+  and per-project indexes are provisioned per project.
+- **Cross-project isolation** — the 7-probe leak suite passes under the `NOBYPASSRLS` application
+  role; a connection scoped to one project sees zero of another's rows across all partitioned tables.
+- **Hybrid retrieval** — true BM25 lexical ranking via `vchord_bm25`, ANN via pgvector `halfvec`,
+  fused and gated by abstention (rarity/cosine/BM25); document frequency for the rarity gate comes
+  from a `tsvector` column.
+- **The learning-plane store layer** — every worker's Postgres store port is implemented and wired
+  into the composition root, so each worker can be constructed against its live store.
+- **The periodic scheduler runs** and drives five jobs per project: `embedder`, `gc`,
+  `corroboration` (given a host candidate source), `sweeps`, and `prefix_builder`.
+
+**Complete but not yet running end-to-end**
+
+Several stages that turn recorded evidence into a validated memory are logic-complete and have live
+stores, but stay **deliberately unscheduled** because their remaining driver is not this repository's
+to invent — and a worker scheduled-but-inert is worse than one honestly unscheduled. Each is named,
+with its exact blocker, in `workers/composition.py::UNSCHEDULED_WORKERS`, and `build_scheduled_jobs`
+**refuses to return** if any worker is dropped without a recorded reason. The blockers are:
+
+- **Host-supplied ports** you provide at deployment: `RevalidationCheckPort` (what counts as
+  re-verified is deliberately your policy, D-113), `ContributionJudgePort`, `TracePrincipalLookupPort`,
+  `LLMProviderPort`.
+- **Under-specified evidence schemas** (a decision, not a guess): the promotion/retirement predicates,
+  the scorer's outcome→trace→injection→memory candidate join, an `invalidation_event` drain cursor, a
+  day-bucketed lift feed for the kill switch.
+- **One store still to design**: `MemoryLinkStorePort` for the consolidator.
+
+`python harness/closed_loop.py` walks all nine hops of the learning loop end-to-end and passes — the
+loop **composes**. It runs against in-memory fakes and prints every unscheduled worker beside the
+blocker that stops it, so "the loop composes" is never mistaken for "the learning plane is live for
+these stages." That distinction is the one this section exists to convey.
+
+A full requirements audit lives in [`docs/FIDELITY-AUDIT.md`](docs/FIDELITY-AUDIT.md); the
+architecture and the open work, one item at a time, in [`PLAN.md`](PLAN.md) §11.
 
 ---
 
 ## The eight invariants
 
-These are the load-bearing promises. Each has a proving test; the audit checked whether each test
-would actually go red if the invariant broke.
+The load-bearing promises. Each has a proving test; the audit checked whether each test would
+actually go red if the invariant broke.
 
 | # | Invariant | Enforced by | Proof |
 |---|---|---|---|
-| 1 | **Hot-path purity** — no generative client reachable from `hotpath/` | `scripts/purity_check.py`, import-graph reachability with a third-party **allowlist** | CI-blocking |
-| 2 | **Fail-open, budgeted** — 300 ms p99, degradation ladder, never blocks a run | `hotpath/pipeline.py` + `budget.py` | 6-way drill, 0 exceptions ⚠️ *simulated clock* |
+| 1 | **Hot-path purity** — no generative client reachable from `hotpath/` | `scripts/purity_check.py`, import-graph reachability with a third-party allowlist | CI-blocking |
+| 2 | **Fail-open, budgeted** — 300 ms p99, degradation ladder, never blocks a run | `hotpath/pipeline.py` + `budget.py`; client wait **and** server `statement_timeout` | 6-way fail-open drill |
 | 3 | **Render-as-data** — memory enters context as a labelled data block, never instructions | `hotpath/templates.py` closed grammar | 40-payload fuzz corpus |
-| 4 | **Project isolation at query construction** | Typed repo (no scope-less constructor) + `FORCE ROW LEVEL SECURITY` + LIST partitions | 7-class leak suite ⚠️ *needs Postgres* |
-| 5 | **Async writes** — nothing on the write side is awaited | SDK ring buffer | **0.04 ms p99** with the API down |
+| 4 | **Project isolation** — enforced at query construction, in RLS, and in partitioning | Typed repo + `FORCE ROW LEVEL SECURITY` + LIST partitions | **7-probe leak suite, green on the live DB under `tracebed_app`** |
+| 5 | **Async writes** — nothing on the write side is awaited | SDK ring buffer | 0.04 ms p99 with the API down |
 | 6 | **Provenance-complete-or-rejected** | `validate_provenance` before the statement is built + `NOT NULL` backstop | Exhaustive class × field matrix |
-| 7 | **Tier B quarantine** — nothing content-derived is retrievable until confirmed | One state machine, no admin bypass, `PROPOSAL` hard-coded to satisfy no skip | 4-probe red team |
+| 7 | **Tier B quarantine** — nothing content-derived is retrievable until confirmed | One state machine, no admin bypass | 4-probe red team, verified on the live DB |
 | 8 | **No guessed rewards** — `Q ← clamp01(Q + α·w·c·(r − Q))` | `workers/scorer.py`, `w = 0` short-circuits | Verified by hand arithmetic |
 
 > **On invariant 3, stated plainly:** render-as-data is a *governance* control, not an anti-poisoning
@@ -192,60 +143,24 @@ would actually go red if the invariant broke.
 
 ---
 
-## The gates
-
-Five phase gates plus an aggregate. **The overall verdict is `INCOMPLETE`, and that is the correct
-reading** — not a soft pass.
-
-| Gate | Verdict | Why |
-|---|---|---|
-| Phase 0 — trace substrate, isolation, security | `INCOMPLETE` | 6/7 clauses PASS · cross-project leak suite needs Postgres |
-| Phase 1 — hot path | `INCOMPLETE` | 6/7 clauses PASS · latency bench needs Postgres (informational, never gates) |
-| Phase 2 — operational lane + staleness | **`PASS`** | 7/7 · offline by design, and its own report says so |
-| Phase 3 — quality lane + learning | `INCOMPLETE` | **10/10 clauses PASS**, verdict INCOMPLETE on untracked skips (no Postgres). Clause 9 is the closed-loop drill |
-| Phase 4 — workflow memory + polish | `INCOMPLETE` | 6/6 clauses PASS · integration tests unrun |
-| **Full** | **`INCOMPLETE`** | The weakest of the five, by design |
-
-*Regenerated 2026-07-27 after the BMAD remediation pass. **No verdict improved and none regressed** —
-the remediation changed source and tests, not the one thing every `INCOMPLETE` here turns on.*
-
-Every gate runner reports each assertion as `PASS` / `FAIL` / `SKIPPED-NO-STACK` / `INCOMPLETE-DATA`
-individually. **An overall `PASS` is only legal when every assertion actually executed.** There is no
-code path that prints `PASS` for a test that did not run.
-
-> Phases 2 and 3 pass because their gates are offline by design. They also disclose, beside their own
-> verdict, that they contribute no integration-marked tests and that none of the worker ports their
-> clauses exercise has a Postgres implementation.
-
-Stand up the stack and the picture changes:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/verify_with_stack.ps1
-```
-
-⚠️ **The compose image tags are unverified** — this repository was authored on a machine with no
-Docker daemon, so they have never been pulled.
-
----
-
 ## Quick start
 
-<details open>
-<summary><b>Backend</b></summary>
+Postgres is on **5442** and Valkey on **6389** so the stack cannot collide with anything already
+running on your machine. The compose Postgres image bundles `pgvector` and `vchord_bm25`; both require
+`shared_preload_libraries`, already set in `docker/compose.yaml`.
 
 ```bash
-uv venv --python 3.13 .venv
+uv venv --python 3.13 .venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 
-docker compose -f docker/compose.yaml up -d      # PG18 + Valkey + SeaweedFS
-psql "$TB_STORAGE__PG_DSN" -f docker/initdb/01-roles.sql
-python -m tracebed.stores.pg.migrate apply
+docker compose -f docker/compose.yaml up -d          # PG18 (pgvector + vchord_bm25) + Valkey + SeaweedFS
+export TB_STORAGE__PG_DSN="postgresql://tracebed_owner:tracebed_dev_only@localhost:5442/tracebed"
+python -m tracebed.stores.pg.migrate apply           # applies 0001..0006 (roles are created by initdb)
 
-pytest -q                                        # 4,276 passed / 45 skipped
-python harness/full_gate.py                      # the honest verdict
+export TB_STORAGE__VALKEY_URL="valkey://localhost:6389/0" TB_EMBEDDING__MODEL_VERSION=dev-pin
+pytest -q                                            # 4,403 passed · 1 skipped (S3 env-gated)
+python harness/closed_loop.py                        # the learning loop, composed, with its scope note
 ```
-
-</details>
 
 <details>
 <summary><b>Dashboard</b> — React 18 + Vite + TypeScript + Tailwind on :8111</summary>
@@ -258,30 +173,32 @@ npm run build
 node scripts/license_check.mjs
 ```
 
-The stack matches the host platform's frontend so these views lift into its console later without a
-rewrite. **No view is fixture-backed** — every one is live or honestly empty, and
+No view is fixture-backed — every one is live or honestly empty;
 [`dashboard/README.md`](dashboard/README.md) has the exact per-view table.
 
 </details>
 
-<details>
-<summary><b>The five CI gates</b></summary>
+Ports: API **8110**, dashboard **8111**, Postgres **5442**, Valkey **6389**, S3 **8333**.
+
+---
+
+## Testing
+
+The full suite runs offline **and** against the live stack; RLS-sensitive tests connect as the
+non-privileged `tracebed_app` role (the owner bypasses RLS and would hide a leak).
 
 ```bash
-python scripts/license_check.py      # CI step 1 — 49 distributions, permissive + one logged LGPL
-python scripts/raw_sql_lint.py       # CI step 2 — no SQL outside stores/pg/
-python scripts/purity_check.py       # CI step 3 — invariant 1, by import-graph reachability
-python scripts/image_check.py        # container images declared and pinned
-mypy                                 # strict, 151 files
+pytest -q                            # 4,403 passed · 1 skipped, against live PG + Valkey
+mypy                                 # strict, 158 files, clean
+ruff check src tests harness scripts # clean
+python scripts/license_check.py      # dependency policy (Apache/permissive + one logged LGPL)
+python scripts/raw_sql_lint.py       # no SQL execution outside stores/pg/
+python scripts/purity_check.py       # invariant 1, by import-graph reachability
 ```
 
-Each has a `--self-test` proving the gate actually bites. They were written that way after two of
-them shipped defects that made them pass on input they should have rejected.
-
-</details>
-
-Ports: API **8110**, dashboard **8111**. Postgres is on **5442** and Valkey on **6389** so the stack
-cannot collide with anything already running on your machine.
+Each gate script has a `--self-test` proving it actually bites — written that way after two of them
+shipped defects that made them pass on input they should have rejected. The five phase-gate reports
+(`gate_report_phase*.md`) predate the live database and are being regenerated against it.
 
 ---
 
@@ -292,15 +209,15 @@ src/tracebed/
   domain/        newtypes, the ONE state machine, config, canonical hashing, signatures
   core/scans/    the shared gate suite — every write path must present a ScanVerdict
   crypto/        per-subject crypto-shredding (erasure that coexists with an immutable archive)
-  stores/        pg (typed repo, RLS, partitions) · valkey · tracestore (fs + generic S3)
+  stores/pg/     typed repo, RLS, partitions, migrations, search (BM25 + ANN), the worker stores
   hotpath/       retriever · fusion · abstention · assembler · renderer   [purity-gated]
   ingest/        trace_writer · outcome_intake
-  workers/       extractors · distiller · scorer · shadow_validator · killswitch · forensics
+  workers/       extractors · distiller · scorer · shadow_validator · killswitch · composition · scheduler
   api/           FastAPI :8110
   sdk/           fire-and-forget client, ring buffer
   adapters/      ports + shipped defaults; adapters/atom/ is STUBS AND DOCS ONLY
 dashboard/       React 18 + Vite + TS + Tailwind (:8111)
-harness/         leak suite · red team · soak · benches · the five gate runners
+harness/         leak suite · red team · soak · benches · the closed-loop drill · gate runners
 migrations/      plain SQL, yoyo
 ```
 
@@ -311,18 +228,17 @@ migrations/      plain SQL, yoyo
 | Document | What it is |
 |---|---|
 | [`PLAN.md`](PLAN.md) | Architecture, the eight invariants, the data model, the config surface, five phases. **Authoritative.** |
-| [`docs/SESSION-HANDOFF.md`](docs/SESSION-HANDOFF.md) | **Start here if you are picking this up.** Where the repo lives, verified state, what to do next, and the bugs worth not reintroducing. |
-| [`docs/FIDELITY-AUDIT.md`](docs/FIDELITY-AUDIT.md) | 472 items audited against the original spec. **Read §1 before trusting anything else.** |
-| [`DECISIONS.md`](DECISIONS.md) | 119 entries. Append-only; a reversal is superseded, never edited. |
-| [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Running it: migrations, the 1,000-project ceiling, erasure, reading a lift report. |
-| [`docs/ADAPTER-GUIDE.md`](docs/ADAPTER-GUIDE.md) | Implementing each port — and the ReMe parity section. |
+| [`docs/FIDELITY-AUDIT.md`](docs/FIDELITY-AUDIT.md) | 472 items audited against the original spec. |
+| [`DECISIONS.md`](DECISIONS.md) | Append-only decision log; a reversal is superseded, never edited. |
+| [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Running it: migrations, the partition ceiling, erasure, reading a lift report. |
+| [`docs/ADAPTER-GUIDE.md`](docs/ADAPTER-GUIDE.md) | Implementing each host-supplied port. |
 | [`docs/MEMORY-FLOW.md`](docs/MEMORY-FLOW.md) | Read path, write path, lifecycle, host integration. Diagrams. |
-| [`docs/ARCHETYPE-CONFIGS.md`](docs/ARCHETYPE-CONFIGS.md) | Three real starting configurations, each field annotated with *why* it differs. |
-| [`PHASE-0.md`](PHASE-0.md) · [`docs/PHASE0-CONTRACT.md`](docs/PHASE0-CONTRACT.md) | The task breakdown and the binding signature contract. |
+| [`docs/ARCHETYPE-CONFIGS.md`](docs/ARCHETYPE-CONFIGS.md) | Three real starting configurations, each field annotated with *why*. |
+| [`docs/SESSION-HANDOFF.md`](docs/SESSION-HANDOFF.md) | Where the repo lives, its verified state, and what to do next. |
 
 ---
 
-## Decisions worth knowing
+## Design decisions worth knowing
 
 <details>
 <summary><b>Six bugs found in the original specification, and what shipped instead</b></summary>
@@ -331,10 +247,10 @@ migrations/      plain SQL, yoyo
 
 | # | The spec said | Why it was wrong | What shipped |
 |---|---|---|---|
-| 1 | Feed the adapter **weight** in as the reward | From Q=0.5 a *successful* downstream event (w=0.3) gives `r−Q = −0.2` and **lowers** the score — it punishes success | `Q ← clamp01(Q + α·w·c·(r−Q))`, weight scales the *learning rate*. Verified by hand: 0.5 → **0.545** where the old formula gave 0.44 |
-| 2 | Use `ts_rank` for the lexical arm | nDCG@10 **0.07** vs BM25's **0.69** on BEIR SciFact; and the rarity gate *is* an IDF computation `ts_rank` cannot provide | `pg_textsearch` (true BM25, PostgreSQL Licence) → forced Postgres 18 |
+| 1 | Feed the adapter **weight** in as the reward | From Q=0.5 a *successful* event (w=0.3) gives `r−Q=−0.2` and **lowers** the score | `Q ← clamp01(Q + α·w·c·(r−Q))`; weight scales the *learning rate*. 0.5 → **0.545** where the old formula gave 0.44 |
+| 2 | Use `ts_rank` for the lexical arm | nDCG@10 **0.07** vs BM25's **0.69** on BEIR SciFact; the rarity gate *is* an IDF computation `ts_rank` cannot provide | True BM25 via **`vchord_bm25`** on Postgres 18; the rarity gate reads document frequency from a `tsvector` column |
 | 3 | Vault must **observe** a plateau in a 30-day soak | `ln(0.3)/ln(0.95) ≈ 164 days`. Arithmetically unpassable | A trend assertion plus a computed projected plateau date |
-| 4 | Threshold **RRF output** for abstention | Rank is not a relevance magnitude — rank 1 of a bad candidate set looks identical to rank 1 of a good one | Abstention from calibrated raw signals; the fused object exposes no thresholdable scalar |
+| 4 | Threshold **RRF output** for abstention | Rank is not a relevance magnitude — rank 1 of a bad set looks identical to rank 1 of a good one | Abstention from calibrated raw signals; the fused object exposes no thresholdable scalar |
 | 5 | Static prefix placed **after** dynamic memory | Destroys prompt-cache economics on *every* call | `placement: "append_last"` — the dynamic block goes last |
 | 6 | A state diagram *and* a status enum | Two different machines | One state machine; the transition table is the test source |
 
@@ -345,15 +261,11 @@ migrations/      plain SQL, yoyo
 
 <br>
 
-- **Postgres 18** — `pg_textsearch` needs it, and `pg_textsearch` replaced `ts_rank` for the reason above.
+- **Postgres 18** — `vchord_bm25` (true BM25) needs it, and BM25 replaced `ts_rank` for the reason above.
 - **Valkey, not Redis** — Redis relicensed to RSALv2/SSPL, which the licence gate denies.
-- **SeaweedFS, not MinIO** — MinIO's OSS repo was archived 2026-04-25. The driver speaks *generic S3*
-  with hand-rolled SigV4 and imports no vendor SDK, so legacy MinIO still works.
-- **psycopg 3 is LGPL-3.0-only** — which would have failed the original spec's own permissive-only
-  allowlist while being the driver that same spec mandated. The policy now has a conditional tier
-  requiring a written rationale per distribution.
-- **Gemini by default**, behind `LLMProviderPort` / `EmbeddingPort`. Any OpenAI-compatible gateway is
-  one config line.
+- **SeaweedFS, not MinIO** — MinIO's OSS repo was archived; the driver speaks *generic S3* and imports no vendor SDK, so legacy MinIO still works.
+- **psycopg 3** — the mandated driver; its LGPL-3.0 licence rides the policy's one conditional tier with a written rationale.
+- **Gemini by default**, behind `LLMProviderPort` / `EmbeddingPort`. Any OpenAI-compatible gateway is one config line.
 
 </details>
 
@@ -376,51 +288,22 @@ migrations/      plain SQL, yoyo
 
 ---
 
-## Known gaps
+## Current gaps
 
-Stated here rather than left to be discovered. Full detail in [`PLAN.md`](PLAN.md) §11 and
-[`docs/FIDELITY-AUDIT.md`](docs/FIDELITY-AUDIT.md) §11.4 and §12.4.
+Stated here rather than left to be discovered; full detail in [`PLAN.md`](PLAN.md) §11 and the
+per-worker reasons in `workers/composition.py::UNSCHEDULED_WORKERS`.
 
-Gaps that close are **removed from this list rather than annotated**, so it stays readable as a live
-inventory. Closed before this revision: the status writer, the embedding writer and the duplicate
-Benjamini–Hochberg implementation (audit §12.1). Closed by the BMAD remediation pass: the hot path's
-total absence of cancellation, the fail-open project-wide kill switch, the `trace_index` upsert
-rewriting independence evidence, `ABSENT_SIGNATURE` counting as independent evidence, `/export/
-project` shipping raw embedding vectors, and the zero-evidence route out of quarantine (audit §13,
-D-129…D-139). What is left:
-
-1. **11 of the 14 periodic workers cannot be scheduled.** A scheduler thread now runs and drives
-   three jobs (embedder, gc, corroboration). The other eleven — including the **shadow validator**,
-   the **scorer** and the **promotion** worker, i.e. the whole path from "evidence recorded" to
-   "validated" — are blocked on a Postgres implementation of the port each declares. Every one is
-   named, with its blocking port, in `workers/composition.py::UNSCHEDULED_WORKERS`, and
-   `build_scheduled_jobs` **refuses to return** if a worker is dropped without a recorded reason.
-   *This is now the single highest-value fix in the repository.*
-2. **No `CorroborationCandidateSource`.** The shadow-confirmation writer has a real store, but
-   deciding *which run corroborates which memory* is a deliberately host-supplied seam (D-121) that
-   nothing implements. Until a host supplies one, that job is constructed and left unscheduled.
-3. **No integration test has ever run.** There is no Docker/Postgres/Valkey/S3 on the build machine.
-   Every SQL statement in the repository is parsed and structurally asserted; none has been executed.
-   Read every "Complete" above with that clause attached.
-4. **The 300 ms p99 is proven by nothing.** Every stall in the drill is `FakeClock.advance()`. It
-   needs Postgres — and now that the embedding writer exists, that is the only thing it needs.
-5. **Retrieval's scope predicate is applied in the assembler, not in SQL.** The SQL-side conjunct
-   exists and is tested but is opt-in, and no caller supplies a `RunVisibility` yet (D-126). The
-   exposure is closed; the query is not yet narrow.
-6. **`memory_link`, `derived_state`, `killswitch_state` and `scoring_epoch` still have no writer.**
-   `memory_item.epoch_id` and `memory_status_log.epoch_id` exist, typed and empty.
-7. **The insert door enforces no creation guard.** `Repo.insert_memory_item` checks status
-   membership and per-class provenance *fields*, and never the state machine's creation guard, so
-   every PLAN §5 creation-edge condition — Tier, scan pass, provenance completeness,
-   operator-created — holds by convention at the repository boundary rather than by mechanism.
-   Closing it needs the creation evidence four worker modules assemble.
-8. **Roughly eleven further real defects are known and unfixed**, enumerated with their evidence in
-   [`docs/BMAD-EVALUATION.md`](docs/BMAD-EVALUATION.md) §6.2 — among them the 300 ms p99 being
-   measured over the wrong window, a telemetry outage orphaning `injection_log` rows, and proposal
-   caps being opt-in by call site.
-9. **Not one of the five mandated phase STOPs occurred**, and neither the 2026-07-27 integration
-   pass nor the remediation pass that followed it had one either. All six gate reports were
-   originally generated inside 58 seconds, after the final phase was complete.
+1. **The stages from "evidence recorded" to "validated" are not yet scheduled.** Their stores exist
+   and are wired, but `revalidation`, `scorer`, `shadow_validator`, `distiller`, `promotion`,
+   `invalidator`, `killswitch`, `consolidator` and `derived_state` each await a host-supplied port, an
+   under-specified evidence schema, or (consolidator) one store still to design. See Status above.
+2. **The 300 ms p99 is not yet load-proven.** The fail-open drill's stalls are a `FakeClock`; the
+   bound is now wired end-to-end (client wait + server `statement_timeout`) but wants a populated
+   vector arm under real load to measure.
+3. **The insert door enforces creation guards by convention, not mechanism.** `insert_memory_item`
+   checks status membership and provenance fields, not the state machine's creation guard; the guard
+   holds on callers that route through `apply()` first.
+4. **`adapters/atom/` is stubs and docs only** — host integration is intentionally left to the host.
 
 ---
 

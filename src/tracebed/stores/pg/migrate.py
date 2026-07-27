@@ -144,3 +144,47 @@ def current_revision(dsn: str) -> list[str]:
     backend = get_backend(_yoyo_dsn(dsn))
     migrations = read_all_migrations()
     return [m.id for m in backend.to_rollback(migrations)]
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """`python -m tracebed.stores.pg.migrate <apply|rollback|rollback-all|list>`.
+
+    A thin CLI over the functions above, so the documented runbook command is REAL rather than a
+    module import that silently does nothing (this module previously had no `__main__`, so
+    `python -m ... apply` imported and exited 0 without touching the database). The DSN comes from
+    `--dsn` or `$TB_STORAGE__PG_DSN` — the same variable the application and compose use — and
+    migrations run as the owner role, never the app role (`docker/initdb/01-roles.sql`).
+    """
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(
+        prog="python -m tracebed.stores.pg.migrate",
+        description="Apply, roll back, or list Tracebed's Postgres migrations.",
+    )
+    parser.add_argument("command", choices=("apply", "rollback", "rollback-all", "list"))
+    parser.add_argument(
+        "--dsn",
+        default=os.environ.get("TB_STORAGE__PG_DSN"),
+        help="Postgres DSN (default: $TB_STORAGE__PG_DSN)",
+    )
+    args = parser.parse_args(argv)
+    dsn: str | None = args.dsn
+    if not dsn:
+        parser.error("no DSN: pass --dsn or set TB_STORAGE__PG_DSN")
+
+    if args.command == "apply":
+        applied = apply_migrations(dsn)
+        print("applied: " + ", ".join(applied) if applied else "already current")
+    elif args.command == "rollback":
+        print("rolled back: " + ", ".join(rollback_migrations(dsn)))
+    elif args.command == "rollback-all":
+        print("rolled back: " + ", ".join(rollback_migrations(dsn, all=True)))
+    else:  # list
+        for migration_id in current_revision(dsn):
+            print(migration_id)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - console entry point
+    raise SystemExit(_main())
