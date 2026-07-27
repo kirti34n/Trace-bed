@@ -18,6 +18,58 @@ queries cannot drift apart on which rows they let through:
     lower-trust, cap 1/run)"); a Tier-B row that has merely reached `candidate` status by some
     future transition must not surface here.
 
+DEFENCE IN DEPTH (D-097 follow-up, D-126): `lexical_arm` can narrow its own SQL to the caller's
+scope, via `_SCOPE_PREDICATE` -- derived from `domain.visibility.ScopeType` by iterating every
+member through a `match`/`assert_never` block (mirroring `domain.visibility.scope_visible`'s own
+structure), so adding a `ScopeType` without a case here raises at IMPORT time, the same build-time
+failure `scope_visible` itself gets from mypy's exhaustiveness check on its `match`. D-097 closed
+the exposure in the ASSEMBLER (`hotpath.assembly`/`hotpath.jit` drop a row the caller may not see
+before it is ever placed), but the query itself was not narrow. A row is visible when
+`scope_type = project_shared`, or `scope_type` matches one of `agent_type`/`workflow_template`/
+`user` AND `scope_id` equals the caller's resolved reference for that scope. The unresolved
+references (`workflow_template_id`, `user_scope_id` -- see `domain.visibility`'s own fail-closed
+note) bind as SQL `NULL`, and `scope_id = NULL` is never `true` (NULL is not equal to anything,
+including itself), so an unresolved reference matches nothing without this module having to
+special-case it. The predicate is therefore the exact SQL-level mirror of `scope_visible`, and
+`tests/phase1/test_scope_sql_predicate.py` proves that by EVALUATING the generated predicate text
+against a row and comparing to `scope_visible` on an exhaustive case matrix, rather than by
+asserting substrings that a swapped bind parameter would still satisfy.
+
+`visibility` IS OPT-IN, AND THAT IS DELIBERATE -- read this before "hardening" it. A
+`RunVisibility` always carries a mandatory, server-derived `agent_type_id`, so `None` cannot mean
+"I have a visibility but it is empty"; it means "the caller does not know the run's identity at
+all". Applying the predicate anyway in that case would bind every resolver to `NULL` and narrow
+the arm to `project_shared` rows only -- which sounds conservative and is in fact a total
+retrieval outage on today's corpus: `workers/extractors/base.py` and `workers/distiller.py` both
+create memories with `scope_type=ScopeType.AGENT_TYPE` hard-coded, so essentially every retrievable
+row in a deployed Tracebed is agent-type scoped and NONE of them would match. Those rows are
+memories the caller is entitled to see -- `scope_visible` returns `True` for them, and the
+assembler places them today -- so a fail-closed default would drop rows the assembler would keep,
+which is not "a missed candidate rather than a leak", it is the memory system returning nothing.
+When no `visibility` is supplied, `lexical_arm` therefore issues the same statement it shipped
+before D-126, with D-097's assembler filter remaining the control; the SQL becomes a second,
+independent control the moment a caller supplies the visibility it already holds.
+
+CONTRACT GAP (reported, not deviated on), two links of one chain:
+
+  1. `hotpath.retriever.Retriever.retrieve()` -- outside this chunk's file list -- takes only
+     `(project_id, query_text, cfg)`; it has no `RunVisibility` to pass. Its own caller
+     (`hotpath.pipeline`, also outside the list) does hold a `ProjectScope` carrying
+     `agent_type_id`, which is all a `RunVisibility` needs. Until `retrieve()` grows that
+     parameter and forwards it, the SQL-side control is inert in production and D-097's assembler
+     filter is doing the work alone -- exactly today's audited state, no better and no worse.
+  2. `vector_arm` does NOT grow a `visibility` keyword at all:
+     `tests/phase4/test_vector_drivers.py::test_every_driver_ann_search_signature_matches_search_store_vector_arm`
+     asserts `inspect.signature(SearchStore.vector_arm) == inspect.signature(PgVectorStore
+     .ann_search) == inspect.signature(QdrantVectorStore.ann_search) ==
+     inspect.signature(VectorStorePort.ann_search)`, and `stores/vector/base.py` /
+     `stores/vector/pgvector.py` are outside this chunk's file list (hard rule 8). Widening
+     `vector_arm` alone would break that port-parity baseline. Stashing a per-run visibility on the
+     `SearchStore` INSTANCE to route around the signature is not an option either: one
+     `SearchStore` is shared by every concurrent request in the process, so a per-request field on
+     it is a cross-tenant race, not a workaround. The ANN arm therefore keeps the assembler as its
+     only scope control until all four signatures grow the parameter in lockstep.
+
 `pinned` is a member of `state_machine.RETRIEVABLE_STATUSES` but is deliberately excluded from
 every query in this module. PLAN.md §5's retrievable-statuses line parenthesises it
 "(prefix only)", `domain.state_machine.RETRIEVABLE_STATUSES`'s own comment says "pinned:
@@ -67,7 +119,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final
+from typing import Final, assert_never
 from uuid import UUID
 
 from psycopg.rows import DictRow, dict_row
@@ -77,6 +129,7 @@ from tracebed.domain.enums import MemType, ScopeType, TrustTier
 from tracebed.domain.errors import TracebedError
 from tracebed.domain.ids import MemoryId, ProjectId
 from tracebed.domain.state_machine import Status
+from tracebed.domain.visibility import RunVisibility
 from tracebed.stores.pg.pool import scoped
 
 __all__ = [
@@ -133,13 +186,103 @@ def _retrievable_predicate(column_prefix: str = "") -> str:
 _RETRIEVABLE_PREDICATE: Final[str] = _retrievable_predicate()
 _RETRIEVABLE_PREDICATE_M: Final[str] = _retrievable_predicate("m.")
 
+
+def _scope_fragment(scope_type: ScopeType, column_prefix: str) -> str:
+    """One `OR`-branch of `_SCOPE_PREDICATE` for `scope_type`, textually mirroring
+    `domain.visibility.scope_visible`'s own `match` over `ScopeType` case for case (module
+    docstring's DEFENCE IN DEPTH section) — a project_shared row always matches; every other
+    scope type matches only when `scope_id` equals the caller's resolved reference for that
+    scope, bound as `%(visible_agent_type_id)s` / `%(visible_workflow_template_id)s` /
+    `%(visible_user_scope_id)s` (`_scope_predicate_params` below). Exhaustive via `assert_never`
+    on the same enum `scope_visible` matches over, so a new `ScopeType` member reaches this
+    function (see `_SCOPE_PREDICATE`, built by iterating every member at import time) and
+    raises before either module can silently disagree about it.
+    """
+    match scope_type:
+        case ScopeType.PROJECT_SHARED:
+            return f"{column_prefix}scope_type = %(scope_project_shared)s"
+        case ScopeType.AGENT_TYPE:
+            return (
+                f"({column_prefix}scope_type = %(scope_agent_type)s "
+                f"AND {column_prefix}scope_id = %(visible_agent_type_id)s)"
+            )
+        case ScopeType.WORKFLOW_TEMPLATE:
+            return (
+                f"({column_prefix}scope_type = %(scope_workflow_template)s "
+                f"AND {column_prefix}scope_id = %(visible_workflow_template_id)s)"
+            )
+        case ScopeType.USER:
+            return (
+                f"({column_prefix}scope_type = %(scope_user)s "
+                f"AND {column_prefix}scope_id = %(visible_user_scope_id)s)"
+            )
+        case _:  # pragma: no cover - exhaustiveness is a mypy error, not a runtime path
+            assert_never(scope_type)
+
+
+def _scope_predicate(column_prefix: str = "") -> str:
+    """The full scope-visibility disjunction, one `_scope_fragment` per `ScopeType` member,
+    OR-ed together and parenthesised so it composes safely with the `AND`s around it. Iterating
+    `ScopeType` itself (not a hand-written list of four cases) is what makes "derive the SQL
+    predicate FROM the same enum" true rather than aspirational: this call already touches
+    every member that exists the moment the module imports, so `_scope_fragment`'s
+    `assert_never` branch is live at import time, not only if some call path happens to reach a
+    new member later.
+    """
+    return "(" + " OR ".join(_scope_fragment(st, column_prefix) for st in ScopeType) + ")"
+
+
+_SCOPE_PREDICATE: Final[str] = _scope_predicate()
+
+
+def _scope_predicate_params(visibility: RunVisibility) -> dict[str, object]:
+    """Bind values for `_SCOPE_PREDICATE`. The four `scope_*` constants are always the same
+    `ScopeType` values; the three `visible_*` values are this run's resolved references.
+
+    Takes a `RunVisibility`, never `None`: a caller with no visibility does not issue the scoped
+    statement at all (module docstring's opt-in note), so there is no "absent visibility" case for
+    this function to encode. An UNRESOLVED reference is a different thing and is still handled --
+    `workflow_template_id`/`user_scope_id` are `None` until a resolver exists, they bind as SQL
+    `NULL`, and `scope_id = NULL` is never `true`, which is precisely the `is not None` guard
+    `domain.visibility.scope_visible` applies in Python.
+    """
+    return {
+        "scope_project_shared": ScopeType.PROJECT_SHARED.value,
+        "scope_agent_type": ScopeType.AGENT_TYPE.value,
+        "scope_workflow_template": ScopeType.WORKFLOW_TEMPLATE.value,
+        "scope_user": ScopeType.USER.value,
+        "visible_agent_type_id": visibility.agent_type_id.value,
+        "visible_workflow_template_id": visibility.workflow_template_id,
+        "visible_user_scope_id": visibility.user_scope_id,
+    }
+
+
+def _with_scope(template: str) -> str:
+    """Substitute the real scope disjunction into `@SCOPE@`."""
+    return template.replace("@SCOPE@", _SCOPE_PREDICATE)
+
+
+def _without_scope(template: str) -> str:
+    """Drop the `@SCOPE@` conjunct's whole line, yielding the statement this module shipped
+    before D-126.
+
+    Line-wise removal rather than substituting a literal `TRUE`: an always-true conjunct compiles
+    to the same plan but reads, in a log or an `EXPLAIN`, as a scope control that is present and
+    passing. It is neither. The two statements are generated from ONE template so they cannot
+    drift apart on the `project_id` or retrievability predicates -- the only permitted difference
+    between them is this line, and `tests/phase1/test_scope_sql_predicate.py` asserts exactly that
+    by reconstructing each from the other.
+    """
+    return "\n".join(line for line in template.splitlines() if "@SCOPE@" not in line)
+
+
 # Every statement below is a plain (non-f) triple-quoted template with a `@RETRIEVABLE@` /
-# `@RETRIEVABLE_M@` placeholder, substituted via `.replace()` — the exact technique
+# `@RETRIEVABLE_M@` / `@SCOPE@` placeholder, substituted via `.replace()` — the exact technique
 # `stores.pg.repo._TRACE_INDEX_UPSERT_SQL` already uses for the same reason: an f-string (or
 # `.format()`/`%`) assembling a SQL string trips `ruff`'s S608 (possible SQL injection via
 # string-based query construction) even when, as here, every substituted value is a fixed
 # module-level constant, never caller data. `.replace()` on a plain string is not a construction
-# pattern that rule flags, and the import-time guard below (mirroring repo.py's own) proves the
+# pattern that rule flags, and the import-time guards below (mirroring repo.py's own) prove the
 # substitution actually happened rather than silently leaving the placeholder token in the SQL
 # psycopg executes.
 _LEXICAL_ARM_TEMPLATE: Final[str] = """
@@ -148,10 +291,16 @@ FROM memory_item
 WHERE project_id = %(project_id)s
   AND content @@@ %(query)s
   AND @RETRIEVABLE@
+  AND @SCOPE@
 ORDER BY raw_score DESC
 LIMIT %(top_n)s
 """.strip()
-_LEXICAL_ARM_SQL: Final[str] = _LEXICAL_ARM_TEMPLATE.replace("@RETRIEVABLE@", _RETRIEVABLE_PREDICATE)
+_LEXICAL_ARM_SQL: Final[str] = _without_scope(_LEXICAL_ARM_TEMPLATE).replace(
+    "@RETRIEVABLE@", _RETRIEVABLE_PREDICATE
+)
+_LEXICAL_ARM_SCOPED_SQL: Final[str] = _with_scope(_LEXICAL_ARM_TEMPLATE).replace(
+    "@RETRIEVABLE@", _RETRIEVABLE_PREDICATE
+)
 
 # `hnsw.iterative_scan` / `hnsw.max_scan_tuples` are pgvector session GUCs (filtered-ANN recall
 # vs latency, PLAN.md §6). Same `set_config(..., true)` idiom as `stores.pg.pool.scoped`'s own RLS
@@ -162,6 +311,11 @@ _HNSW_MAX_SCAN_TUPLES_GUC_SQL: Final[str] = (
     "SELECT set_config('hnsw.max_scan_tuples', %(max_tuples)s, true)"
 )
 
+# No `@SCOPE@` conjunct: `vector_arm` cannot accept a `RunVisibility` without breaking the
+# four-way signature parity `tests/phase4/test_vector_drivers.py` pins (module docstring, contract
+# gap 2), and a scoped statement with nothing to bind into it would narrow the ANN arm to
+# `project_shared` rows only -- an outage, not a control, on a corpus that is almost entirely
+# agent-type scoped.
 _VECTOR_ARM_TEMPLATE: Final[str] = """
 SELECT id, trust_tier, status, 1 - (embedding <=> %(embedding)s::halfvec) AS raw_score
 FROM memory_item
@@ -171,7 +325,9 @@ WHERE project_id = %(project_id)s
 ORDER BY embedding <=> %(embedding)s::halfvec
 LIMIT %(top_n)s
 """.strip()
-_VECTOR_ARM_SQL: Final[str] = _VECTOR_ARM_TEMPLATE.replace("@RETRIEVABLE@", _RETRIEVABLE_PREDICATE)
+_VECTOR_ARM_SQL: Final[str] = _VECTOR_ARM_TEMPLATE.replace(
+    "@RETRIEVABLE@", _RETRIEVABLE_PREDICATE
+)
 
 _DOCUMENT_FREQUENCY_TEMPLATE: Final[str] = """
 SELECT t.term AS term, COUNT(m.id) AS df
@@ -206,16 +362,31 @@ WHERE project_id = %(project_id)s
 """.strip()
 _CORPUS_SIZE_SQL: Final[str] = _CORPUS_SIZE_TEMPLATE.replace("@RETRIEVABLE@", _RETRIEVABLE_PREDICATE)
 
-if "@RETRIEVABLE" in (
-    _LEXICAL_ARM_SQL
-    + _VECTOR_ARM_SQL
-    + _DOCUMENT_FREQUENCY_SQL
-    + _CORPUS_SIZE_SQL
-    + _FETCH_CANDIDATES_SQL
-):  # pragma: no cover - import-time structural guard
+_ALL_STATEMENTS: Final[tuple[str, ...]] = (
+    _LEXICAL_ARM_SQL,
+    _LEXICAL_ARM_SCOPED_SQL,
+    _VECTOR_ARM_SQL,
+    _DOCUMENT_FREQUENCY_SQL,
+    _CORPUS_SIZE_SQL,
+    _FETCH_CANDIDATES_SQL,
+)
+
+if any("@RETRIEVABLE" in sql for sql in _ALL_STATEMENTS):  # pragma: no cover - import-time guard
     raise RuntimeError(
         "a retrievability-predicate template has an unsubstituted placeholder; a query would "
         "compare against a literal token instead of the real predicate"
+    )
+
+if any("@SCOPE@" in sql for sql in _ALL_STATEMENTS):  # pragma: no cover - import-time guard
+    raise RuntimeError(
+        "a scope-predicate template has an unsubstituted @SCOPE@ placeholder; a query would "
+        "compare against a literal token instead of the real scope-visibility predicate"
+    )
+
+if _SCOPE_PREDICATE not in _LEXICAL_ARM_SCOPED_SQL:  # pragma: no cover - import-time guard
+    raise RuntimeError(
+        "the scoped lexical statement lost its scope conjunct; it would be indistinguishable "
+        "from the unscoped one while its caller believes a visibility was applied"
     )
 
 
@@ -383,7 +554,14 @@ class SearchStore:
     def __init__(self, pool: ConnectionPool) -> None:
         self._pool = pool
 
-    def lexical_arm(self, project_id: ProjectId, query: str, top_n: int) -> list[ArmHit]:
+    def lexical_arm(
+        self,
+        project_id: ProjectId,
+        query: str,
+        top_n: int,
+        *,
+        visibility: RunVisibility | None = None,
+    ) -> list[ArmHit]:
         """True BM25 via `pg_textsearch` (D-003) — never `ts_rank`, which the audit measured at
         nDCG@10 0.07 on BEIR SciFact against BM25's 0.69, and which exposes no IDF for the
         rarity gate (`document_frequency` below) to read.
@@ -391,19 +569,31 @@ class SearchStore:
         An empty/whitespace-only query or a non-positive `top_n` returns `[]` without issuing a
         statement — `content @@@ ''` is not a query pg_textsearch's match operator can score, and
         "return nothing" is the correct, cheaper answer to "asked for nothing."
+
+        `visibility`, when supplied, narrows the SQL itself to exactly the rows
+        `domain.visibility.scope_visible` would accept for that run (module docstring's DEFENCE IN
+        DEPTH section). `None` — the default, and every call this codebase makes today; see that
+        section's CONTRACT GAP — issues the pre-D-126 statement unchanged, leaving D-097's
+        assembler filter as the sole scope control rather than narrowing to `project_shared` rows
+        only, which on a corpus whose memories are almost all agent-type scoped would return
+        nothing at all. The two statements are generated from one template and differ by exactly
+        the scope conjunct.
         """
         if not query.strip() or top_n <= 0:
             return []
+        params: dict[str, object] = {
+            "project_id": project_id,
+            "query": query,
+            "top_n": _bounded_top_n(top_n),
+            **_retrievability_params(),
+        }
+        if visibility is None:
+            sql = _LEXICAL_ARM_SQL
+        else:
+            sql = _LEXICAL_ARM_SCOPED_SQL
+            params.update(_scope_predicate_params(visibility))
         with scoped(self._pool, project_id) as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                _LEXICAL_ARM_SQL,
-                {
-                    "project_id": project_id,
-                    "query": query,
-                    "top_n": _bounded_top_n(top_n),
-                    **_retrievability_params(),
-                },
-            )
+            cur.execute(sql, params)
             rows = cur.fetchall()
         return [_row_to_arm_hit(r) for r in rows]
 
@@ -427,6 +617,15 @@ class SearchStore:
 
         A non-positive `top_n` or an empty `embedding` returns `[]` without issuing a statement,
         matching `lexical_arm`'s "asked for nothing" behaviour.
+
+        NOT narrowed by `_SCOPE_PREDICATE`, unlike `lexical_arm` — this method's signature is
+        pinned to `VectorStorePort.ann_search` / `PgVectorStore.ann_search` /
+        `QdrantVectorStore.ann_search` by `tests/phase4/test_vector_drivers.py`, none of which are
+        this chunk's to edit (hard rule 8), so it cannot accept a caller-supplied `RunVisibility`.
+        The alternative — applying the predicate with nothing bound into it — would silently drop
+        every agent-type-scoped row, which is most of the corpus. `hotpath.assembly`'s
+        `scope_visible` filter (D-097) is this arm's scope control until all four signatures grow
+        the parameter together; module docstring, contract gap 2.
         """
         if top_n <= 0 or not embedding:
             return []

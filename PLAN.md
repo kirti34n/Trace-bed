@@ -546,24 +546,41 @@ six open items and omitted the four largest gaps in the tree. Everything below i
 promise this repository has not kept or surface area nobody asked for. Sizes are engineer-days
 for someone who knows this codebase. Nothing here is scheduled; the user decides.
 
-### 11.1 The learning plane — one absence with many faces
+### 11.1 The learning plane — the absence, and what closed on 2026-07-27
 
-**Nothing in `src/` can change a memory's status, score, or strike count.** There is no
-`UPDATE memory_item` statement anywhere (`workers/edit_ops.py` says so outright). The state
-machine, Q updates, decay, strikes, promotion, retirement, archiving, pinning and crypto-shred
-tombstoning are all *computed correctly* and *unsavable*. A deployed Tracebed today ingests
-traces and outcome events faithfully and learns nothing from either.
+**Updated after the integration pass recorded in `docs/FIDELITY-AUDIT.md` §12 and D-128.**
+Rows that are now closed have been REMOVED from the table below rather than annotated, so this
+list stays readable as a live inventory instead of an archive; what closed each one is recorded
+immediately below, once, and in the audit's §12.1 in full.
+
+**Closed by the integration pass (2026-07-27):**
+
+* **M1 — the status write path.** `stores.pg.lifecycle.LifecycleWriter` is the one
+  `UPDATE memory_item SET status`, and it is now REACHED: `MemoryEditRepo`/`ForensicsRepo`
+  (same module) are the first production implementations of the two Protocols whose only
+  implementations were three test fakes, and both delegate `persist_status` to it. Every write
+  also appends a `memory_status_log` row in the same transaction.
+* **M6 — the shadow-confirmation producer.** `stores.pg.learning.CorroborationRepo` gives
+  `CorroborationWriter` a real store. *Caveat, and it is why the job is not scheduled by
+  default:* deciding WHICH run corroborates WHICH memory is a declared host seam (D-121) with
+  no implementation anywhere.
+* **M8 — the embedding write.** `stores.pg.learning.EmbeddingRepo` implements the select/write
+  pair; the sweep runs on `workers.embedding_interval_minutes`. The ANN arm can hold data.
+* **The cadence contract gap** that `scheduler.py`, `runner.py` and `registry.py` each recorded
+  identically — `domain.config.WorkersConfig` now carries every interval.
+* **Two Benjamini-Hochberg implementations** (D-095's residue, D-126's contract gap) —
+  `workers/killswitch.py` imports the exact one and defines none.
+
+**Still open:**
 
 | # | Gap | Evidence | Size |
 |---|---|---|---|
-| M1 | No status/score write path | no `UPDATE memory_item` in `src/`; `persist_status`'s only implementations are three test fakes | 3–5 d |
-| M2 | No running worker plane | `workers/runner.py` constructs `WorkerRunner(handlers={})`; its docstring lists extractors, distiller, scorer, shadow validator, consolidator, invalidator, prefix builder, kill switch, sweeps, gc and scheduler as deliberately not constructed | 5–8 d (after M1/M3) |
-| M3 | No Postgres implementation for ten worker ports | `MemoryLifecycleRepoPort`, `ScorerRepoPort`, `ShadowValidatorRepoPort`, `PromotionRepoPort`, `KillswitchStorePort`, `DerivedStateStorePort`, `ForensicsRepoPort`, `MemoryEditRepoPort`, `ReviewQueueRepoPort`, `EpochStorePort` — each declared only in the worker that consumes it | 5–8 d |
-| M4 | Four §5 tables have no writer | `memory_link`, `derived_state`, `killswitch_state`, `scoring_epoch` (plus `agent_type_config`) are created, partitioned and RLS-protected and never written | inside M3 |
+| M2 | **Half-closed.** A periodic plane now exists — `workers/composition.py` + a `Scheduler` thread in `runner.run()` — but only **3 of 13** periodic workers are schedulable (`embedder`, `gc`, and `corroboration` given a host-supplied candidate source). The other ten are refused BY NAME with the port each is blocked on in `composition.UNSCHEDULED_WORKERS`, and `build_scheduled_jobs` raises rather than returning a shorter list | `workers/composition.py::UNSCHEDULED_WORKERS`; `harness/closed_loop.py` prints it beside its verdict | 3–5 d, and it is entirely M3 |
+| M3 | **4 of 10 closed.** `EmbeddingRepoPort`, `CorroborationRepoPort`, `MemoryEditRepoPort`, `ForensicsRepoPort` now have Postgres implementations. Still declared only in the worker that consumes them: `MemoryLifecycleRepoPort`, `ScorerRepoPort`, `ShadowValidatorRepoPort`, `PromotionRepoPort`, `KillswitchStorePort`, `DerivedStateStorePort`, `EpochStorePort` | `stores/pg/learning.py`, `stores/pg/lifecycle.py` for the four; the rest are still worker-local Protocols | 4–6 d |
+| M4 | Four §5 tables have no writer | `memory_link`, `derived_state`, `killswitch_state`, `scoring_epoch` (plus `agent_type_config`) are created, partitioned and RLS-protected and never written. `memory_item.epoch_id` and `memory_status_log.epoch_id` now exist, typed and empty — the column is there, the writer is not | inside M3 |
 | M5 | Static prefix is never delivered | `hotpath/pipeline.py` never consults it on the happy path, `api/main.py` passes no `static_prefix=`, and no class implements `StaticPrefixPort` — so the `timeout_prefix_only` rung returns an empty block and pinned preferences are unreachable | 1–2 d |
-| M6 | No shadow-confirmation producer | nothing appends `shadow_confirm_runs`, the only non-human exit from quarantine | inside M3 |
+| M6b | No `CorroborationCandidateSource` | the writer exists and is constructed; nothing decides which run corroborates which memory (D-121, a declared host seam). Until a host supplies one the corroboration job is built and left unscheduled | 1–2 d, or a host decision |
 | M7 | No credit assignment | no query joins `outcome_event` → `trace_index` → `injection_log` → `memory_item`; `run_scorer_batch` has no production caller | 2–3 d |
-| M8 | No embedding write, so the ANN arm is dead | `insert_memory_item` writes no `embedding`/`embedding_model_id`/`embedding_model_version`/`lexemes`; `PgVectorStore.upsert` raises. "Hybrid retrieval" degenerates permanently to the lexical arm, and `adapters/embedding/pinning.assert_pin_matches` has zero production call sites because there is nothing to pin | 2–3 d |
 | M9 | No episodic memory | the enum value is occupied by Tier A operational notes, which then render under the EXEMPLARS label; the distiller refuses episodic outright | 3–5 d |
 | M10 | No contradiction detection | `workers/consolidator.py` explicitly refuses semantic comparison; `open_contradiction` is a caller-supplied field, so "never last-write-wins" rests on the caller | 3–5 d |
 | M11 | No session-scoped or paused-workflow working memory (the "lifetime knob") | Valkey keys are run-scoped; `session_id` reaches no store. This is also the one thing ReMe actually did — see `docs/ADAPTER-GUIDE.md`'s ReMe parity section | 2–3 d |
@@ -620,3 +637,16 @@ The five phase STOPs did not happen: all six gate reports were generated inside 
 Phase 4 was complete, and no approval record exists in any form (D-111). Everything from roughly
 D-038 onward was decided without the review that was supposed to gate it. **The worker plane
 (M1–M4) should be its own phase with a real STOP before it starts.**
+
+**Updated 2026-07-27.** That STOP did not happen either. The integration pass recorded in
+`docs/FIDELITY-AUDIT.md` §12 built the composition root, four store implementations and the
+closed-loop drill without one. What it did NOT do is close M3's remaining six ports, which is
+the larger half of the same phase — so the STOP is still available, and it is now in front of a
+smaller and much better-specified piece of work than it was: `composition.UNSCHEDULED_WORKERS`
+names every remaining worker and the exact port that blocks it, and `harness/closed_loop.py`
+already exercises each of those workers' logic against an in-memory implementation of the port
+that has to be written.
+
+**One measurement nobody has taken.** Not a single `@pytest.mark.integration` test in this
+repository has ever executed. Every SQL statement in `stores/pg/` — including the eight added by
+the integration pass — has been parsed, structurally asserted, and never run against Postgres.

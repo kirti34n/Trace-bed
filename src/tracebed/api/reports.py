@@ -77,10 +77,24 @@ from tracebed.workers.lift import (
     directional_p_value,
     stratify,
 )
+from tracebed.workers.statistics import bh_adjusted_p_values
 
 __all__ = ["router"]
 
 router = APIRouter()
+
+# D-118 / D-126: this module used to define its own Benjamini-Hochberg step-up implementation
+# (`_bh_adjusted_p_values`) alongside `workers.killswitch.benjamini_hochberg` -- the exact "two
+# authors of one governing number" defect D-118 and D-093 both name, and the two did not in fact
+# agree (see `workers.statistics`'s module docstring for the worked disagreements). The one
+# implementation now lives in `workers.statistics`, imported above. This name is kept, bound to the
+# SAME function object rather than to a wrapper, purely so `_bh_adjusted_p_values` stays importable
+# under its old private name for existing callers (`tests/phase4/test_report_routes.py
+# ::TestBhAdjustedPValues`, outside this chunk's file list) --
+# `tests/phase3/test_bh_single_authority.py` asserts this `is` `workers.statistics
+# .bh_adjusted_p_values`, so reintroducing a second definition here fails that test rather than
+# silently shipping a second author again.
+_bh_adjusted_p_values = bh_adjusted_p_values
 
 # Same ceiling as `api.admin._MAX_LIST_LIMIT` / `stores.pg.reports.MAX_REPORT_LIMIT` -- repeated
 # locally (not imported from `api.admin`, a sibling route module this chunk does not own) for
@@ -154,28 +168,6 @@ def _reports_store(request: Request) -> ReportsPort:
     if store is None:
         raise ConfigError("no reports reader is configured on this deployment")
     return store  # type: ignore[no-any-return]
-
-
-def _bh_adjusted_p_values(p_values: Sequence[float]) -> list[float]:
-    """Standard Benjamini-Hochberg adjusted ("q-value") p-values: for the ascending-sorted
-    ranks, `adjusted[(k)] = min(adjusted[(k+1)], p[(k)] * m / k)`, walked from the largest rank
-    down so the result is monotone non-decreasing in rank (this is the standard step-up
-    adjustment, not `workers.killswitch.benjamini_hochberg`'s reject/accept boolean at one fixed
-    alpha -- a report wants the numeric value itself so a dashboard can show it, and a caller
-    can still recover "reject at alpha" as `bh_adjusted_p <= alpha`).
-    """
-    m = len(p_values)
-    if m == 0:
-        return []
-    order = sorted(range(m), key=lambda i: p_values[i])
-    adjusted = [0.0] * m
-    running_min = 1.0
-    for rank in range(m, 0, -1):
-        idx = order[rank - 1]
-        candidate = min(1.0, p_values[idx] * m / rank)
-        running_min = min(running_min, candidate)
-        adjusted[idx] = running_min
-    return adjusted
 
 
 @router.get("/admin/lift/report", response_model=LiftReportOut)
@@ -282,7 +274,7 @@ def get_lift_report(
     # But an adjusted p is only meaningful next to the estimate it adjusts, and an insufficient
     # cell's estimate is refused, so its adjusted p is withheld too: showing "p=0.03" beside
     # "insufficient data" invites exactly the reading the refusal exists to prevent.
-    bh_adjusted = _bh_adjusted_p_values(directional_ps)
+    bh_adjusted = bh_adjusted_p_values(directional_ps)
     cells = [
         cell.model_copy(update={"bh_adjusted_p": None if cell.insufficient else bh})
         for cell, bh in zip(cells, bh_adjusted, strict=True)

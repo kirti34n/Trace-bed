@@ -190,6 +190,52 @@ _KIND_PATTERN: Final = re.compile(KIND_RE)
 # only, scan()'s own ceiling is what rejects an oversized `content` field once parsing succeeds.
 _MAX_RAW_RESPONSE_CHARS: Final = 20_000
 
+# Deeper than any legitimate distillation response (they are flat objects with a
+# handful of scalar fields) and far below the depth at which any interpreter's
+# JSON scanner gets into trouble.
+_MAX_JSON_DEPTH: Final = 64
+
+
+def _exceeds_json_depth(raw: str, limit: int = _MAX_JSON_DEPTH) -> bool:
+    """True when `raw` nests brackets deeper than `limit`, checked WITHOUT parsing.
+
+    Relying on `json.loads` to raise `RecursionError` made the depth defence
+    platform-dependent: on CPython/Windows `"[" * 9000` raises `RecursionError`,
+    while on CPython/Linux the same input produces a `JSONDecodeError` from the C
+    scanner instead. The rejection reason therefore differed by operating system,
+    and the test that pinned it passed locally and failed in CI.
+
+    A guard that depends on how much C stack the host happens to have is not a
+    guard. This counts nesting in one pass over the string before any parse
+    begins, so the same input yields the same verdict everywhere — and it rejects
+    a hostile response without spending the recursion at all. The `RecursionError`
+    clause at the parse site stays as a backstop for anything this misses.
+
+    String contents are skipped: a bracket inside a JSON string literal is data,
+    and counting it would reject legitimate content that merely mentions one.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for ch in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif ch in "]}":
+            depth -= 1
+    return False
+
 # How much of an out-of-vocabulary value may be quoted back in a rejection reason. The reason
 # string reaches `DistillationOutcome.reason` and operator-facing logs; echoing an unbounded
 # attacker-chosen string into either is a second, quieter version of the `kind` channel above.
@@ -440,6 +486,12 @@ def _parse_response(raw: str) -> tuple[MemType, str, str] | str:
     """
     if len(raw) > _MAX_RAW_RESPONSE_CHARS:
         return f"llm_response_exceeds_{_MAX_RAW_RESPONSE_CHARS}_chars"
+
+    # Checked BEFORE the parse and without recursing, so the verdict is identical on
+    # every platform. See `_exceeds_json_depth` for why the RecursionError clause
+    # below could not carry this on its own.
+    if _exceeds_json_depth(raw):
+        return "llm_response_nested_too_deeply"
 
     try:
         parsed: Any = json.loads(raw)

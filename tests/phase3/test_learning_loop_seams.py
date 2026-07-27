@@ -604,16 +604,34 @@ class TestUntrustedJsonCannotUnwindAWorker:
         assert handled, f"{module} parses a provider response without catching RecursionError"
 
     def test_the_hazard_is_real_and_not_theoretical(self) -> None:
-        """Guard the guard: if `json.loads` ever stopped raising
-        `RecursionError` on deep nesting, the three clauses above would be
-        dead code and this file would be asserting a rule that protects
-        nothing.
+        """Guard the guard: deeply nested untrusted JSON must not be parseable.
+
+        This asserted `pytest.raises(RecursionError)` on `json.loads("[" * 9000)`
+        until CI showed the exception TYPE is platform-dependent: CPython/Windows
+        raises `RecursionError`, CPython/Linux returns a `JSONDecodeError` from the
+        C scanner for the same input. The test passed locally and failed in CI, and
+        the production code it guards had the same platform split — which is why
+        `distiller._exceeds_json_depth` now rejects by counting nesting before the
+        parse rather than by letting the interpreter run out of stack.
+
+        What matters is the property, not which exception carries it: the input is
+        rejected, and it is not rejected as a plain `ValueError` that a bare
+        `except ValueError` would have quietly absorbed.
         """
         import json
 
-        with pytest.raises(RecursionError):
+        with pytest.raises(Exception) as caught:
             json.loads("[" * 9000)
+        assert isinstance(caught.value, RecursionError | json.JSONDecodeError), (
+            f"deep nesting produced {type(caught.value).__name__}, which neither clause handles"
+        )
         assert not issubclass(RecursionError, ValueError)
+
+        # The real guarantee, and it is platform-independent by construction.
+        from tracebed.workers.distiller import _exceeds_json_depth
+
+        assert _exceeds_json_depth("[" * 9000) is True
+        assert _exceeds_json_depth('{"content": "a [bracket] in a string"}') is False
 
 
 # --------------------------------------------------------------------------- #

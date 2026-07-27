@@ -29,18 +29,39 @@ than any badge above.
 > state machine matches the plan row for row. The project wall is a type-level constraint. Provenance
 > rejection fires before the INSERT is built.
 >
-> **But the learning half is a library, not a service.** There is no `UPDATE memory_item` statement
-> anywhere in `src/`. The worker process starts with `handlers={}`. Nothing writes an embedding, so
-> the ANN arm of "hybrid retrieval" can never have data. Nothing appends `shadow_confirm_runs` — the
-> only non-human route out of quarantine.
+> **The learning half was a library, not a service.** There was no `UPDATE memory_item` statement
+> anywhere in `src/`. The worker process started with `handlers={}`. Nothing wrote an embedding, so
+> the ANN arm of "hybrid retrieval" could never have data. Nothing appended `shadow_confirm_runs` —
+> the only non-human route out of quarantine.
 >
-> **A Tracebed deployed today ingests traces and outcome events faithfully, and learns nothing from
-> either.**
+> **A Tracebed deployed today ingested traces and outcome events faithfully, and learned nothing
+> from either.**
 
 That paragraph is from [`docs/FIDELITY-AUDIT.md`](docs/FIDELITY-AUDIT.md) — a 472-item audit of the
 built system against its own specification. It found **325 matches, 25 logged deviations, 49 silent
-deviations and 23 missing items**. Everything below is written on the assumption you would rather
-know that on line 30 than discover it on day three.
+deviations and 23 missing items**.
+
+**It is written in the past tense because an integration pass on 2026-07-27 closed part of it
+([audit §12](docs/FIDELITY-AUDIT.md), D-128) — and only part.** Here is the whole of the current
+answer, in three sentences:
+
+> A status change now reaches a column, an embedding now reaches a row, and a shadow confirmation
+> now reaches an array — each through exactly one statement, each with a real Postgres
+> implementation of the port its worker declared, and the worker process now runs a scheduler
+> thread that drives them.
+>
+> **But 10 of the 13 periodic workers still cannot be scheduled**, because the store port each one
+> takes has no Postgres implementation: the *shadow validator*, the *scorer* and the *promotion*
+> worker among them — which are precisely the three stages between "evidence recorded" and
+> "validated memory".
+>
+> So a deployed Tracebed today **records the evidence a memory needs to graduate, and cannot yet
+> graduate it.** `python harness/closed_loop.py` walks all nine hops end to end and passes — offline,
+> against in-memory implementations of the missing ports — and prints the ten unscheduled workers
+> beside its own verdict so that PASS cannot be mistaken for "the learning plane is live".
+
+Everything below is written on the assumption you would rather know that on line 30 than discover it
+on day three.
 
 <details>
 <summary><b>What is actually finished, and what is not</b> — click to expand</summary>
@@ -55,17 +76,22 @@ know that on line 30 than discover it on day three.
 | Hot read path (retrieve → abstain → assemble → render) | **Complete** | 32 negative probes, 0 injections; 6-way fail-open drill |
 | SDK, ingest, queue, telemetry | **Complete** | 0.04 ms p99 hot-path overhead with the server down |
 | Tier A parsers, derived state, invalidation, sweeps | **Complete** | Zero byte passthrough proven over a rolling 8-byte window |
-| Scorer, judge, shadow validation, promotion, kill switch | **Logic complete** | Correct and tested — **but see below** |
-| **Persisting a status change** | **MISSING** | No `UPDATE memory_item` exists. `workers/edit_ops.py:204` says so |
-| **Worker process handlers** | **MISSING** | `workers/runner.py:422` registers `handlers={}` |
-| **Embedding writes** | **MISSING** | `insert_memory_item` writes no embedding column |
-| **`shadow_confirm_runs` writer** | **MISSING** | Consumed by a projection nothing produces |
+| Scorer, judge, shadow validation, promotion, kill switch | **Logic complete** | Correct and tested — **but not schedulable; see below** |
+| **Persisting a status change** | **Complete** | `stores/pg/lifecycle.py` — one `UPDATE memory_item SET status`, plus a `memory_status_log` row in the same transaction. Reached through `MemoryEditRepo`/`ForensicsRepo` |
+| **Embedding writes** | **Complete** | `stores/pg/learning.py::EmbeddingRepo`; swept on a config cadence. A pin change re-selects every row — that IS the re-embedding migration |
+| **`shadow_confirm_runs` writer** | **Complete** | `stores/pg/learning.py::CorroborationRepo` — a `FOR NO KEY UPDATE` CTE reporting appended / already-present / row-not-eligible |
+| **Worker process: periodic plane** | **Partial (3 of 13)** | `workers/composition.py` + a `Scheduler` thread in `runner.run()`. Scheduled: embedder, gc, corroboration (given a host-supplied candidate source). The other ten are refused **by name** with the port that blocks each |
+| **Postgres implementations of the worker ports** | **Partial (4 of 10)** | Done: `EmbeddingRepoPort`, `CorroborationRepoPort`, `MemoryEditRepoPort`, `ForensicsRepoPort`. Missing: `ScorerRepoPort`, `ShadowValidatorRepoPort`, `PromotionRepoPort`, `KillswitchStorePort`, `DerivedStateStorePort`, `MemoryLifecycleRepoPort` |
 | **`q_history`, consolidation-diff table, `memory_link` over HTTP** | **MISSING** | Views for these render honest empty pages |
+| **Any integration test, ever** | **NEVER RUN** | No Docker/Postgres/Valkey/S3 on the build machine. All 12 SQL statements in `stores/pg/learning.py` + `lifecycle.py` are parsed and structurally asserted, never executed |
 | Dashboard (16 views, React 18 + Vite + TS + Tailwind) | **Complete** | Zero fixture data; every view live or honestly empty |
 
-**Consequence:** the pieces that *decide* are done; several pieces that *remember the decision* are
-not. Closing that gap is a bounded, well-understood job — the columns, the partitions and the RLS
-policies all already exist. It is written up in [`PLAN.md`](PLAN.md) §11.
+**Consequence:** the pieces that *decide* were always done. As of 2026-07-27 several pieces that
+*remember the decision* are done too — but the three stages that turn recorded evidence into a
+validated memory (shadow validator, scorer, promotion) still have no store, so they run in the
+closed-loop drill and in no deployment. What remains is bounded and specified one worker at a time
+in `workers/composition.py::UNSCHEDULED_WORKERS`; the columns, the partitions and the RLS policies
+all already exist. Written up in [`PLAN.md`](PLAN.md) §11 and [audit §12](docs/FIDELITY-AUDIT.md).
 
 </details>
 
@@ -330,21 +356,36 @@ migrations/      plain SQL, yoyo
 ## Known gaps
 
 Stated here rather than left to be discovered. Full detail in [`PLAN.md`](PLAN.md) §11 and
-[`docs/FIDELITY-AUDIT.md`](docs/FIDELITY-AUDIT.md) §11.4.
+[`docs/FIDELITY-AUDIT.md`](docs/FIDELITY-AUDIT.md) §11.4 and §12.4.
 
-1. **No status writer.** Promotion, staleness, retirement, archiving, pinning and tombstoning are all
-   computed correctly and none can be persisted. *The single highest-value fix in the repository.*
-2. **No worker handlers registered.** `runner.py` starts with `handlers={}`.
-3. **No embedding writer**, so the ANN arm has no data and the hybrid retrieval is lexical-only in
-   practice.
+Three of the seven gaps listed here before 2026-07-27 are now closed and have been **removed from
+this list rather than annotated**, so it stays readable as a live inventory: the status writer, the
+embedding writer and the duplicate Benjamini–Hochberg implementation. Audit §12.1 records what
+closed each. What is left:
+
+1. **10 of the 13 periodic workers cannot be scheduled.** A scheduler thread now runs and drives
+   three jobs (embedder, gc, corroboration). The other ten — including the **shadow validator**, the
+   **scorer** and the **promotion** worker, i.e. the whole path from "evidence recorded" to
+   "validated" — are blocked on a Postgres implementation of the port each declares. Every one is
+   named, with its blocking port, in `workers/composition.py::UNSCHEDULED_WORKERS`, and
+   `build_scheduled_jobs` **refuses to return** if a worker is dropped without a recorded reason.
+   *This is now the single highest-value fix in the repository.*
+2. **No `CorroborationCandidateSource`.** The shadow-confirmation writer has a real store, but
+   deciding *which run corroborates which memory* is a deliberately host-supplied seam (D-121) that
+   nothing implements. Until a host supplies one, that job is constructed and left unscheduled.
+3. **No integration test has ever run.** There is no Docker/Postgres/Valkey/S3 on the build machine.
+   Every SQL statement in the repository is parsed and structurally asserted; none has been executed.
+   Read every "Complete" above with that clause attached.
 4. **The 300 ms p99 is proven by nothing.** Every stall in the drill is `FakeClock.advance()`. It
-   needs Postgres *and* the embedding writer.
-5. **Two Benjamini–Hochberg implementations** exist — `api/reports.py` and `workers/killswitch.py`.
-   The one an operator reads is not the one that arms the kill switch. See **D-118**.
-6. **Retrieval's scope predicate is applied in the assembler, not in SQL.** The arms still return ids
-   for rows the caller may not see; the exposure is closed, the query is not yet narrow.
-7. **Not one of the five mandated phase STOPs occurred.** All six gate reports were generated inside
-   58 seconds, after the final phase was complete.
+   needs Postgres — and now that the embedding writer exists, that is the only thing it needs.
+5. **Retrieval's scope predicate is applied in the assembler, not in SQL.** The SQL-side conjunct
+   exists and is tested but is opt-in, and no caller supplies a `RunVisibility` yet (D-126). The
+   exposure is closed; the query is not yet narrow.
+6. **`memory_link`, `derived_state`, `killswitch_state` and `scoring_epoch` still have no writer.**
+   `memory_item.epoch_id` and `memory_status_log.epoch_id` exist, typed and empty.
+7. **Not one of the five mandated phase STOPs occurred**, and the 2026-07-27 integration pass did not
+   have one either. All six gate reports were originally generated inside 58 seconds, after the final
+   phase was complete.
 
 ---
 

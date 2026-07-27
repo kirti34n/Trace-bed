@@ -68,24 +68,37 @@ _APP_ROLE_PASSWORD = os.environ.get("TB_APP_ROLE_PASSWORD", "tracebed_app_dev")
 
 
 def test_ddl_partitioned_tables_match_migration() -> None:
-    sql = (MIGRATIONS_DIR / "0002_partitioned.sql").read_text(encoding="utf-8")
-    declared = set(
-        re.findall(
-            r"CREATE TABLE\s+(\w+)\s*\([\s\S]*?PARTITION BY LIST\s*\(\s*project_id\s*\)",
-            sql,
-            re.IGNORECASE,
+    """Scans EVERY forward migration, not only 0002.
+
+    A LIST-partitioned parent created by a later migration (0004_lifecycle.sql's
+    `memory_status_log` is the first) is exactly as dependent on
+    `create_project_partitions` as one created by 0002: without a per-project
+    partition its first INSERT fails with "no partition of relation found for row".
+    Reading one file made the check blind to the only kind of table that can be
+    added from here on.
+    """
+    declared: set[str] = set()
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if path.name.endswith(".rollback.sql"):
+            continue
+        declared |= set(
+            re.findall(
+                r"CREATE TABLE\s+(\w+)\s*\([\s\S]*?PARTITION BY LIST\s*\(\s*project_id\s*\)",
+                path.read_text(encoding="utf-8"),
+                re.IGNORECASE,
+            )
         )
-    )
+    assert declared, "no LIST-partitioned parent found in any migration -- the scan broke"
     assert declared == set(PARTITIONED_TABLES), (
-        "ddl.py's PARTITIONED_TABLES drifted from migrations/0002_partitioned.sql: "
+        "ddl.py's PARTITIONED_TABLES drifted from the migrations: "
         f"only-in-sql={declared - set(PARTITIONED_TABLES)} "
         f"only-in-ddl={set(PARTITIONED_TABLES) - declared}"
     )
 
 
-def test_thirteen_tables_exactly() -> None:
-    assert len(PARTITIONED_TABLES) == 13
-    assert len(set(PARTITIONED_TABLES)) == 13  # no duplicate would be silently tolerated
+def test_fourteen_tables_exactly() -> None:
+    assert len(PARTITIONED_TABLES) == 14
+    assert len(set(PARTITIONED_TABLES)) == 14  # no duplicate would be silently tolerated
 
 
 def test_partition_name_is_deterministic_and_stable() -> None:

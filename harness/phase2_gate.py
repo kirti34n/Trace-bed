@@ -628,11 +628,14 @@ def render_markdown(run: GateRun) -> str:
         w(
             "> **What this PASS does and does not mean.** Every clause below executed and "
             "passed against in-memory doubles. This phase contributes no integration-marked "
-            "tests, and none of the worker ports its clauses exercise has a Postgres "
-            "implementation in this tree (PLAN.md §11 M3) -- so a green verdict here is "
-            "evidence about LOGIC, and is not evidence that any of it has ever run against a "
-            "database. The verdict rule keys on skipped tests, and a phase with no "
-            "integration tests has none to skip."
+            "tests. Four of the ten worker ports M3 enumerates now DO have a Postgres "
+            "implementation (`EmbeddingRepoPort`, `CorroborationRepoPort`, "
+            "`MemoryEditRepoPort`, `ForensicsRepoPort` -- D-128), and not one of those "
+            "statements has ever been EXECUTED: no Docker/Postgres on this machine, and their "
+            "integration tests skip. The other six ports (PLAN.md §11 M3) still have no "
+            "implementation at all. So a green verdict here is evidence about LOGIC, and is "
+            "not evidence that any of it has ever run against a database. The verdict rule "
+            "keys on skipped tests, and a phase with no integration tests has none to skip."
         )
         w("")
     if run.overall_verdict == "INCOMPLETE":

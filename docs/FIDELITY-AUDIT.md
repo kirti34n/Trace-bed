@@ -641,6 +641,136 @@ count rose by 74 (scope visibility, the reports isolation suite, the creation-st
 guessed-reward drill, the known-gaps currency tests, the config pins, and two JIT scope tests).
 
 
+
+---
+
+## 12. Integration pass (2026-07-27) — the learning plane is wired
+
+§11 was a remediation of the audit's *findings*. This section records a second pass whose
+subject was the audit's *verdict*: **"the learning half of the system is a library, not a
+service."** Five agents had, since §11, landed the status writer, the embedding writer, the
+shadow-confirmation writer, the shared Benjamini-Hochberg implementation and the worker
+registry — each individually correct, each mutation-tested, and **not one of them reachable
+from a deployed process**. This pass wired them, and enumerated what still is not.
+
+As with §11, **nothing in §1–§10 was edited**: a finding that is now closed is still described
+above as the audit found it, and this section is the only place that says so. D-128 is the
+decision entry.
+
+### 12.1 What this pass closed
+
+| Finding | State after this pass | What closed it |
+|---|---|---|
+| **M1** — no status write path; `persist_status`'s only implementations were three test fakes | **Closed** | `stores.pg.lifecycle.LifecycleWriter` (landed by the status-writer chunk) is now reachable: `MemoryEditRepo` and `ForensicsRepo` (new, same module) are the first production implementations of `MemoryEditRepoPort`/`ForensicsRepoPort`, and both delegate `persist_status` to it. There is exactly ONE `SET status = %(to_status)s` in `src/`, asserted by a test that greps the whole `stores/pg/` package |
+| **M2** — no running worker plane; `runner.py` constructed `WorkerRunner(handlers={})` and no scheduler | **Half-closed, and the half is named** | `workers/composition.py` + a fourth `Scheduler` thread in `runner.run()`. **3 of 13** periodic workers are scheduled (`embedder`, `gc`, `corroboration` when a host supplies its declared candidate source). The other 10 are refused *by name, with the missing port*, in `composition.UNSCHEDULED_WORKERS`, and `build_scheduled_jobs` **raises** if any module under `workers/` is neither scheduled nor accounted for |
+| **M3** — no Postgres implementation for ten worker ports | **4 of 10 closed** | `EmbeddingRepoPort` → `stores.pg.learning.EmbeddingRepo`; `CorroborationRepoPort` → `stores.pg.learning.CorroborationRepo`; `MemoryEditRepoPort` → `stores.pg.lifecycle.MemoryEditRepo`; `ForensicsRepoPort` → `stores.pg.lifecycle.ForensicsRepo`. `ScorerRepoPort`, `ShadowValidatorRepoPort`, `PromotionRepoPort`, `KillswitchStorePort`, `DerivedStateStorePort`, `ReviewQueueRepoPort`/`EpochStorePort` remain open |
+| **M6** — no shadow-confirmation producer | **Closed** | `CorroborationRepo` gives `CorroborationWriter` a real store. The `run_id → memory_id` MATCH remains a declared host seam (D-121) with no implementation, so the job is constructed and left unscheduled until a host supplies one — visible in the gate report, not silent |
+| **M8** — no embedding write, so the ANN arm is dead | **Closed** | `EmbeddingRepo` implements the select/write pair; the sweep is scheduled every `workers.embedding_interval_minutes`. `adapters.embedding.pinning.assert_pin_matches` now has production call sites (S16) |
+| **S16** — the embedding-pin guard is never called | **Closed** | Called at `Embedder` construction and before every `embed()`; and `adapters/embedding/factory.py` now builds the driver for BOTH processes from one constructor, so the API's query embedder and the worker's write-side embedder cannot drift into different vector spaces |
+| **D-095's residue / D-126's contract gap** — two Benjamini-Hochberg implementations | **Closed** | `workers/killswitch.py` imports the exact-arithmetic one from `workers.statistics` and defines none. This is a **behaviour change, not a no-op**: it removes spurious boundary triggers (D-126 measured ~4,500 disagreements in 200,000 boundary-weighted inputs). The previously-disagreeing inputs are still parametrised in `tests/phase3/test_bh_single_authority.py`, now asserting the corrected answer |
+| **The cadence contract gap** (recorded identically in `scheduler.py`, `runner.py`, `registry.py`) | **Closed** | `domain.config.WorkersConfig`. Deployment-level, not overridable per project — one `Scheduler` serves every project, so a per-project cadence would be a knob that silently does nothing |
+| **`memory_status_log` had no partition** (the status-writer chunk's own reported gap) | **Closed** | Added to `ddl.PARTITIONED_TABLES` with a `(memory_id, changed_at DESC)` index |
+
+### 12.2 Three defects this pass found while wiring
+
+None of these was in the audit. All three were silent, and all three are the same shape: a
+control that is correct in the file it lives in and absent from the path a deployment takes.
+
+1. **The status-history table could not be partitioned at all.** `memory_status_history` is 21
+   characters; `ddl.partition_policy_name` builds `<table>_p_<32 hex>_isolation`, which at that
+   length is **66 bytes** against PostgreSQL's 63-byte `NAMEDATALEN - 1`. `create_project_
+   partitions` would have raised for **every project** — the status writer was dead on arrival
+   in any real deployment while passing every offline test that never built a policy name. The
+   table is renamed `memory_status_log`, and `ddl.py` now refuses at import time any
+   `PARTITIONED_TABLES` entry over the derived 18-character bound.
+2. **Two structural tests each read one migration file.** `test_ddl_partitioned_tables_match_
+   migration` scanned only `0002_partitioned.sql` and `test_every_partitioned_table_is_force_
+   rls_in_the_migration` only `0003_rls.sql`, so both were blind to any partitioned table added
+   afterwards — i.e. to exactly the tables at greatest risk of being left unprotected. Both now
+   scan every forward migration.
+3. **The closed-loop drill's own checks could be deleted silently.** In its first version each
+   hop's `passed` was an `and` chain, so a mutation removing the Sybil control from hop 5, or
+   the "the quarantined row got no vector" conjunct from hop 3, left the drill AND its pytest
+   wrapper green. `Hop.checks` is now a named map with `passed` derived from it, and
+   `tests/phase3/test_closed_loop_drill.py` requires each load-bearing check **by name**.
+
+### 12.3 The closed-loop drill
+
+`harness/closed_loop.py`, CI-blocking as `phase3_gate` clause 9 and collected as
+`tests/phase3/test_closed_loop_drill.py`. Nine hops, each asserted with the production
+function:
+
+```
+[PASS] 1. trace ingested                     ingest.trace_writer.TraceWriter.run_once
+[PASS] 2. extractor emits a Tier A candidate workers.tier_a_lane.TierALane.run_batch
+[PASS] 3. embedded and persisted             workers.embedder.Embedder.run
+[PASS] 4. two independent runs corroborate   workers.corroboration.CorroborationWriter.run_once
+[PASS] 5. shadow validation promotes         workers.shadow_validator.ShadowValidator.run_once
+[PASS] 6. outcome events move Q              workers.scorer.run_scorer_batch
+[PASS] 7. promotion -> validated             workers.promotion.PromotionWorker.evaluate_candidate
+[PASS] 8. retrieval returns it               stores.pg.search.assert_dynamically_retrievable
+[PASS] 9. status change persisted            stores.pg.lifecycle.LifecycleWriter.persist_status
+VERDICT: the loop CLOSES (9/9 hops)
+```
+
+**Read that verdict exactly this far and no further.** Every hop ran offline against in-memory
+implementations of each worker's own declared `Protocol`; hop 9 proves the `UPDATE` and the
+`INSERT INTO memory_status_log` are ISSUED in one transaction after the RLS GUC, not that a
+database accepted them; hop 8 asserts the production retrievability predicate, not a `WHERE`
+clause. **A PASS means "the loop closes when every store method exists", not "the loop closes
+in production today."** The drill prints `UNSCHEDULED_WORKERS` beside its own verdict for that
+reason.
+
+Two negative controls make it more than a walk-through: hop 5 promotes a memory with **two
+independent** confirmations and simultaneously refuses an identical memory whose two
+confirmations share a principal and an input-signature cluster (invariant 7's Sybil test), and
+hop 3 asserts the quarantined row receives **no** vector while the retrievable one does.
+
+### 12.4 Still open, unchanged by this pass
+
+* **M3's remaining six ports** — `ScorerRepoPort`, `ShadowValidatorRepoPort`,
+  `PromotionRepoPort`, `KillswitchStorePort`, `DerivedStateStorePort`, `EpochStorePort`. Hops
+  5, 6 and 7 of the drill run against in-memory implementations of these. That is why M2 is
+  half-closed: the shadow validator, the scorer and the promotion worker are the three stages
+  between "evidence recorded" and "validated memory", and none of them can run in a deployed
+  process yet.
+* **M4** — `memory_link`, `derived_state`, `killswitch_state` and `scoring_epoch` still have no
+  writer. `memory_item.epoch_id` and `memory_status_log.epoch_id` exist, typed and empty.
+* **M5, M7, M9–M22** — untouched. See PLAN.md §11.
+* **The SQL-side scope predicate** is still opt-in and no caller supplies a `RunVisibility`
+  (D-126). D-097's assembler filter remains the scope control, which is the audited status quo.
+* **No integration test has ever executed.** Every `@pytest.mark.integration` test added by
+  this pass (`tests/phase1/test_learning_repos.py` has two) skips cleanly through the shared
+  `pg` fixture, because this machine has no Docker/Postgres/Valkey/S3. The four SQL statements
+  in `stores/pg/learning.py` and the four in `stores/pg/lifecycle.py` have been **parsed**, not
+  **run**.
+* **The process failure (D-111) is unchanged.** This pass had no STOP either.
+
+### 12.5 Verified after this pass
+
+```
+pytest -q                          4,066 passed / 45 skipped / 0 failed  (was 3,754 / 41 at §11.5;
+                                    3,980 / 43 / 1 failed when this pass began)
+mypy                               clean, 151 source files               (was 143 at §11.5)
+ruff check src tests harness scripts   clean
+scripts/raw_sql_lint.py            PASS
+scripts/purity_check.py            PASS
+scripts/license_check.py           PASS (49 distributions)
+scripts/image_check.py             PASS (5 image references)
+harness/phase2_gate.py             7/7 clauses PASS · verdict PASS
+harness/phase3_gate.py             10/10 clauses PASS (clause 9 is the new closed-loop drill)
+                                   · verdict INCOMPLETE (untracked skips: no Postgres)
+harness/phase4_gate.py             6/6 clauses PASS · verdict INCOMPLETE
+harness/closed_loop.py             9/9 hops · the loop CLOSES (offline, against fakes)
+harness/full_gate.py               INCOMPLETE (phase0/1/3/4 INCOMPLETE, phase2 PASS)
+```
+
+The `INCOMPLETE` verdicts have the same single cause they had at §11.5 and the same one they
+had at the original audit: no Docker/Postgres/Valkey on this machine. **No verdict improved as
+a result of this pass and none regressed.** The test count rose by 312 (the two learning
+repos, the composition root, the closed-loop drill and its wrapper, the corrected
+Benjamini-Hochberg identity tests, and the migration/partition scans).
+
 ---
 
 *Audit performed 2026-07-26 against the working tree at `C:/Users/kirti/Music/Strata` (275 Python
@@ -649,6 +779,7 @@ mypy --strict clean on 142 files). Read-only: no file was modified. The `INCOMPL
 caused by the absence of Docker/Postgres on this machine are known, documented, and were not
 re-litigated.*
 
-*Remediation performed the same day and recorded in §11 above; §1–§10 describe the tree as the
-audit found it and were deliberately left unedited, so the two halves of this document can be
-read against each other.*
+*Remediation performed the same day and recorded in §11 above; a second, wiring-focused pass
+followed on 2026-07-27 and is recorded in §12. §1–§10 describe the tree as the audit found it
+and were deliberately left unedited, so the three parts of this document can be read against
+each other.*

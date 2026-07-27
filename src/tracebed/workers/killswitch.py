@@ -102,6 +102,16 @@ from tracebed.workers.lift import (
     is_adverse,
 )
 
+# Re-exported, not redefined (D-126). This module carried its own float copy of the
+# Benjamini-Hochberg step-up until this pass; a differential run showed the two
+# implementations of the one governing correction disagreed on ~2% of randomised inputs,
+# all at rank boundaries, with the local copy firing SPURIOUSLY (it rounded the threshold
+# up, so a cell whose exact p-value sits fractionally above the boundary was rejected and a
+# memory type disabled for an agent type on a floating-point artefact). The name stays
+# importable from here because `__all__` and existing callers/tests reference it; what is
+# gone is the second author.
+from tracebed.workers.statistics import benjamini_hochberg
+
 __all__ = [
     "DailyLiftSnapshot",
     "KillswitchAuditPort",
@@ -261,38 +271,6 @@ def evaluate_sustained(
         latest_estimate=latest,
         days_covered=days_covered,
     )
-
-
-def benjamini_hochberg(p_values: Sequence[float], *, alpha: float = DEFAULT_BH_ALPHA) -> list[bool]:
-    """The Benjamini-Hochberg step-up procedure. Returns, in the SAME order as `p_values`,
-    whether each entry is rejected (i.e. significant after correction).
-
-    Standard procedure: sort ascending, find the largest rank `k` such that
-    `p_(k) <= (k / m) * alpha`, and reject every hypothesis at rank <= `k`. An empty input
-    returns an empty list rather than raising -- a grid with zero cells has nothing to correct
-    for, which is a legitimate (if uninteresting) call from `evaluate_grid` on a project with
-    no history at all yet.
-    """
-    if not 0.0 < alpha < 1.0:
-        raise ValueError(f"alpha must be in (0, 1), got {alpha!r}")
-    m = len(p_values)
-    if m == 0:
-        return []
-    for p in p_values:
-        if not 0.0 <= p <= 1.0:
-            raise ValueError(f"p-value out of [0, 1]: {p!r}")
-
-    order = sorted(range(m), key=lambda i: p_values[i])
-    largest_k = 0
-    for rank, idx in enumerate(order, start=1):
-        if p_values[idx] <= (rank / m) * alpha:
-            largest_k = rank
-
-    reject = [False] * m
-    for rank, idx in enumerate(order, start=1):
-        if rank <= largest_k:
-            reject[idx] = True
-    return reject
 
 
 @dataclass(frozen=True, slots=True)

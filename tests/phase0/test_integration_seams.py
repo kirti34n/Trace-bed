@@ -662,7 +662,16 @@ def test_every_partitioned_table_is_force_rls_in_the_migration() -> None:
     added later cannot be silently left unprotected."""
     from tracebed.stores.pg.ddl import PARTITIONED_TABLES
 
-    rls_sql = (_REPO_ROOT / "migrations" / "0003_rls.sql").read_text(encoding="utf-8")
+    # Every forward migration, not only 0003: a partitioned parent created after
+    # 0003 ran (0004_lifecycle.sql's `memory_status_log` is the first) has to
+    # apply its own RLS inline, because 0003 cannot protect a table that did not
+    # exist when it ran. Reading one file made this check blind to exactly the
+    # tables that carry the greater risk of being left unprotected.
+    rls_sql = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((_REPO_ROOT / "migrations").glob("*.sql"))
+        if not path.name.endswith(".rollback.sql")
+    )
     missing = [
         table
         for table in PARTITIONED_TABLES

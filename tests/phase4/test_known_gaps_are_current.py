@@ -54,11 +54,29 @@ def _agent_control_repo_methods_are_missing() -> bool:
 
 
 def _no_embedding_write_path_exists() -> bool:
-    """The one gap in this list that is still true, kept so the test proves it can say yes."""
+    """Was: "`repo.py` never mentions embedding". That predicate went STALE the moment the
+    embedding writer landed in a SIBLING module (`stores/pg/learning.py`, D-128) -- it kept
+    answering True while the gap it stood for had closed, which is precisely the failure this
+    file exists to catch, reproduced inside the catcher.
+
+    Now scans the whole of `stores/pg/` for a statement that assigns the embedding column, so
+    the answer tracks the claim rather than one file's contents.
+    """
+    package = REPO_ROOT / "src" / "tracebed" / "stores" / "pg"
+    return not any(
+        "SET embedding" in path.read_text(encoding="utf-8") for path in package.glob("*.py")
+    )
+
+
+def _latency_bench_still_seeds_without_embeddings() -> bool:
+    """The half of that gap which is still true, and the reason the phase-1 entry was rewritten
+    rather than deleted: the bench seeds through `Repo.insert_memory_item`, which writes no
+    embedding, so its vector arm measures zero rows however well the writer works."""
+    bench = (REPO_ROOT / "harness" / "latency_bench.py").read_text(encoding="utf-8")
     repo_src = (REPO_ROOT / "src" / "tracebed" / "stores" / "pg" / "repo.py").read_text(
         encoding="utf-8"
     )
-    return '"embedding"' not in repo_src
+    return "insert_memory_item" in bench and '"embedding"' not in repo_src
 
 
 def _routing_record_table_is_undefined() -> bool:
@@ -73,6 +91,11 @@ _CLAIMS: tuple[tuple[object, str, Callable[[], bool]], ...] = (
     (phase4_gate, "value_ref/status being NULLable", _blackboard_columns_are_nullable),
     (phase4_gate, "three missing AgentControlRepoPort", _agent_control_repo_methods_are_missing),
     (phase1_gate, "no write path for memory_item.embedding", _no_embedding_write_path_exists),
+    (
+        phase1_gate,
+        "latency_bench.py still seeds through Repo.insert_memory_item",
+        _latency_bench_still_seeds_without_embeddings,
+    ),
     (phase4_gate, "routing_record table", _routing_record_table_is_undefined),
 )
 

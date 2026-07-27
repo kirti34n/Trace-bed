@@ -60,7 +60,9 @@ REQUIRED_ENV = {
     "TB_EMBEDDING__MODEL_VERSION": "2026-01-01",
 }
 
-DEPLOYMENT_SECTIONS = ("api", "dashboard", "auth", "storage", "embedding", "llm")
+# `workers` joined this list with the scheduler wiring (D-128): one `Scheduler` serves every
+# project in the process, so a per-project sweep cadence is a knob that silently does nothing.
+DEPLOYMENT_SECTIONS = ("api", "dashboard", "auth", "storage", "embedding", "llm", "workers")
 """Sections §3.4 declares deployment-level: no project/agent_type override may reach them."""
 
 

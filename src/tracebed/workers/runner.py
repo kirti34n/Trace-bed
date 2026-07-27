@@ -319,7 +319,7 @@ class WorkerRunner:
 def run() -> None:
     """Console entry point (`tracebed-worker`, pyproject.toml). Builds real
     adapters from `TracebedSettings` read off the process environment and
-    runs two loops on one shared shutdown signal:
+    runs FOUR loops -- one thread each -- on one shared shutdown signal:
 
       * the ingest consumer loop (`ingest.runner.ConsumerRunner` over real
         `TraceWriter`/`OutcomeIntake`) -- the two Phase 0 topics this
@@ -335,30 +335,57 @@ def run() -> None:
         is swept. It gets its own loop rather than a `WorkerRunner` handler
         entry because its ack/nack policy is per item, not per batch -- see
         `ProposalIntake.run_forever`'s docstring.
-      * this chunk's `WorkerRunner`, registered with `handlers={}` today.
-        All three of `stores.pg.queue`'s topics are drained by the two loops
-        above, and its own DO-NOT list forbids adding more. Every Phase 2
-        sibling that HAS landed in `workers/` (`sweeps`, `revalidation`,
-        `consolidator`, `invalidator`, `prefix_builder`, `derived_state`) is
-        a periodic pass over the memory store, not a queue-topic consumer --
-        none of them defines a `TOPIC_*` constant to register here. So an
-        empty handler map is an honestly-idle, ready-to-extend engine, not a
-        stub standing in for missing logic.
+      * this chunk's `WorkerRunner`, registered with
+        `workers.registry.build_default_registry(WorkerDeps())`. That call --
+        not a bare `{}` literal -- is what makes the handler map auditable:
+        it refuses to return at all unless every topic `stores.pg.queue`
+        defines is either handled here or named in
+        `registry.UNREGISTERED_TOPICS` with the reason it is not, and unless
+        no handler is registered for a topic that does not exist. So a future
+        worker dropped because its dependencies were absent fails THIS
+        process's construction instead of shrinking the map silently.
+        It resolves to an empty map today, and that emptiness is checked on
+        the same terms as any populated one: all three of `stores.pg.queue`'s
+        topics are drained by the two loops above (each claims its own rows,
+        so a second `BatchHandler` layer over them would double-claim), and
+        its own DO-NOT list forbids adding more. Every Phase 2 sibling that
+        HAS landed in `workers/` (`sweeps`, `revalidation`, `consolidator`,
+        `invalidator`, `prefix_builder`, `derived_state`) is a periodic pass
+        over the memory store, not a queue-topic consumer -- none of them
+        defines a `TOPIC_*` constant to register here. See
+        `workers/registry.py`'s module docstring for the full reasoning.
+
+      * the PERIODIC plane: a `workers.scheduler.Scheduler` over the
+        `ScheduledJob`s `workers.composition.build_scheduled_jobs` returns.
+        This is the loop the fidelity audit's M2 was about ("a deployed
+        Tracebed today ingests traces and outcome events faithfully and
+        learns nothing from either") and it now exists. The jobs it drives
+        today are the embedding sweep, the shadow-confirmation writer (only
+        when a `CorroborationCandidateSource` is supplied -- see below) and
+        the queue GC pass; every other periodic worker is recorded in
+        `composition.UNSCHEDULED_WORKERS` with the exact store port it is
+        blocked on, and `build_scheduled_jobs` REFUSES TO RETURN if any
+        module under `workers/` is neither scheduled nor accounted for.
+
+    Cadences come from `domain.config.WorkersConfig`, which exists precisely
+    because the previous version of this docstring recorded the contract gap
+    that made this loop unbuildable: "`domain/config.py` has no field for how
+    often the TTL sweep / GC pass runs ... picking an arbitrary number here
+    would put an invented literal directly on a live process". Every interval
+    is now a declared, overridable, deployment-visible field (D-128).
+
+    STILL A CONTRACT GAP, narrowed rather than closed: no
+    `CorroborationCandidateSource` implementation exists anywhere in this
+    repository, so the corroboration job is constructed and NOT scheduled
+    unless a host supplies one. Deciding which runs corroborate which
+    quarantined memory is a declared host seam (D-121), and inventing a
+    matching heuristic here would make this process the second author of
+    "these two runs are about the same thing".
 
     No loop is allowed to die quietly. Every thread target is wrapped so that
     returning OR raising sets the shared `stop`: a process that has lost one
     loop but still holds the others looks alive to a supervisor while silently
     draining nothing, which is strictly worse than exiting and being restarted.
-
-    CONTRACT GAP -- `workers.scheduler.Scheduler` / `workers.gc`'s periodic
-    jobs are deliberately NOT constructed here, and neither are the Phase 2
-    siblings listed above. All are complete and fully tested offline; what is
-    missing is a real cadence to give them, and `domain/config.py` (outside
-    this chunk's file list) has no field for "how often does the TTL sweep /
-    GC pass run" (see `workers.scheduler`'s module docstring). Picking an
-    arbitrary number here would put an invented literal directly on a live
-    process rather than in a test fixture the soak explicitly drives --
-    reported as a contract_gap against `domain/config.py` instead.
     """
     import signal
 
@@ -374,6 +401,7 @@ def run() -> None:
     from tracebed.stores.tracestore import TraceStorePort
     from tracebed.stores.tracestore.fs import FsTraceStore
     from tracebed.stores.tracestore.s3 import S3TraceStore
+    from tracebed.workers.registry import WorkerDeps, build_default_registry
     from tracebed.workflow.agent_control import AgentControl, ProposalIntake
 
     def _build_tracestore(cfg: TracebedSettings, clock: SystemClock) -> TraceStorePort:
@@ -419,9 +447,52 @@ def run() -> None:
     worker_runner = WorkerRunner(
         queue=queue,
         clock=clock,
-        handlers={},
+        handlers=build_default_registry(WorkerDeps()),
         batch_size=settings.queue.batch_size,
         lease_seconds=settings.queue.lease_seconds,
+    )
+
+    # ---- the periodic plane (FIDELITY-AUDIT.md M1/M2/M3) --------------------
+    from tracebed.adapters.embedding.factory import (
+        build_embedding_driver,
+        model_pin_from_settings,
+    )
+    from tracebed.stores.pg.queue import (
+        TOPIC_MEMORY_PROPOSAL,
+        TOPIC_OUTCOME_EVENT,
+        TOPIC_TRACE_EVENT,
+    )
+    from tracebed.workers.composition import build_learning_plane, build_scheduled_jobs
+    from tracebed.workers.scheduler import Scheduler
+    from tracebed.workers.spend import SpendMeter
+
+    plane = build_learning_plane(
+        pool=pool,
+        repo=repo,
+        clock=clock,
+        cfg=settings.workers,
+        pin=model_pin_from_settings(settings),
+        # The SAME driver construction the API process uses, imported rather than repeated:
+        # two processes stamping `embedding_model_id` from two independently-built drivers is
+        # how a query embedding and a stored vector end up in different vector spaces.
+        embedding_port=build_embedding_driver(settings, clock),
+        spend=SpendMeter(repo, clock, settings.spend),
+        key_manager=keys,
+        # No implementation exists; see run()'s docstring. Passed explicitly as None rather
+        # than omitted so the absence is visible at the call site, not only in a default.
+        candidate_source=None,
+    )
+    scheduler = Scheduler(
+        clock,
+        build_scheduled_jobs(
+            plane,
+            cfg=settings.workers,
+            list_project_ids=repo.list_project_ids,
+            queue_observability=queue,
+            topics=(TOPIC_TRACE_EVENT, TOPIC_OUTCOME_EVENT, TOPIC_MEMORY_PROPOSAL),
+            lease_seconds=settings.queue.lease_seconds,
+            candidate_source=None,
+        ),
     )
 
     from types import FrameType
@@ -457,9 +528,24 @@ def run() -> None:
             stop_event, poll_interval_s=ingest_runner.config.poll_interval_s
         )
 
+    def _scheduler_loop(stop_event: threading.Event) -> None:
+        """Ticks until shutdown. `Scheduler.tick()` decides which jobs are due off the
+        injected clock, so the tick cadence here is only the RESOLUTION at which cadences are
+        observed -- a job never runs more often than its own interval regardless of how fast
+        this loop spins. Sleeps via `stop_event.wait`, never `time.sleep`, so a SIGTERM during
+        an idle wait is honoured immediately (identical to `WorkerRunner.run_forever`)."""
+        while not stop_event.is_set():
+            scheduler.tick()
+            stop_event.wait(settings.workers.scheduler_tick_seconds)
+
     ingest_thread = threading.Thread(
         target=_supervised("ingest", ingest_runner.run_forever),
         name="tracebed-ingest",
+        daemon=True,
+    )
+    scheduler_thread = threading.Thread(
+        target=_supervised("scheduler", _scheduler_loop),
+        name="tracebed-scheduler",
         daemon=True,
     )
     proposal_thread = threading.Thread(
@@ -472,7 +558,8 @@ def run() -> None:
         name="tracebed-worker",
         daemon=True,
     )
-    for thread in (ingest_thread, proposal_thread, worker_thread):
+    threads = (ingest_thread, proposal_thread, worker_thread, scheduler_thread)
+    for thread in threads:
         thread.start()
-    for thread in (ingest_thread, proposal_thread, worker_thread):
+    for thread in threads:
         thread.join()

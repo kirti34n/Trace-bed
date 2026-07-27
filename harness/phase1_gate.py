@@ -431,13 +431,14 @@ class GateRun:
 
 
 _KNOWN_GAPS: tuple[str, ...] = (
-    "Repo.insert_memory_item has no write path for memory_item.embedding/embedding_model_id/"
-    "embedding_model_version/lexemes, and Repo has no bulk-insert primitive. The vector arm is "
-    "therefore structurally empty for any data seeded through the sanctioned Repo path, in "
-    "harness/latency_bench.py and in production alike, until Repo grows an embedding-write "
-    "path. The READ side is complete (stores.pg.search.vector_arm, and hotpath.assembly which "
-    "consumes it), so this is the one remaining break in the chain memory -> embedding -> ANN "
-    "hit; it is a write-plane deliverable and cannot be exercised on this machine at all.",
+    "A write path for memory_item.embedding/embedding_model_id/embedding_model_version now "
+    "exists -- stores.pg.learning.EmbeddingRepo, driven by workers.embedder.Embedder on the "
+    "workers.embedding_interval_minutes cadence (D-128) -- so the chain memory -> embedding -> "
+    "ANN hit is no longer structurally broken. TWO CAVEATS, both real: the statement has never "
+    "been EXECUTED (no Postgres on this machine; its @pytest.mark.integration test skips), and "
+    "harness/latency_bench.py still seeds through Repo.insert_memory_item, which writes no "
+    "embedding, so this bench's vector arm still measures zero rows. Repo also still has no "
+    "bulk-insert primitive and no lexemes writer.",
     "This machine has no Docker/Postgres/Valkey, so the latency bench above ran at a "
     "drastically reduced 'smoke' scale (2 projects x 50 items) by default here, not the real "
     "50 x 100,000 PLAN.md Section 7 names -- informational only, per D-035, and explicitly "

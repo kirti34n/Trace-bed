@@ -412,6 +412,100 @@ class QueueConfig(_StrictModel):
     batch_size: int = Field(default=100, ge=1)
 
 
+class WorkersConfig(_StrictModel):
+    """Cadences and per-sweep sizing for the periodic learning plane (`workers.scheduler`).
+
+    WHY THIS SECTION EXISTS. `workers/scheduler.py`, `workers/runner.py` and
+    `workers/registry.py` each carried the same standing CONTRACT GAP: "PLAN.md §6's config
+    table has no field for how often the TTL sweep runs (only the TTL *durations*, which are
+    `domain.state_machine` guard thresholds, not sweep periods) ... inventing one here would be
+    exactly hard rule 4's 'a number that is not there is a contract_gap, not a licence to invent
+    a literal'." That refusal was right, and it is also why `workers.Scheduler` was constructed
+    by nothing: a job needs a cadence, a cadence is a number, and there was nowhere legitimate
+    to put one. This section is that place. Every interval below is now a *declared* number a
+    deployment can see, override per environment, and read back off `/admin/config` -- not a
+    literal buried in `runner.run()`'s body.
+
+    WHY IT IS NOT IN `OVERRIDABLE_SECTIONS`. Deliberate, and the same reasoning
+    `EffectiveConfig`'s docstring already gives for `storage`/`llm`/`auth`: one `Scheduler`
+    instance serves every project in the process, so "how often does the sweep thread tick" is
+    not a per-project quantity and a `project_config` row claiming otherwise would be a knob
+    that silently does nothing. The *thresholds* the sweeps evaluate (`lifecycle.*`,
+    `retirement.*`, `promotion.*`) stay overridable exactly as before -- what a sweep decides is
+    a project's business; how often the process wakes up is the deployment's.
+
+    Bounds. Every interval is `ge=1` minute: a zero or negative interval is refused by
+    `ScheduledJob.__post_init__` anyway, and a sub-minute sweep over every project in a
+    deployment is a load profile nobody would choose on purpose. There is no upper bound --
+    a very long interval is a deliberate "effectively off" setting, and refusing it would take
+    away the only way to disable one job without editing code.
+    """
+
+    sweep_interval_minutes: int = Field(default=60, ge=1)
+    """`workers.sweeps` -- quarantine/candidate TTL expiry, idle Q decay, archive floor."""
+
+    revalidation_interval_minutes: int = Field(default=360, ge=1)
+    """`workers.revalidation` -- idle-triggered re-verification (D-113)."""
+
+    consolidation_interval_minutes: int = Field(default=1_440, ge=1)
+    """`workers.consolidator` -- near-duplicate merge. Daily by default: consolidation
+    rewrites provenance, and doing it more often than the distiller produces new material
+    buys nothing."""
+
+    prefix_rebuild_interval_minutes: int = Field(default=60, ge=1)
+    """`workers.prefix_builder` -- the static prefix every run of an agent type receives."""
+
+    derived_state_interval_minutes: int = Field(default=1_440, ge=1)
+    """`workers.derived_state` -- baseline refresh, movement-clamped."""
+
+    gc_interval_minutes: int = Field(default=1_440, ge=1)
+    """`workers.gc` -- tombstone/blackboard/dead-letter reclamation."""
+
+    embedding_interval_minutes: int = Field(default=5, ge=1)
+    """`workers.embedder` -- the ANN arm's write side. Much shorter than the governance
+    sweeps on purpose: a memory is retrievable by BM25 the moment it is written but invisible
+    to the vector arm until this runs, so the interval is the ANN arm's staleness window, not
+    a maintenance cadence."""
+
+    embedding_batch_limit: int = Field(default=200, ge=1)
+    """Rows per project per embedding sweep (`Embedder.run(..., limit=)`). Bounds the work one
+    tick can do so a large backfill is spread across ticks instead of blocking the thread."""
+
+    embedding_max_batch: int = Field(default=32, ge=1)
+    """Texts per `EmbeddingPort.embed` call. Distinct from `embedding_batch_limit`: one sweep
+    of `embedding_batch_limit` rows issues `ceil(limit / max_batch)` provider calls."""
+
+    embedding_timeout_ms: int = Field(default=10_000, ge=1)
+    """Per-call budget for a BACKGROUND embedding request. Deliberately not
+    `retrieval.embed_timeout_ms` (200 ms), which PLAN.md invariant 1 defines as the HOT PATH's
+    query-embedding sub-budget for a single short string; reusing it here would starve a batch
+    of `embedding_max_batch` documents to a budget sized for one query."""
+
+    embedding_usd_per_1k_tokens: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+    """Price used to record embedding spend on `spend_ledger`. Defaults to 0.0, which is a
+    HONEST default rather than a free lunch: this repository has no price table anywhere
+    (`SpendConfig` has a cap and no prices -- `workers/distiller.py` documents the same gap),
+    and a made-up non-zero price would put a fabricated number into the ledger the daily cap is
+    computed from. Zero means "spend is recorded as tokens, not dollars" until a deployment
+    supplies its provider's real rate."""
+
+    corroboration_interval_minutes: int = Field(default=30, ge=1)
+    """`workers.corroboration` -- the shadow-confirmation writer, the only non-human route out
+    of quarantine."""
+
+    shadow_validation_interval_minutes: int = Field(default=30, ge=1)
+    """`workers.shadow_validator` -- judges the evidence the corroboration writer records."""
+
+    killswitch_interval_minutes: int = Field(default=1_440, ge=1)
+    """`workers.killswitch` -- the daily grid evaluation."""
+
+    scheduler_tick_seconds: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    """How often the scheduler thread calls `Scheduler.tick()`. Not a job cadence -- it is the
+    resolution at which the cadences above are observed, so it must be well below the shortest
+    of them. Seconds, not minutes, because it is a polling interval of the same class as
+    `ingest.runner.RunnerConfig.poll_interval_s`."""
+
+
 # --------------------------------------------------------------------------- #
 # The settings root.
 # --------------------------------------------------------------------------- #
@@ -453,6 +547,12 @@ class TracebedSettings(BaseSettings):
     cache: CacheConfig = Field(default_factory=CacheConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
     queue: QueueConfig = Field(default_factory=QueueConfig)
+    # Deployment-level, like `storage`/`llm`/`auth` and unlike `queue`: see
+    # WorkersConfig's docstring for why a per-project scheduler cadence would be a
+    # knob that silently does nothing. Absent from `_SECTION_MODELS` below, which is
+    # the enforcement -- `_apply_override` refuses any dotted key whose first segment
+    # is outside `OVERRIDABLE_SECTIONS`.
+    workers: WorkersConfig = Field(default_factory=WorkersConfig)
 
 
 # --------------------------------------------------------------------------- #

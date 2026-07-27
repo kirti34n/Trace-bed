@@ -57,6 +57,37 @@ def read_all_migrations() -> MigrationList:
     return migrations
 
 
+_PSYCOPG3_SCHEME = "postgresql+psycopg://"
+
+_PLAIN_SCHEMES = ("postgresql://", "postgres://")
+
+
+def _yoyo_dsn(dsn: str) -> str:
+    """Translate a standard Postgres DSN to yoyo's psycopg3 backend scheme.
+
+    yoyo resolves its backend from the URI scheme, and it maps bare
+    `postgresql://` to a backend that imports **psycopg2**. Tracebed ships
+    **psycopg 3** (D-036: psycopg 3 is the mandated driver, and it is the one
+    entry the licence policy admits under its conditional LGPL tier). psycopg2
+    is therefore not installed and must not be — adding it would mean a second
+    LGPL dependency carried solely to run migrations.
+
+    Without this translation `get_backend()` raises
+    `ModuleNotFoundError: No module named 'psycopg2'`, which meant migrations
+    could never be applied on any machine and every integration test skipped
+    with a message that read like "no database available". CI found it on the
+    first run against a real Postgres; no amount of offline testing could have.
+
+    Callers keep using ordinary `postgresql://` DSNs — the same string the
+    application, psql and the compose file use. The scheme rewrite is local to
+    yoyo and never leaves this module.
+    """
+    for scheme in _PLAIN_SCHEMES:
+        if dsn.startswith(scheme):
+            return _PSYCOPG3_SCHEME + dsn[len(scheme) :]
+    return dsn
+
+
 def apply_migrations(dsn: str) -> list[str]:
     """Apply every pending migration in `migrations/`, in dependency order.
 
@@ -68,7 +99,7 @@ def apply_migrations(dsn: str) -> list[str]:
     the second would then re-run migrations the first already applied and
     fail on `relation ... already exists` — or, worse, partially re-run one.
     """
-    backend = get_backend(dsn)
+    backend = get_backend(_yoyo_dsn(dsn))
     migrations = read_all_migrations()
     with backend.lock():
         to_apply = backend.to_apply(migrations)
@@ -91,7 +122,7 @@ def rollback_migrations(dsn: str, *, all: bool = False) -> list[str]:
     decoration: without them this function would report a clean rollback over
     a database whose every table still exists.
     """
-    backend = get_backend(dsn)
+    backend = get_backend(_yoyo_dsn(dsn))
     migrations = read_all_migrations()
     with backend.lock():
         applied = backend.to_rollback(migrations)
@@ -110,6 +141,6 @@ def current_revision(dsn: str) -> list[str]:
     empty list means either a fresh database or one that has been fully
     rolled back.
     """
-    backend = get_backend(dsn)
+    backend = get_backend(_yoyo_dsn(dsn))
     migrations = read_all_migrations()
     return [m.id for m in backend.to_rollback(migrations)]

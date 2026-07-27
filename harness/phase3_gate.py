@@ -19,15 +19,26 @@ Same discipline as `harness/phase0_gate.py` / `harness/phase1_gate.py` /
 `harness/phase2_gate.py` (all three read first, matched here): runs
 `pytest -m phase3` once (so every assertion below is drawn from the SAME
 execution, never two runs that could disagree), the three static gates
-(`license_check.py`, `raw_sql_lint.py`, `purity_check.py`), plus EIGHT direct
+(`license_check.py`, `raw_sql_lint.py`, `purity_check.py`), plus NINE direct
 library calls for the concrete numbers a bare JUnit pass/fail cannot carry on
 its own: `harness.guessed_reward.run_guessed_reward_drill`,
 `harness.redteam.probes.run_redteam`, `harness.redteam.probes.run_sybil_probe`,
 `harness.redteam.probes.run_retirement_k_minus_one_probe`,
-`harness.lift_sim.run_lift_sim`, `harness.ledger_audit.run_ledger_audit`, and
-`harness.dependence_test.run_dependence_drill` -- then renders
-`gate_report_phase3.md` mapping every result onto the eight PLAN.md section 7
-Phase 3 clauses above, plus the baseline static-gates clause.
+`harness.lift_sim.run_lift_sim`, `harness.ledger_audit.run_ledger_audit`,
+`harness.dependence_test.run_dependence_drill`, and
+`harness.closed_loop.run_closed_loop` -- then renders `gate_report_phase3.md`
+mapping every result onto the eight PLAN.md section 7 Phase 3 clauses above,
+plus the closed-loop clause and the baseline static-gates clause.
+
+CLAUSE 9 IS NOT IN PLAN.md section 7. It was added on 2026-07-27, after
+`docs/FIDELITY-AUDIT.md` found that every worker this phase built was correct
+and none of them was reachable from a deployed process ("the learning half of
+the system is a library, not a service"). It is CI-blocking on the same terms
+as the eight named clauses, and for the same reason section 8's dependence
+drill is: the failure it guards is silent everywhere else. Its own
+measurement block states, beside the verdict, that it runs offline against
+fakes -- so a PASS is "the nine production functions compose", never "the
+learning plane is live in production".
 
 THE REPORT MUST NOT LIE (`harness/phase0_gate.py`'s own words, carried
 through every sibling gate unchanged, carried through here unchanged). Every
@@ -44,9 +55,9 @@ assertion is one of exactly four verdicts:
                             gate report's own grouping, never folded silently
                             into SKIPPED-NO-STACK.
 
-The overall verdict is ``PASS`` only when every one of the NINE assertions
-below (the eight PLAN.md section 7 Phase 3 clauses plus the static-gates
-baseline) is individually ``PASS`` AND no `-m phase3` test anywhere skipped,
+The overall verdict is ``PASS`` only when every one of the TEN assertions
+below (the eight PLAN.md section 7 Phase 3 clauses, the closed-loop drill, and
+the static-gates baseline) is individually ``PASS`` AND no `-m phase3` test anywhere skipped,
 tracked or not (mirrors every sibling gate's own `test_gate_smoke.py`-pinned
 behaviour: a skip is "this was not verified", never folded into a green top
 line). Every clause here is CI-blocking: PLAN.md section 7 Phase 3 names all
@@ -542,6 +553,49 @@ def _assertion_dependence(cases: list[Case]) -> AssertionReport:
     )
 
 
+def _assertion_closed_loop(cases: list[Case]) -> AssertionReport:
+    """The closed-loop drill -- `harness/closed_loop.py`, added in the 2026-07-27 integration
+    pass in answer to `docs/FIDELITY-AUDIT.md` §1's headline finding ("the learning half of the
+    system is a library, not a service").
+
+    Backed by BOTH the JUnit cases from `tests/phase3/test_closed_loop_drill.py` (so the drill
+    is COLLECTED, not merely runnable -- §11.1 records the same correction for the
+    guessed-reward drill) AND a direct `run_closed_loop()` call here, so this clause reports the
+    hop-by-hop result rather than a pytest tally alone.
+
+    WHAT A PASS HERE MEANS, and the disclosure belongs beside the verdict rather than 300 lines
+    below it (S34's correction): the nine production functions COMPOSE -- the row each stage
+    writes is the row the next stage reads. It does NOT mean a deployed process runs them. Ten
+    of the thirteen periodic workers are still unscheduled, each blocked on a Postgres port that
+    does not exist, and `workers.composition.UNSCHEDULED_WORKERS` names every one. The
+    measurement block below prints that list, so this clause cannot be quoted as "the learning
+    plane is live".
+    """
+    from harness.closed_loop import render_text, run_closed_loop
+
+    selected = _select(cases, classname_contains="tests.phase3.test_closed_loop_drill")
+    t = _tally(selected)
+
+    report = run_closed_loop()
+    verdict = _worse(t.verdict, "PASS" if report.closed else "FAIL")
+    passed = sum(1 for hop in report.hops if hop.passed)
+    return AssertionReport(
+        9,
+        "Closed-loop drill: trace -> Tier A candidate -> embedded -> corroborated -> shadow"
+        "-validated -> scored -> promoted -> retrievable -> status PERSISTED",
+        verdict,
+        _fmt_tally(t) + f"; direct drill: {passed}/{len(report.hops)} hops",
+        (
+            "OFFLINE AGAINST FAKES -- no Postgres/Valkey/S3 on this machine. Every hop runs "
+            "against in-memory implementations of the worker's own declared Protocol (plus the "
+            "recording fake pool for the status write, which proves the statements are ISSUED, "
+            "not that a database accepted them). A PASS is 'the loop closes when every store "
+            "method exists', not 'the loop closes in production today'.",
+            render_text(report),
+        ),
+    )
+
+
 def _assertion_static_gates(
     license_result: ProcResult, raw_sql_result: ProcResult, purity_result: ProcResult
 ) -> AssertionReport:
@@ -560,7 +614,7 @@ def _assertion_static_gates(
         f"raw_sql_lint.py: exit={raw_sql_result.returncode} ({'PASS' if raw_sql_result.ok else 'FAIL'}); "
         f"purity_check.py: exit={purity_result.returncode} ({'PASS' if purity_result.ok else 'FAIL'})"
     )
-    return AssertionReport(9, "License + raw-SQL lint + purity gate green (baseline, must not regress)", verdict, detail)
+    return AssertionReport(10, "License + raw-SQL lint + purity gate green (baseline, must not regress)", verdict, detail)
 
 
 # --------------------------------------------------------------------------- #
@@ -732,6 +786,7 @@ def run_gate(
         _assertion_ledger_and_cap(cases),
         _assertion_cross_epoch(cases),
         _assertion_dependence(cases),
+        _assertion_closed_loop(cases),
         _assertion_static_gates(license_combined, raw_sql_combined, purity_combined),
     )
 
@@ -781,11 +836,14 @@ def render_markdown(run: GateRun) -> str:
         w(
             "> **What this PASS does and does not mean.** Every clause below executed and "
             "passed against in-memory doubles. This phase contributes no integration-marked "
-            "tests, and none of the worker ports its clauses exercise has a Postgres "
-            "implementation in this tree (PLAN.md §11 M3) -- so a green verdict here is "
-            "evidence about LOGIC, and is not evidence that any of it has ever run against a "
-            "database. The verdict rule keys on skipped tests, and a phase with no "
-            "integration tests has none to skip."
+            "tests. Four of the ten worker ports M3 enumerates now DO have a Postgres "
+            "implementation (`EmbeddingRepoPort`, `CorroborationRepoPort`, "
+            "`MemoryEditRepoPort`, `ForensicsRepoPort` -- D-128), and not one of those "
+            "statements has ever been EXECUTED: no Docker/Postgres on this machine, and their "
+            "integration tests skip. The other six ports (PLAN.md §11 M3) still have no "
+            "implementation at all. So a green verdict here is evidence about LOGIC, and is "
+            "not evidence that any of it has ever run against a database. The verdict rule "
+            "keys on skipped tests, and a phase with no integration tests has none to skip."
         )
         w("")
     if run.overall_verdict == "INCOMPLETE":

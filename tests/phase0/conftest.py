@@ -87,12 +87,29 @@ def pg_pool(pg_dsn: str, _pg_pools: dict[str, ConnectionPool]) -> ConnectionPool
 
         try:
             # Idempotent: a second call against a current schema applies nothing.
-            # A DSN with DML-only rights (the `tracebed_app` role, which
-            # migrations deliberately cannot use) raises here — skip, because
-            # without a schema nothing downstream can run either. Never error.
             apply_migrations(pg_dsn)
+        except (ModuleNotFoundError, ImportError, FileNotFoundError) as exc:
+            # A BUG, NOT AN ABSENT STACK. This branch existed as a blanket
+            # `except Exception -> skip`, and it hid the single worst defect in
+            # the repository for the entire build: yoyo resolves `postgresql://`
+            # to a psycopg2 backend, Tracebed ships psycopg 3, so
+            # `apply_migrations` raised ModuleNotFoundError on EVERY machine and
+            # all ~40 integration tests skipped with a message that read like
+            # "no database available". CI ran against a real Postgres and still
+            # reported SKIPPED-NO-STACK.
+            #
+            # The module docstring's own rule is that a red gate meaning "no
+            # database" must never look like one meaning "the test failed". The
+            # inverse is worse and is what happened: a broken migration runner
+            # wearing a skip's clothing. Import and packaging errors now FAIL.
+            raise RuntimeError(
+                f"migration runner is broken, not absent: {exc.__class__.__name__}: {exc}"
+            ) from exc
         except Exception as exc:
-            pytest.skip(f"could not bring the Phase 0 schema current: {exc.__class__.__name__}")
+            # Everything else — a DSN with DML-only rights (the `tracebed_app`
+            # role, which migrations deliberately cannot use), a database that
+            # went away mid-run — is a genuine "cannot verify here" and skips.
+            pytest.skip(f"could not bring the Phase 0 schema current: {exc.__class__.__name__}: {exc}")
         _pg_pools[pg_dsn] = create_pool(pg_dsn)
     return _pg_pools[pg_dsn]
 

@@ -57,6 +57,12 @@ PARTITIONED_TABLES: tuple[str, ...] = (
     "invalidation_event",
     "spend_ledger",
     "review_queue",
+    # 14th, added with migrations/0004_lifecycle.sql. `stores.pg.lifecycle
+    # .LifecycleWriter` writes one row here per persisted `apply()` result, in the
+    # same transaction as the `memory_item` status UPDATE; without a per-project
+    # partition every one of those INSERTs fails with "no partition of relation
+    # found for row" and takes the status write down with it.
+    "memory_status_log",
 )
 
 # Grantee for every per-partition GRANT below. Must match the role created in
@@ -67,6 +73,18 @@ _APP_ROLE = "tracebed_app"
 
 # PostgreSQL's NAMEDATALEN - 1. Over this the server truncates with a NOTICE.
 _IDENT_MAX = 63
+
+# The longest name this module builds is the isolation POLICY name:
+# `<table>_p_<32 hex>_isolation` = len(table) + 3 + 32 + 10. So a table name
+# longer than 18 characters cannot be added to `PARTITIONED_TABLES` without
+# `partition_policy_name` raising for every project. That is not a theoretical
+# bound: `memory_status_log` was first written as `memory_status_history` (21),
+# which made `create_project_partitions` raise on its very first call — the
+# status writer would have been dead on arrival in any real deployment while
+# passing every offline test that did not build the policy name. Checked by
+# `tests/phase0/test_partitions.py::test_generated_identifiers_fit_postgres_limit`,
+# which is parametrised over `PARTITIONED_TABLES` and is what caught it.
+_TABLE_NAME_MAX = _IDENT_MAX - len("_p_") - 32 - len("_isolation")
 
 # The RLS predicate, character-for-character identical to the one
 # migrations/0003_rls.sql puts on the parent tables. `NULLIF(..., '')` is
@@ -81,6 +99,15 @@ _UUID_TEXT = re.compile(r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 def _require_partitioned(table: str) -> None:
     if table not in PARTITIONED_TABLES:
         raise ValueError(f"{table!r} is not a LIST-partitioned table")
+
+
+_OVERLONG_TABLES = tuple(t for t in PARTITIONED_TABLES if len(t) > _TABLE_NAME_MAX)
+if _OVERLONG_TABLES:  # pragma: no cover - import-time refusal, see _TABLE_NAME_MAX
+    raise ValueError(
+        f"PARTITIONED_TABLES entries {list(_OVERLONG_TABLES)} exceed {_TABLE_NAME_MAX} "
+        "characters, so partition_policy_name would exceed PostgreSQL's identifier limit "
+        "for every project and create_project_partitions would raise on first use"
+    )
 
 
 def _checked_ident(name: str) -> str:
@@ -209,6 +236,11 @@ _INDEX_SPECS: dict[str, tuple[tuple[str, str], ...]] = {
     "injection_log": (("mem", "(memory_id)"),),
     "review_queue": (("mem", "(memory_id)"),),
     "trace_subject": (("subject", "(subject_tag)"),),
+    # The dashboard's MemoryDetail transition-log panel and every "why is this
+    # memory in this state" query read one memory's history newest-first; without
+    # this the read is a partition scan whose cost grows with every transition the
+    # project has ever made, not with the one memory being inspected.
+    "memory_status_log": (("mem", "(memory_id, changed_at DESC)"),),
 }
 
 

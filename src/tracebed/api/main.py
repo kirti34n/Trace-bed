@@ -15,8 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from psycopg_pool import ConnectionPool
 
-from tracebed.adapters.embedding.gemini import GeminiEmbeddingClient
-from tracebed.adapters.embedding.pinning import ModelPin
+from tracebed.adapters.embedding.factory import build_embedding_driver
 from tracebed.adapters.identity import (
     ApiKeyVerifier,
     ChainVerifier,
@@ -35,7 +34,6 @@ from tracebed.domain.clock import SystemClock
 from tracebed.domain.config import ConfigResolver, TracebedSettings
 from tracebed.domain.errors import (
     AuthenticationFailed,
-    ConfigError,
     DuplicateRegistration,
     NotFound,
     ScopeResolutionFailed,
@@ -188,41 +186,16 @@ class _PoolPartitionsAdapter:
 
 
 def _build_embedder(settings: TracebedSettings, clock: SystemClock) -> EmbeddingPort:
-    """The configured `EmbeddingPort` driver, pinned (D-007, PLAN.md §6 `embedding.*`).
+    """Delegates to `adapters.embedding.factory.build_embedding_driver`.
 
-    A vector endpoint, never a generative client — invariant 1 permits exactly this
-    one outbound model call on the read path, under its own `embed_timeout_ms`
-    sub-budget. Note that this function lives in `api/`, not in `hotpath/`: the
-    driver is *injected into* the hot path, so `scripts/purity_check.py`'s
-    reachability walk over `hotpath/` still sees only `adapters.embedding`.
+    The body moved there (D-128) so the `tracebed-worker` process, whose embedding sweep is
+    the only writer of `embedding_model_id`/`embedding_model_version`, builds its driver from
+    the SAME constructor this process builds its query embedder from. Two processes reading
+    the same config through two constructors is how query vectors and stored vectors end up in
+    different spaces while every row still carries a correct-looking pin. Kept as a
+    module-private wrapper rather than deleted because `api.main`'s own tests reference it.
     """
-    pin = ModelPin(
-        model_id=settings.embedding.model_id,
-        model_version=settings.embedding.model_version,
-        dim=settings.embedding.dim,
-    )
-    if settings.embedding.driver == "onnx-local":
-        if settings.embedding.onnx_model_path is None or settings.embedding.onnx_model_hash is None:
-            raise ConfigError(
-                "embedding.driver='onnx-local' requires embedding.onnx_model_path and "
-                "embedding.onnx_model_hash (the pinned model and its integrity hash)"
-            )
-        raise ConfigError(
-            "the onnx-local embedding driver needs an injected tokenizer, which no "
-            "deployment in this repository names yet; configure embedding.driver='gemini'"
-        )
-    api_key = os.environ.get(settings.llm.api_key_env)
-    if not api_key:
-        # Loud at startup rather than a per-request `EmbeddingProviderError` that the
-        # retriever would fail open on: an embedder that can never succeed makes every
-        # single retrieval a silent `degraded_lexical`, which looks like a working
-        # deployment on every dashboard.
-        raise ConfigError(
-            f"embedding driver 'gemini' needs an API key in ${settings.llm.api_key_env}"
-        )
-    return GeminiEmbeddingClient(
-        base_url=settings.llm.base_url, api_key=api_key, pin=pin, clock=clock
-    )
+    return build_embedding_driver(settings, clock)
 
 
 def _build_pipeline(
