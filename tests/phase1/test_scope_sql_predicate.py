@@ -437,7 +437,10 @@ def test_the_scoped_arm_returns_exactly_what_scope_visible_accepts_on_a_real_dat
                 kind="k",
                 lane=Lane.OPERATIONAL,
                 trust_tier=TrustTier.A,
-                status=Status.VALIDATED,
+                # A `validated` row cannot be constructed (assert_legal_creation_status). This test
+                # only needs a *retrievable* row to prove scope visibility, and a Tier-A `candidate`
+                # is retrievable by the same predicate, so seed that status directly.
+                status=Status.CANDIDATE,
                 content=content,
                 token_count=len(content.split()),
                 provenance=Provenance(cls=ProvenanceClass.PARSER, trace_ids=(run_id,)),

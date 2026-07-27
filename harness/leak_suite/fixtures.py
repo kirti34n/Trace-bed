@@ -890,6 +890,15 @@ SEED_ROW_SQL: dict[str, str] = {
     "review_queue": (
         "INSERT INTO review_queue (project_id, reason) VALUES (%(pid)s, 'rls-probe-seed')"
     ),
+    # memory_status_log: the 14th partitioned table (migrations/0004_lifecycle.sql), added to
+    # PARTITIONED_TABLES after this fixture was first written. `from_status <> to_status` is a
+    # table CHECK; history_id/reason/evidence/changed_at all default. Without this seed the
+    # probe-7 fixture aborts on `seed_all_partitioned_tables`'s completeness assertion before it
+    # can make its RLS claim, leaving the cross-project wall unverified.
+    "memory_status_log": (
+        "INSERT INTO memory_status_log (project_id, memory_id, from_status, to_status)"
+        " VALUES (%(pid)s, gen_random_uuid(), 'quarantined', 'candidate')"
+    ),
 }
 
 

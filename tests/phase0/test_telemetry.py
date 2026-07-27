@@ -225,8 +225,25 @@ def test_retrieval_and_injection_rows_land_under_callers_project_only(
     assert len(injection_rows) == 1
     assert str(injection_rows[0][0]) == str(memory_id.value)
 
-    # The wall: project B's own scoped connection sees neither row for this run_id.
-    with scoped(pg_pool, scope_b.project_id) as conn, conn.cursor() as cur:
+    # The wall: project B's own connection sees neither row for this run_id. This MUST run as the
+    # non-BYPASSRLS `tracebed_app` role: the shared `pg_pool` connects as the table owner, and
+    # `FORCE ROW LEVEL SECURITY` does not apply to a superuser/BYPASSRLS role, so a `scoped()`
+    # check on that pool would prove nothing. `tracebed_app` is the role the service runs as in
+    # production, where this wall actually stands.
+    import os
+
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+
+    pg_dsn = _require_fixture(request, "pg_dsn")
+    app_dsn = make_conninfo(
+        pg_dsn, user="tracebed_app", password=os.environ.get("TB_APP_ROLE_PASSWORD", "tracebed_app_dev")
+    )
+    with psycopg.connect(app_dsn) as bconn, bconn.cursor() as cur:
+        cur.execute(
+            "SELECT set_config('tracebed.project_id', %(pid)s, true)",
+            {"pid": str(scope_b.project_id.value)},
+        )
         cur.execute("SELECT 1 FROM retrieval_event WHERE run_id = %(run_id)s", {"run_id": run_id})
         assert cur.fetchone() is None
         cur.execute("SELECT 1 FROM injection_log WHERE run_id = %(run_id)s", {"run_id": run_id})

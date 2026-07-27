@@ -821,9 +821,16 @@ def test_pgvector_ann_search_and_delete_by_project_against_a_real_database(pg: s
         try:
             with scoped(pool, project_id) as conn:
                 conn.execute(
-                    "UPDATE memory_item SET embedding = %(embedding)s::halfvec "
+                    "UPDATE memory_item SET embedding = %(embedding)s::halfvec, "
+                    "embedding_model_id = %(model_id)s, embedding_model_version = %(model_version)s "
                     "WHERE project_id = %(project_id)s AND id = %(id)s",
-                    {"embedding": literal, "project_id": project_id, "id": memory_id},
+                    {
+                        "embedding": literal,
+                        "model_id": "m",
+                        "model_version": "v1",
+                        "project_id": project_id,
+                        "id": memory_id,
+                    },
                 )
         except psycopg.errors.UndefinedObject as exc:
             pytest.skip(f"halfvec type unavailable: {exc}")

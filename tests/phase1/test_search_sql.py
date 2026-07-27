@@ -542,6 +542,14 @@ def test_retrievable_predicate_holds_against_a_real_database(pg: str) -> None:
         run_id = mint_run_id()
 
         def _insert(content: str, *, status: Status, tier: TrustTier) -> MemoryId:
+            from tracebed.domain.state_machine import LEGAL_CREATION_STATUSES
+
+            # NewMemoryItem forbids constructing a row at a non-creation status
+            # (assert_legal_creation_status: memories are born candidate/quarantined/pinned and
+            # reach validated/tombstoned/... only by transition). This test deliberately plants
+            # rows at those statuses purely to prove the retrievability SQL predicate, so it
+            # inserts at a legal creation status and applies the intended one with a direct UPDATE.
+            create_status = status if status in LEGAL_CREATION_STATUSES else Status.CANDIDATE
             item = NewMemoryItem(
                 scope_type=ScopeType.PROJECT_SHARED,
                 scope_id=None,
@@ -549,7 +557,7 @@ def test_retrievable_predicate_holds_against_a_real_database(pg: str) -> None:
                 kind="k",
                 lane=Lane.OPERATIONAL,
                 trust_tier=tier,
-                status=status,
+                status=create_status,
                 content=content,
                 token_count=len(content.split()),
                 provenance=Provenance(cls=ProvenanceClass.PARSER, trace_ids=(run_id,)),
@@ -564,7 +572,15 @@ def test_retrievable_predicate_holds_against_a_real_database(pg: str) -> None:
                     lane=Lane.OPERATIONAL,
                 ),
             ).verdict()
-            return repo.insert_memory_item(project_id, item, verdict)
+            mem_id = repo.insert_memory_item(project_id, item, verdict)
+            if create_status is not status:
+                with pool.connection() as conn:
+                    conn.execute(
+                        "UPDATE memory_item SET status = %s WHERE project_id = %s AND id = %s",
+                        (status.value, project_id.value, mem_id.value),
+                    )
+                    conn.commit()
+            return mem_id
 
         validated_id = _insert(
             "retry the flaky tool with jittered backoff", status=Status.VALIDATED, tier=TrustTier.A

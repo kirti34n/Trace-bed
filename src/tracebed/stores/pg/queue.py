@@ -388,7 +388,16 @@ class WorkQueue:
             cur.execute(_DEAD_LETTER_SQL, {"topic": topic, "n": batch})
             cur.execute(_CLAIM_SQL, {"topic": topic, "lease": self._lease, "n": batch})
             rows = cur.fetchall()
-        return [_row_to_item(row) for row in rows]
+        # `_CLAIM_SQL`'s inner `SELECT ... ORDER BY priority, id ... LIMIT n` decides WHICH rows
+        # are claimed, but `UPDATE ... RETURNING` does NOT return rows in a subquery's order —
+        # Postgres yields them in an unspecified, physically-driven order (id order, in practice).
+        # Sort the materialised batch here so `claim()` hands the caller highest-priority-first,
+        # as its contract (and `test_claim_orders_by_priority_then_id`) requires. Kept here rather
+        # than wrapping the UPDATE in an ordered CTE so `_CLAIM_SQL` stays the single UPDATE the
+        # offline guards pin (FOR UPDATE SKIP LOCKED on the inner select; RETURNING last).
+        items = [_row_to_item(row) for row in rows]
+        items.sort(key=lambda item: (item.priority, item.id))
+        return items
 
     def ack(self, item_id: int) -> None:
         """DELETE — the only success path. Acking an id that is already gone (redelivered

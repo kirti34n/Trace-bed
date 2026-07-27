@@ -388,8 +388,7 @@ def test_persist_status_round_trip_against_postgres(pg: str) -> None:
         token_count=4,
         provenance=Provenance(cls=ProvenanceClass.PARSER, trace_ids=(mint_run_id(),)),
     )
-    from tracebed.core.scans import scan
-    from tracebed.domain.scan import ScanContext
+    from tracebed.core.scans import ScanContext, scan
 
     verdict: ScanVerdict = scan(
         item.content,

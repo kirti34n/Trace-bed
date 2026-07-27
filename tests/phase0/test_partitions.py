@@ -224,7 +224,7 @@ def test_grants_are_dml_only(table: str) -> None:
 def test_memory_item_gets_both_retrieval_indexes() -> None:
     stmts = " | ".join(partition_index_statements("memory_item", PID_A))
     assert "USING hnsw (embedding halfvec_cosine_ops)" in stmts
-    assert "USING bm25 (content)" in stmts
+    assert "USING gin (lexemes)" in stmts
 
 
 def test_index_statements_are_idempotent_and_scoped_to_the_partition() -> None:
@@ -500,8 +500,12 @@ _SEED_ROWS: dict[str, str] = {
         " VALUES (gen_random_uuid(), %(pid)s, 'empty_result', 5, 'memory_on')"
     ),
     "blackboard_entry": (
-        "INSERT INTO blackboard_entry (project_id, run_id, branch_id, author_agent, key)"
-        " VALUES (%(pid)s, gen_random_uuid(), 'main', 'seed-agent', 'k')"
+        # author_agent is uuid NOT NULL and value_ref/status are NOT NULL
+        # (migrations/0002_partitioned.sql); the prior seed put the string 'seed-agent' into the
+        # uuid author_agent column and omitted value_ref/status, so it never ran against real PG.
+        "INSERT INTO blackboard_entry"
+        " (project_id, run_id, branch_id, author_agent, key, value_ref, status)"
+        " VALUES (%(pid)s, gen_random_uuid(), 'main', gen_random_uuid(), 'k', 'seed-ref', 'committed')"
     ),
     "invalidation_event": (
         "INSERT INTO invalidation_event (project_id, event_type) VALUES (%(pid)s, 'seed')"
@@ -511,6 +515,12 @@ _SEED_ROWS: dict[str, str] = {
         " VALUES (%(pid)s, CURRENT_DATE, 'seed', 'm')"
     ),
     "review_queue": "INSERT INTO review_queue (project_id, reason) VALUES (%(pid)s, 'seed')",
+    # memory_status_log: the 14th partitioned table (migrations/0004_lifecycle.sql), added to
+    # PARTITIONED_TABLES after this dict was written; from_status <> to_status is a table CHECK.
+    "memory_status_log": (
+        "INSERT INTO memory_status_log (project_id, memory_id, from_status, to_status)"
+        " VALUES (%(pid)s, gen_random_uuid(), 'quarantined', 'candidate')"
+    ),
 }
 
 

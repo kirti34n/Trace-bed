@@ -42,11 +42,18 @@ services:
       - -c
       - idle_in_transaction_session_timeout=60s
       - -c
-      - shared_preload_libraries=pg_stat_statements
+      # vchord_bm25 (the BM25 lexical arm — the mandated pg_textsearch is a phantom, absent from
+      # this image and not a real extension) and its pg_tokenizer dependency must be preloaded;
+      # both refuse to CREATE EXTENSION otherwise. pgvector needs no preload.
+      - shared_preload_libraries=pg_stat_statements,pg_tokenizer,vchord_bm25
     ports:
       - "5442:5432"   # not 5432: this must not collide with a host Postgres
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # PG18's Docker image stores data in a major-version subdirectory and refuses to boot when
+      # the volume is mounted at the legacy /var/lib/postgresql/data (docker-library/postgres #1259:
+      # "there appears to be PostgreSQL data in ... (unused mount/volume)"). Mount the parent;
+      # the entrypoint then initialises /var/lib/postgresql/18/docker inside it.
+      - pgdata:/var/lib/postgresql
       - ./initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tracebed_owner -d tracebed"]

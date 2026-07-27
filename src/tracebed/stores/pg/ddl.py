@@ -219,11 +219,14 @@ def partition_grant_statements(table: str, project_id: ProjectId) -> list[str]:
 _INDEX_SPECS: dict[str, tuple[tuple[str, str], ...]] = {
     "memory_item": (
         ("hnsw", "USING hnsw (embedding halfvec_cosine_ops)"),
-        # pg_textsearch indexes the source text column directly (it maintains
-        # its own on-disk representation internally); `lexemes` stays a plain
-        # tsvector column for the zero-extension ts_rank fallback
-        # (DECISIONS D-003), not what this index is built over.
-        ("bm25", "USING bm25 (content) WITH (text_config='english')"),
+        # Rarity-gate document-frequency source: GIN over the `lexemes` tsvector supports the
+        # `lexemes @@ to_tsquery(...)` counting in search.document_frequency — an EXACT document
+        # frequency, which is the quantity the abstention rarity gate reads (D-003 rejected
+        # ts_rank's *ranking*, not tsvector *matching*). The true BM25 *ranking* index —
+        # vchord_bm25 over a `content_bm25 bm25vector` column — is added alongside that column
+        # (STAGE 2). This replaced the phantom `USING bm25 (content) WITH (text_config='english')`:
+        # pg_textsearch never existed, and vchord_bm25's `bm25` access method rejects `text_config`.
+        ("lex", "USING gin (lexemes)"),
         ("status", "(status)"),
         ("subject", "(subject_tag)"),
         ("verdict", "(scan_verdict_id)"),

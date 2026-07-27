@@ -174,7 +174,8 @@ class TestRegistriesStructure:
     def test_extensions_declared(self) -> None:
         sql = _read("0001_registries.sql")
         assert re.search(r"CREATE EXTENSION.*\bvector\b", sql, re.IGNORECASE)
-        assert re.search(r"CREATE EXTENSION.*\bpg_textsearch\b", sql, re.IGNORECASE)
+        assert re.search(r"CREATE EXTENSION.*\bvchord_bm25\b", sql, re.IGNORECASE)
+        assert re.search(r"CREATE EXTENSION.*\bpg_tokenizer\b", sql, re.IGNORECASE)
 
     @pytest.mark.parametrize("table", REGISTRY_TABLES)
     def test_registry_table_present(self, table: str) -> None:
@@ -442,7 +443,8 @@ class TestMigrationsIntegration:
             cur.execute("SELECT extname FROM pg_extension")
             names = {row[0] for row in cur.fetchall()}
         assert "vector" in names
-        assert "pg_textsearch" in names
+        assert "vchord_bm25" in names
+        assert "pg_tokenizer" in names
 
     def test_app_role_attributes(self, pg_pool: Any) -> None:
         """Invariant 4's backstop is void if the role the service connects as

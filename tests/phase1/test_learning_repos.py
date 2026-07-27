@@ -810,7 +810,12 @@ def _seed_two_rows(pool: Any, project_id: ProjectId) -> tuple[MemoryId, MemoryId
 
     def _insert(content: str, *, status: Status, tier: TrustTier) -> MemoryId:
         from tracebed.domain.memory import NewMemoryItem
+        from tracebed.domain.state_machine import LEGAL_CREATION_STATUSES
 
+        # NewMemoryItem forbids constructing a `validated` row (assert_legal_creation_status:
+        # memories are born candidate/quarantined/pinned and reach `validated` by transition).
+        # Seed at a legal creation status, then apply the intended status with a direct UPDATE.
+        create_status = status if status in LEGAL_CREATION_STATUSES else Status.CANDIDATE
         item = NewMemoryItem(
             scope_type=ScopeType.PROJECT_SHARED,
             scope_id=None,
@@ -818,7 +823,7 @@ def _seed_two_rows(pool: Any, project_id: ProjectId) -> tuple[MemoryId, MemoryId
             kind="k",
             lane=Lane.OPERATIONAL,
             trust_tier=tier,
-            status=status,
+            status=create_status,
             content=content,
             token_count=len(content.split()),
             provenance=Provenance(cls=ProvenanceClass.PARSER, trace_ids=(run_id,)),
@@ -833,7 +838,15 @@ def _seed_two_rows(pool: Any, project_id: ProjectId) -> tuple[MemoryId, MemoryId
                 lane=Lane.OPERATIONAL,
             ),
         ).verdict()
-        return repo.insert_memory_item(project_id, item, verdict)
+        mem_id = repo.insert_memory_item(project_id, item, verdict)
+        if create_status is not status:
+            with pool.connection() as conn:
+                conn.execute(
+                    "UPDATE memory_item SET status = %s WHERE project_id = %s AND id = %s",
+                    (status.value, project_id.value, mem_id.value),
+                )
+                conn.commit()
+        return mem_id
 
     validated_id = _insert("retry with jittered backoff", status=Status.VALIDATED, tier=TrustTier.A)
     quarantined_id = _insert("an unconfirmed lesson", status=Status.QUARANTINED, tier=TrustTier.B)

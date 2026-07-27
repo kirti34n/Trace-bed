@@ -9,12 +9,18 @@
 -- project-scoped agent output and must be walled per invariant 4 — lives in
 -- 0002_partitioned.sql, where RLS is added in 0003_rls.sql.
 
--- pgvector (halfvec ANN indexes, DECISIONS D-007) and pg_textsearch (true
--- BM25 lexical ranking, DECISIONS D-003 — ts_rank is demoted to a
--- zero-extension fallback because it has no IDF and the abstention rarity
--- gate *is* an IDF computation, PLAN.md §6 abstention.rarity_*).
+-- pgvector (halfvec ANN indexes, DECISIONS D-007) and vchord_bm25 (true BM25
+-- lexical ranking, DECISIONS D-003). The originally-specified `pg_textsearch`
+-- is a phantom — absent from the pinned image and not a real extension; the
+-- image's BM25 engine is vchord_bm25 (+ its pg_tokenizer dependency, which is
+-- why both are in shared_preload_libraries). BM25 *scoring* comes from
+-- vchord_bm25; the abstention rarity gate's per-term document frequency
+-- (PLAN.md §6 abstention.rarity_*) is counted off the `lexemes` tsvector column
+-- via `@@` — an exact document frequency, which is the quantity the gate needs
+-- (D-003 rejected ts_rank's *ranking*, not tsvector *matching*).
 CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pg_textsearch;
+CREATE EXTENSION IF NOT EXISTS pg_tokenizer;
+CREATE EXTENSION IF NOT EXISTS vchord_bm25;
 
 -- project: the registry root. deleted_at is a soft-delete marker only — the
 -- actual removal of a project's learning-plane data happens through
