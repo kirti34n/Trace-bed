@@ -1,0 +1,39 @@
+# Container-image policy (D-109).
+#
+# `scripts/license_check.py` walks Python distributions only, so every container image this
+# repository runs — the database that holds the vault, the cache, the object store — was outside
+# every gate. Hard rule 9's three named AGPL hazards (pg_search, MinIO, Redis) are all
+# infrastructure, i.e. exactly the category the Python audit cannot reach.
+#
+# Rule: every `image:` in `docker/compose.yaml` and `.github/workflows/ci.yml` must appear here.
+# `scripts/image_check.py` fails the build otherwise. A floating tag (`latest`, or any tag ending
+# in `-latest`) must additionally set `floating_tag = true` — the check does not forbid one, it
+# forbids an UNDECLARED one, because the risk is being unaware of it rather than having it.
+
+[[image]]
+repository = "tensorchord/vchord-suite"
+tag = "pg18-latest"
+floating_tag = true
+licence = "Apache-2.0 (VectorChord); PostgreSQL License (server)"
+purpose = "Postgres 18 + pgvector/VectorChord + pg_textsearch — the store, dev and CI"
+note = """Named in no PLAN.md or DECISIONS.md entry before D-109, on a floating tag. The tag is
+accepted for now because pinning by digest needs network access the build machine does not have,
+and a wrong digest fails CI in a way that reads as a code failure. Owner action: pin a digest
+from a machine with registry access, then set floating_tag = false."""
+
+[[image]]
+repository = "valkey/valkey"
+tag = "8-alpine"
+floating_tag = false
+licence = "BSD-3-Clause"
+purpose = "Working memory and tool cache. Valkey, not Redis — D-005's denylist covers RSAL."
+
+[[image]]
+repository = "chrislusf/seaweedfs"
+tag = "latest"
+floating_tag = true
+licence = "Apache-2.0"
+purpose = "S3-compatible trace archive (D-006: SeaweedFS, not MinIO)"
+note = """`latest` on an object store that holds encrypted trace payloads is the worst floating
+tag in this file: an unattended pull can change the storage engine under a live archive. Same
+owner action as above, and it should be done first."""

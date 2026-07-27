@@ -1,0 +1,987 @@
+<title>Tracebed — Memory Flow &amp; Lifecycle</title>
+
+<style>
+  :root {
+    --paper:      #FBFAF7;
+    --plate:      #F4F2EC;
+    --ground:     #FAF9F6;
+    --surface:    #FFFFFF;
+    --ink:        #1B1D21;
+    --ink-soft:   #4A4E56;
+    --ink-faint:  #797E88;
+    --rule:       #DCD8CE;
+    --rule-soft:  #E9E6DE;
+    --brass:      #96702A;
+    --brass-soft: #EFE6D2;
+
+    --s-trace:    #5A6B7A;
+    --s-quar:     #A9762B;
+    --s-cand:     #7A6E4F;
+    --s-valid:    #3F6B52;
+    --s-stale:    #7C818B;
+    --s-retired:  #8E5147;
+
+    --measure: 68ch;
+    --step: clamp(1rem, 0.6rem + 1.4vw, 1.5rem);
+
+    --font-display: Georgia, "Iowan Old Style", "Palatino Linotype", "Times New Roman", serif;
+    --font-body: ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, "Cascadia Code", Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:     #131519;
+      --surface:    #191C21;
+      --ink:        #E8E6E0;
+      --ink-soft:   #B0B4BC;
+      --ink-faint:  #838994;
+      --rule:       #2C3037;
+      --rule-soft:  #23272D;
+      --brass:      #C9A159;
+      --brass-soft: #2A2418;
+
+      --s-trace:    #8CA3B8;
+      --s-quar:     #D3A45E;
+      --s-cand:     #B5A87E;
+      --s-valid:    #6FA888;
+      --s-stale:    #99A0AB;
+      --s-retired:  #C08277;
+    }
+  }
+
+  :root[data-theme="light"] {
+    --ground:     #FAF9F6;
+    --surface:    #FFFFFF;
+    --ink:        #1B1D21;
+    --ink-soft:   #4A4E56;
+    --ink-faint:  #797E88;
+    --rule:       #DCD8CE;
+    --rule-soft:  #E9E6DE;
+    --brass:      #96702A;
+    --brass-soft: #EFE6D2;
+    --s-trace:    #5A6B7A;
+    --s-quar:     #A9762B;
+    --s-cand:     #7A6E4F;
+    --s-valid:    #3F6B52;
+    --s-stale:    #7C818B;
+    --s-retired:  #8E5147;
+  }
+
+  :root[data-theme="dark"] {
+    --ground:     #131519;
+    --surface:    #191C21;
+    --ink:        #E8E6E0;
+    --ink-soft:   #B0B4BC;
+    --ink-faint:  #838994;
+    --rule:       #2C3037;
+    --rule-soft:  #23272D;
+    --brass:      #C9A159;
+    --brass-soft: #2A2418;
+    --s-trace:    #8CA3B8;
+    --s-quar:     #D3A45E;
+    --s-cand:     #B5A87E;
+    --s-valid:    #6FA888;
+    --s-stale:    #99A0AB;
+    --s-retired:  #C08277;
+  }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 16.5px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 78rem;
+    margin: 0 auto;
+    padding: clamp(2rem, 5vw, 4.5rem) clamp(1.1rem, 4vw, 3rem) 5rem;
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--step) * 2.4);
+  }
+
+  /* ---- masthead ---- */
+  .masthead { display: flex; flex-direction: column; gap: 0.9rem; }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.2rem;
+  }
+  .eyebrow b { color: var(--brass); font-weight: 600; }
+  h1 {
+    font-family: var(--font-display);
+    font-size: clamp(2.1rem, 1.3rem + 3.2vw, 3.4rem);
+    line-height: 1.06;
+    letter-spacing: -0.018em;
+    font-weight: 400;
+    text-wrap: balance;
+    margin: 0;
+  }
+  h1 em { font-style: italic; color: var(--brass); }
+  .standfirst {
+    max-width: var(--measure);
+    font-size: 1.07rem;
+    color: var(--ink-soft);
+    text-wrap: pretty;
+  }
+  .rule-brass { height: 2px; background: var(--brass); width: 3.6rem; }
+
+  /* ---- sections ---- */
+  section { display: flex; flex-direction: column; gap: 1.15rem; scroll-margin-top: 2rem; }
+  .sec-head { display: flex; flex-direction: column; gap: 0.35rem; border-top: 1px solid var(--rule); padding-top: 1.1rem; }
+  .sec-num {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.16em;
+    color: var(--brass);
+    text-transform: uppercase;
+  }
+  h2 {
+    font-family: var(--font-display);
+    font-size: clamp(1.4rem, 1.05rem + 1.3vw, 1.95rem);
+    line-height: 1.18;
+    font-weight: 400;
+    letter-spacing: -0.012em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--font-body);
+    font-size: 0.86rem;
+    font-weight: 650;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    margin: 0;
+  }
+  p { max-width: var(--measure); margin: 0; text-wrap: pretty; }
+  p + p { margin-top: 0.7rem; }
+  .lede { font-size: 1.02rem; color: var(--ink-soft); }
+  strong { font-weight: 640; color: var(--ink); }
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.87em;
+    background: var(--rule-soft);
+    padding: 0.1em 0.34em;
+    border-radius: 3px;
+    word-break: break-word;
+  }
+
+  /* ---- diagram plate ---- */
+  /* Diagrams are printed plates: same paper in both themes, so mermaid's
+     own rendering stays legible regardless of the viewer's theme. */
+  .plate {
+    background: #F4F2EC;
+    border: 1px solid #D8D3C7;
+    border-radius: 2px;
+    padding: 1.4rem 1.1rem 1.1rem;
+    overflow-x: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+  }
+  .plate .mermaid { display: flex; justify-content: center; min-width: min-content; }
+
+  /* Mermaid renders theme-aware, and the host injects dark-mode fills that beat
+     the %%{init}%% directive — which put dark nodes and dark text on our light
+     plates. Plates are always paper, so pin the SVG internals to the plate's
+     own palette and let nothing override them. */
+  /* Mermaid emits width="100%" + a max-width style, so a wide diagram gets scaled
+     down to the container and the text becomes unreadable. Force intrinsic size and
+     let the plate scroll instead. */
+  .plate svg {
+    background: transparent !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    height: auto !important;
+  }
+  .plate.zoomed { overflow-x: auto; }
+  .plate.zoomed svg { width: auto !important; max-width: none !important; }
+  .plate.zoomed .mermaid { justify-content: flex-start; }
+
+  .zoom-btn {
+    align-self: flex-start;
+    position: sticky;
+    left: 0;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: #6B6659;
+    background: #FBFAF7;
+    border: 1px solid #D8D3C7;
+    border-radius: 2px;
+    padding: 0.32rem 0.7rem;
+    cursor: pointer;
+  }
+  .zoom-btn:hover { background: #FFFFFF; color: #1B1D21; border-color: #B9B2A2; }
+  .zoom-btn:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
+
+  /* Label text: mermaid sizes most labels from the init fontSize, but edge and
+     cluster labels are rendered as HTML in foreignObject and inherit page styles. */
+  .plate svg foreignObject div,
+  .plate svg foreignObject span,
+  .plate svg foreignObject p,
+  .plate svg .nodeLabel,
+  .plate svg .edgeLabel,
+  .plate svg .cluster-label {
+    font-size: 17px !important;
+    line-height: 1.35 !important;
+    font-family: var(--font-mono) !important;
+  }
+  .plate svg .cluster-label,
+  .plate svg .cluster-label span,
+  .plate svg .cluster-label p {
+    font-size: 15px !important;
+    letter-spacing: 0.06em;
+    font-weight: 600 !important;
+  }
+  .plate svg text { font-size: 17px !important; }
+  .plate svg .messageText { font-size: 16px !important; }
+
+  .plate svg .node rect,
+  .plate svg .node polygon,
+  .plate svg .node circle,
+  .plate svg .node ellipse,
+  .plate svg .node path,
+  .plate svg .statediagram-state rect,
+  .plate svg rect.actor,
+  .plate svg .note rect,
+  .plate svg .labelBox,
+  .plate svg .activation0 {
+    fill: #E9E5DA !important;
+    stroke: #8A8474 !important;
+  }
+
+  .plate svg .cluster rect,
+  .plate svg .statediagram-cluster rect {
+    fill: #FDFCF9 !important;
+    stroke: #C6C0B1 !important;
+  }
+
+  .plate svg .note rect { fill: #F0E7D3 !important; stroke: #B99A55 !important; }
+
+  .plate svg text,
+  .plate svg text.actor,
+  .plate svg .nodeLabel,
+  .plate svg .cluster-label,
+  .plate svg .titleText,
+  .plate svg .messageText,
+  .plate svg .noteText,
+  .plate svg .stateLabel,
+  .plate svg .loopText,
+  .plate svg .sequenceNumber,
+  .plate svg foreignObject div,
+  .plate svg foreignObject span,
+  .plate svg foreignObject p {
+    fill: #1B1D21 !important;
+    color: #1B1D21 !important;
+  }
+
+  /* autonumber bubbles: light disc, dark numeral, same as every other node */
+  .plate svg circle { fill: #E9E5DA !important; stroke: #8A8474 !important; }
+
+  .plate svg .edgeLabel rect,
+  .plate svg .edgeLabel .label-container,
+  .plate svg foreignObject div.edgeLabel,
+  .plate svg .edgeLabel > div,
+  .plate svg .labelBkg {
+    fill: #F4F2EC !important;
+    background-color: #F4F2EC !important;
+    background: #F4F2EC !important;
+    opacity: 1 !important;
+  }
+
+  .plate svg .edgePath path,
+  .plate svg .flowchart-link,
+  .plate svg .transition,
+  .plate svg .messageLine0,
+  .plate svg .messageLine1,
+  .plate svg .actor-line,
+  .plate svg line {
+    stroke: #6E6A5E !important;
+  }
+
+  .plate svg marker path,
+  .plate svg .arrowheadPath,
+  .plate svg .marker {
+    fill: #6E6A5E !important;
+    stroke: #6E6A5E !important;
+  }
+
+  .plate svg .statediagram-state .start-state,
+  .plate svg .node .state-start,
+  .plate svg circle.state-start { fill: #4A4E56 !important; stroke: #4A4E56 !important; }
+  .plate-cap {
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    letter-spacing: 0.07em;
+    color: #6B6659;
+    border-top: 1px solid #DFDACE;
+    padding-top: 0.7rem;
+    line-height: 1.5;
+  }
+  .plate-cap .scroll-hint { color: #938D7C; }
+
+  /* ---- step list ---- */
+  ol.steps { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.55rem; max-width: var(--measure); counter-reset: st; }
+  ol.steps li {
+    display: grid;
+    grid-template-columns: 2.1rem 1fr;
+    gap: 0.7rem;
+    align-items: baseline;
+    counter-increment: st;
+    font-size: 0.95rem;
+    color: var(--ink-soft);
+  }
+  ol.steps li::before {
+    content: counter(st, decimal-leading-zero);
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--brass);
+    font-variant-numeric: tabular-nums;
+  }
+  ol.steps li b { color: var(--ink); font-weight: 620; }
+
+  ul.plain { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.5rem; max-width: var(--measure); }
+  ul.plain li { display: grid; grid-template-columns: 0.85rem 1fr; gap: 0.6rem; font-size: 0.95rem; color: var(--ink-soft); }
+  ul.plain li::before { content: "—"; color: var(--brass); font-family: var(--font-mono); font-size: 0.8rem; }
+
+  /* ---- tables ---- */
+  .tablewrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 2px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; min-width: 34rem; font-size: 0.88rem; }
+  th, td { text-align: left; padding: 0.62rem 0.85rem; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+  thead th {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    background: var(--rule-soft);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num, th.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.mono { font-family: var(--font-mono); font-size: 0.82rem; }
+
+  /* ---- state legend ---- */
+  .legend { display: flex; flex-wrap: wrap; gap: 0.45rem 0.7rem; }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.42rem;
+    font-family: var(--font-mono);
+    font-size: 0.71rem;
+    letter-spacing: 0.05em;
+    color: var(--ink-soft);
+    border: 1px solid var(--rule);
+    border-radius: 999px;
+    padding: 0.24rem 0.62rem 0.24rem 0.46rem;
+    background: var(--surface);
+  }
+  .dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; flex: none; }
+
+  /* ---- ranked options ---- */
+  ol.ranked {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+  }
+  ol.ranked > li {
+    background: var(--surface);
+    padding: 1rem 1.15rem;
+    display: grid;
+    grid-template-columns: 2rem 1fr;
+    gap: 0.45rem 0.8rem;
+    align-items: start;
+  }
+  ol.ranked .rk {
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    color: var(--brass);
+    font-variant-numeric: tabular-nums;
+    padding-top: 0.22rem;
+  }
+  ol.ranked .hd {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.45rem 0.7rem;
+  }
+  ol.ranked .hd b { font-size: 1.02rem; font-weight: 650; letter-spacing: -0.005em; }
+  ol.ranked .body {
+    grid-column: 2;
+    margin: 0;
+    font-size: 0.93rem;
+    color: var(--ink-soft);
+    max-width: 62ch;
+  }
+  .verdict {
+    font-family: var(--font-mono);
+    font-size: 0.63rem;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    padding: 0.2rem 0.55rem;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+    white-space: nowrap;
+  }
+  .v-yes { color: var(--s-valid); }
+  .v-mid { color: var(--s-stale); }
+  .v-no  { color: var(--s-retired); }
+
+  @media (max-width: 34rem) {
+    ol.ranked > li { grid-template-columns: 1fr; }
+    ol.ranked .body { grid-column: 1; }
+  }
+
+  /* ---- callout ---- */
+  .note {
+    border-left: 2px solid var(--brass);
+    background: var(--brass-soft);
+    padding: 0.85rem 1.05rem;
+    max-width: var(--measure);
+    font-size: 0.92rem;
+    color: var(--ink-soft);
+    display: grid;
+    gap: 0.4rem;
+  }
+  .note b { color: var(--ink); font-weight: 640; }
+  .note .tag {
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--brass);
+  }
+
+  /* ---- budget strip ---- */
+  .strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 2px; }
+  .strip > div { background: var(--surface); padding: 0.85rem 0.95rem; display: grid; gap: 0.2rem; }
+  .strip dt { font-family: var(--font-mono); font-size: 0.66rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-faint); }
+  .strip dd { margin: 0; font-family: var(--font-display); font-size: 1.35rem; font-variant-numeric: tabular-nums; color: var(--ink); }
+  .strip small { font-size: 0.76rem; color: var(--ink-faint); font-family: var(--font-body); }
+
+  footer {
+    border-top: 1px solid var(--rule);
+    padding-top: 1.1rem;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem 1.4rem;
+  }
+
+  a { color: var(--brass); }
+  a:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--brass); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+  /* ============================================================
+     HARD OVERRIDE — last rule wins, and the extra specificity beats
+     any id-scoped `#mermaid-N .node rect` the host injects with its
+     own !important. Everything inside a plate is paper + ink, always.
+     ============================================================ */
+
+  /* every node shape */
+  .wrap .plate svg[id] g.node > rect,
+  .wrap .plate svg[id] g.node > path,
+  .wrap .plate svg[id] g.node > polygon,
+  .wrap .plate svg[id] g.node > circle,
+  .wrap .plate svg[id] g.node > ellipse,
+  .wrap .plate svg[id] g.node .label-container,
+  .wrap .plate svg[id] g.node .outer-path,
+  .wrap .plate svg[id] g.node .inner-path,
+  .wrap .plate svg[id] .statediagram-state > rect,
+  .wrap .plate svg[id] rect.actor,
+  .wrap .plate svg[id] .actor-top,
+  .wrap .plate svg[id] .actor-bottom {
+    fill: #E9E5DA !important;
+    stroke: #8A8474 !important;
+  }
+
+  /* subgraph / cluster containers sit behind their nodes */
+  .wrap .plate svg[id] g.cluster > rect,
+  .wrap .plate svg[id] .cluster > rect,
+  .wrap .plate svg[id] .statediagram-cluster > rect {
+    fill: #FDFCF9 !important;
+    stroke: #C6C0B1 !important;
+  }
+
+  /* notes keep the brass tint */
+  .wrap .plate svg[id] .note > rect,
+  .wrap .plate svg[id] g.note rect {
+    fill: #F0E7D3 !important;
+    stroke: #B99A55 !important;
+  }
+
+  /* node + cluster labels: no chip behind them, ink text */
+  .wrap .plate svg[id] g.node foreignObject div,
+  .wrap .plate svg[id] g.node foreignObject span,
+  .wrap .plate svg[id] g.node foreignObject p,
+  .wrap .plate svg[id] .nodeLabel,
+  .wrap .plate svg[id] .nodeLabel *,
+  .wrap .plate svg[id] .cluster-label,
+  .wrap .plate svg[id] .cluster-label * {
+    background: transparent !important;
+    background-color: transparent !important;
+    color: #1B1D21 !important;
+    fill: #1B1D21 !important;
+  }
+
+  /* edge labels: paper chip so the connector does not strike through */
+  .wrap .plate svg[id] .edgeLabel,
+  .wrap .plate svg[id] .edgeLabel *,
+  .wrap .plate svg[id] .labelBkg,
+  .wrap .plate svg[id] .labelBkg * {
+    background: #F4F2EC !important;
+    background-color: #F4F2EC !important;
+    color: #1B1D21 !important;
+    opacity: 1 !important;
+  }
+  .wrap .plate svg[id] .edgeLabel rect,
+  .wrap .plate svg[id] .labelBkg rect,
+  .wrap .plate svg[id] rect.labelBkg {
+    fill: #F4F2EC !important;
+    stroke: none !important;
+  }
+
+  /* every remaining glyph */
+  .wrap .plate svg[id] text,
+  .wrap .plate svg[id] text tspan,
+  .wrap .plate svg[id] .messageText,
+  .wrap .plate svg[id] .noteText,
+  .wrap .plate svg[id] .loopText,
+  .wrap .plate svg[id] .stateLabel,
+  .wrap .plate svg[id] .titleText { fill: #1B1D21 !important; color: #1B1D21 !important; }
+
+  /* connectors */
+  .wrap .plate svg[id] .edgePath > path,
+  .wrap .plate svg[id] path.flowchart-link,
+  .wrap .plate svg[id] .transition,
+  .wrap .plate svg[id] .messageLine0,
+  .wrap .plate svg[id] .messageLine1,
+  .wrap .plate svg[id] .actor-line { stroke: #6E6A5E !important; fill: none !important; }
+
+  .wrap .plate svg[id] marker path,
+  .wrap .plate svg[id] .arrowMarkerPath,
+  .wrap .plate svg[id] .arrowheadPath { fill: #6E6A5E !important; stroke: #6E6A5E !important; }
+
+  /* state machine start / end dots stay solid */
+  .wrap .plate svg[id] .node circle.state-start,
+  .wrap .plate svg[id] .statediagram-state .start-state,
+  .wrap .plate svg[id] .node .state-end { fill: #4A4E56 !important; stroke: #4A4E56 !important; }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="eyebrow">
+      <span><b>Tracebed</b></span>
+      <span>Memory flow &amp; lifecycle</span>
+      <span>Rev. 2026-07-25</span>
+      <span>API :8110 · UI :8111</span>
+    </div>
+    <h1>How a memory is <em>earned</em>, used, and retired</h1>
+    <div class="rule-brass"></div>
+    <p class="standfirst">Tracebed watches every agent run, derives lessons from what actually happened, and refuses to put anything into an agent's context until it has earned the space. This is the read path, the write path, the learning loop, and the full lifecycle of a single memory — from the trace it stands on to the day it is retired.</p>
+  </header>
+
+  <!-- ===================== 0 ===================== -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">Orientation</div>
+      <h2>Four planes, and the separation is the whole latency story</h2>
+    </div>
+    <p class="lede">Nothing in the hot read plane thinks. It searches, scores, and either injects or abstains inside a fixed budget, then gets out of the way. Everything that reasons runs behind it, in batch, reading raw traces — never summaries of summaries.</p>
+
+    <div class="plate">
+      <pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'background':'#F4F2EC','primaryColor':'#E8E4DA','primaryTextColor':'#1B1D21','primaryBorderColor':'#8E8878','lineColor':'#6E6A5E','secondaryColor':'#DDE3E7','tertiaryColor':'#EFEDE6','fontFamily':'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace','fontSize':'17px'}}}%%
+flowchart TB
+  AG["Agent runtime"]
+
+  subgraph HOT["1 · HOT READ — sync, 300ms p99, zero LLM calls"]
+    RET["Retrieve → score → abstain or assemble"]
+  end
+
+  subgraph ING["2 · INGEST — async, never awaited"]
+    TS[("Trace archive<br/>the bedrock")]
+  end
+
+  subgraph BG["3 · BACKGROUND — batch workers"]
+    LEARN["Extract · distil · validate · score<br/>consolidate · invalidate · rebuild prefix"]
+    ST[("Memory store<br/>governed, project-partitioned")]
+  end
+
+  subgraph CTL["4 · CONTROL"]
+    OPS["Dashboard · kill switch · spend ledger"]
+  end
+
+  AG -->|"retrieve(agent, run_ctx)"| RET
+  RET -->|"context_block + run_id"| AG
+  AG -. "trace events · outcomes" .-> TS
+  TS -->|"raw evidence — the only<br/>distillation source"| LEARN
+  LEARN -->|"governed writes"| ST
+  ST -->|"validated rows only"| RET
+  ST -->|"vault · review queue"| OPS
+  TS -->|"provenance drill-down"| OPS
+  OPS -->|"auto-disable · caps · human edits"| ST
+      </pre>
+      <div class="plate-cap">Fig. 1 — Plane separation. Only the hot read plane is on the agent's critical path. <span class="scroll-hint">Plates scroll sideways if the diagram is wider than your screen.</span></div>
+    </div>
+
+    <div class="strip">
+      <div><dt>Total retrieval</dt><dd>300<small>ms p99</small></dd><small>then static prefix only</small></div>
+      <div><dt>Query embed</dt><dd>200<small>ms</small></dd><small>then lexical-only</small></div>
+      <div><dt>Abstention target</dt><dd>≥50<small>%</small></dd><small>of runs inject nothing dynamic</small></div>
+      <div><dt>Memory envelope</dt><dd>1,200<small> tok</small></dd><small>700 prefix · 500 dynamic</small></div>
+    </div>
+  </section>
+
+  <!-- ===================== 1 ===================== -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">Flow 1 · synchronous</div>
+      <h2>Read path — one run, inside Atom</h2>
+    </div>
+    <p class="lede">The recommended attachment is an audit-only fifth GATE mux modelled on <code>aegisGate:8084</code>, with GATE performing the injection. GATE already resolves the agent endpoint and rewrites the request, so memory reaches production agents with <strong>zero agent-code changes</strong> — no codegen prompt edits, no new lint patterns.</p>
+
+    <div class="plate">
+      <pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'background':'#F4F2EC','primaryColor':'#E8E4DA','primaryTextColor':'#1B1D21','primaryBorderColor':'#8E8878','lineColor':'#6E6A5E','secondaryColor':'#DDE3E7','tertiaryColor':'#EFEDE6','fontFamily':'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace','fontSize':'17px','actorBkg':'#E4E0D4','actorBorder':'#8E8878','noteBkgColor':'#EFE6D2','noteBorderColor':'#B99A55'}}}%%
+sequenceDiagram
+  autonumber
+  participant C as Caller
+  participant G as GATE :8080
+  participant TB as Tracebed :8110
+  participant PG as Postgres 18
+  participant VK as Valkey
+  participant GEM as Gemini
+  participant A as Agent container
+
+  C->>G: POST /agents/{name}/invoke
+  G->>TB: POST /v1/retrieve (principal, agent, run_ctx)
+  Note over TB: project_id resolved SERVER-SIDE<br/>from authenticated principal.<br/>Never caller-asserted.
+  TB->>TB: mint run_id
+  TB->>PG: fetch static prefix (prebuilt at consolidation)
+  TB->>VK: embed-cache lookup
+  alt cache miss
+    TB->>GEM: embed query context (200ms timeout)
+    GEM-->>TB: vector
+  else timeout or error
+    TB->>TB: degrade to lexical-only
+  end
+  TB->>PG: BM25 (pg_textsearch) + ANN (pgvector), project-scoped, FORCE RLS
+  TB->>TB: RRF order → calibrated score → abstention + rarity gate
+  alt abstain (target ≥50% of runs)
+    TB-->>G: run_id + static prefix only
+  else inject
+    TB->>TB: budget fill · dedup · render as labelled data
+    TB->>PG: write injection_log (run_id, memory_id, tokens, slot)
+    TB-->>G: run_id + context_block
+  end
+  Note over G,A: memory block is placed LAST,<br/>after all cacheable content —<br/>otherwise it invalidates the prompt cache.
+  G->>A: invoke (definition · prefix · … · MEMORY block)
+  A->>G: LLM + tool calls → :8083 → Gemini
+  A-->>G: result
+  G-->>C: result
+  A-)TB: trace events (fire-and-forget)
+      </pre>
+      <div class="plate-cap">Fig. 2 — Read path. Every branch fails open; a memory fault degrades the run, never blocks it.</div>
+    </div>
+
+    <div class="note">
+      <span class="tag">Load-bearing</span>
+      <p><b>Abstention is not computed from the RRF score.</b> RRF discards score magnitudes by construction — its output encodes consensus <em>rank</em>, not relevance, and a rank cannot be thresholded for "good enough to inject". RRF orders the candidates; the inject/abstain decision comes from calibrated raw signals: normalised BM25 score and cosine similarity.</p>
+    </div>
+  </section>
+
+  <!-- ===================== 2 ===================== -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">Flow 2 · asynchronous</div>
+      <h2>Write path — the trace is the bedrock</h2>
+    </div>
+    <p class="lede">Everything writes to the trace first. Memory is derived; run content never writes memory directly. Nothing on the write side is awaited by the agent runtime, and an outcome event joins its trace by <code>run_id</code> whenever it lands — an analyst disposition two days later simply attaches.</p>
+
+    <div class="plate">
+      <pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'background':'#F4F2EC','primaryColor':'#E8E4DA','primaryTextColor':'#1B1D21','primaryBorderColor':'#8E8878','lineColor':'#6E6A5E','secondaryColor':'#DDE3E7','tertiaryColor':'#EFEDE6','fontFamily':'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace','fontSize':'17px'}}}%%
+flowchart LR
+  A["Agent / GATE"] -->|"trace(event) — fire &amp; forget,<br/>never awaited"| Q["Postgres queue<br/>SKIP LOCKED"]
+  H["Human task resolved<br/>Deployment approve/reject<br/>Downstream event"] -->|"feedback(run_id, outcome)"| Q
+  Q -->|"claim batch, at-least-once"| TW["Trace writer"]
+  TW -->|"payload, encrypted<br/>per subject key"| BLOB[("Trace archive<br/>byte-immutable")]
+  TW -->|"queryable index row"| IDX["trace_index<br/>+ submitter_principal<br/>+ input_signature_hash"]
+  TW -->|"one row per subject<br/>seen in the run"| SUBJ["trace_subject<br/>run_id · subject_tag"]
+  TW -->|"outcome row"| OE["outcome_event<br/>+ authenticated principal"]
+  OE -. "joins by run_id —<br/>hours or days later" .-> IDX
+  IDX -->|"derivation pool +<br/>credit-assignment ledger"| W["Background workers"]
+  SUBJ -.->|"makes delete-by-subject<br/>an indexed query"| BLOB
+      </pre>
+      <div class="plate-cap">Fig. 3 — Ingest. <code>submitter_principal</code> and <code>input_signature_hash</code> exist so "independent evidence" can be computed rather than counted.</div>
+    </div>
+  </section>
+
+  <!-- ===================== 3 ===================== -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">Flow 3 · batch</div>
+      <h2>The learning loop</h2>
+    </div>
+    <p class="lede">Two lanes. The operational lane is pure code — parsers over execution signals — so it works on projects where nobody ever grades the work. The quality lane exists only where a feedback adapter does.</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Worker</th><th>Reads</th><th>Produces</th><th>Model</th><th>Cadence</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><b>Extractors</b></td><td>raw traces</td><td>Tier A operational lessons, derived state</td><td class="mono">none</td><td>near-real-time</td></tr>
+          <tr><td><b>Distiller</b></td><td>raw traces</td><td>Tier B quality lessons, episodic exemplars, semantic conclusions</td><td class="mono">Gemini 3.1 Pro</td><td>batch, novelty-gated</td></tr>
+          <tr><td><b>Shadow validator</b></td><td>quarantined + later outcomes</td><td>promotion to candidate</td><td class="mono">Gemini 3.1 Pro</td><td>on matching outcome</td></tr>
+          <tr><td><b>Scorer</b></td><td>outcome → trace → injection_log</td><td>Q updates</td><td class="mono">Gemini 3.1 Pro</td><td>≤1 update / memory / day</td></tr>
+          <tr><td><b>Consolidator</b></td><td>the vault</td><td>merge, dedup, contradiction, decay, archive</td><td class="mono">none</td><td>nightly, per project</td></tr>
+          <tr><td><b>Invalidator</b></td><td>events, TTL, usage</td><td>stale marks, two-strike retirement</td><td class="mono">none</td><td>continuous</td></tr>
+          <tr><td><b>Prefix builder</b></td><td>validated + pinned</td><td>static prefix per agent-type</td><td class="mono">none</td><td>after each sweep</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note">
+      <span class="tag">Spec correction</span>
+      <p><b>The Q update as specified punishes success.</b> §9 feeds the adapter <em>weight</em> in as the reward. From the mandated start of Q&nbsp;=&nbsp;0.5, a successful downstream event (weight 0.3) yields <code>r − Q = −0.2</code> and lowers the score. The weight expresses how much the signal is <em>trusted</em>, not how good the outcome was. Corrected form: <code>Q ← clamp01(Q + α·w·c·(r − Q))</code>, where <code>r</code> is outcome polarity and <code>w</code> modulates the learning rate.</p>
+    </div>
+  </section>
+
+  <!-- ===================== 4 ===================== -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">Lifecycle</div>
+      <h2>The life of one memory</h2>
+    </div>
+    <p class="lede">One reconciled state machine — the spec shipped two that disagreed. Transitions are the <em>only</em> way status changes; there is no administrative bypass in code.</p>
+
+    <div class="legend">
+      <span class="chip"><span class="dot" style="background:var(--s-trace)"></span>evidence</span>
+      <span class="chip"><span class="dot" style="background:var(--s-quar)"></span>quarantined — never injected</span>
+      <span class="chip"><span class="dot" style="background:var(--s-cand)"></span>candidate — injectable, labelled lower-trust</span>
+      <span class="chip"><span class="dot" style="background:var(--s-valid)"></span>validated — in the prefix and the dynamic slice</span>
+      <span class="chip"><span class="dot" style="background:var(--s-stale)"></span>stale / archived — out of retrieval, recoverable</span>
+      <span class="chip"><span class="dot" style="background:var(--s-retired)"></span>retired / rejected — terminal</span>
+    </div>
+
+    <div class="plate">
+      <pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'background':'#F4F2EC','primaryColor':'#E8E4DA','primaryTextColor':'#1B1D21','primaryBorderColor':'#8E8878','lineColor':'#6E6A5E','secondaryColor':'#DDE3E7','tertiaryColor':'#EFEDE6','fontFamily':'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace','fontSize':'17px'}}}%%
+stateDiagram-v2
+  direction TB
+  [*] --> Trace: every run, async
+  Trace --> Extracted: parser (Tier A) / distiller (Tier B)
+
+  Extracted --> Rejected: scan fail — injection pattern,<br/>secret, schema, incomplete provenance
+  Extracted --> Candidate: Tier A · template+enum only<br/>cap 1 note per run
+  Extracted --> Quarantined: Tier B · content-derived
+
+  Quarantined --> Candidate: shadow confirmed<br/>(2 distinct runs · 1 for failures)
+  Quarantined --> Candidate: provenance IS a human verdict
+  Quarantined --> Rejected: contradicted by outcomes
+
+  Candidate --> Validated: promotion predicate met · Q starts 0.5
+  Validated --> Superseded: contradiction w/ equal or<br/>stronger provenance (link kept)
+  Validated --> Stale: invalidation event · TTL ·<br/>revalidation fail at age R
+  Stale --> Validated: re-verify pass
+  Stale --> Retired: two strikes
+  Validated --> Retired: Q &lt; 0.25 after ≥4 scored uses<br/>AND ≥K distinct principals
+  Validated --> Archived: decay floor 0.15 reached
+  Archived --> Validated: operator restore
+
+  Rejected --> [*]
+  Retired --> [*]
+      </pre>
+      <div class="plate-cap">Fig. 4 — Memory lifecycle. Quarantined content is never injected, under any condition.</div>
+    </div>
+
+    <div class="note">
+      <span class="tag">Disabled at launch</span>
+      <p><b>The "corroborated by 2+ independent traces" shortcut ships switched off.</b> Independence cannot be computed from the original schema — with only <code>run_id</code> to distinguish rows, it degrades to "submitted twice", a two-call bypass of shadow validation. Published measurement puts naive count-based corroboration at a <strong>0.597 false-promotion rate</strong>. The skip re-enables once independence means differing submitter principal <em>and</em> differing input-signature cluster.</p>
+    </div>
+  </section>
+
+  <!-- ===================== 5 ===================== -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">Lifecycle · scoring</div>
+      <h2>How a memory earns and loses its place</h2>
+    </div>
+
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Stage</th><th>Trigger</th><th class="num">Effect on Q</th><th>Guard</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Promotion</td><td>predicate met</td><td class="num">= 0.50</td><td>provenance complete or rejected at insert</td></tr>
+          <tr><td>Positive outcome</td><td>verdict · correction · downstream</td><td class="num">+ α·w·c·(1 − Q)</td><td>unambiguous outcomes only</td></tr>
+          <tr><td>Negative outcome</td><td>verdict · correction · downstream</td><td class="num">− α·w·c·Q</td><td>≥K distinct authenticated principals</td></tr>
+          <tr><td>Ambiguous / implicit</td><td>regenerated, abandoned, rephrased</td><td class="num">no change</td><td>logged on trace, never scored</td></tr>
+          <tr><td>Idle decay</td><td>one week unused</td><td class="num">× 0.95</td><td>archive at floor 0.15</td></tr>
+          <tr><td>Retirement</td><td>Q &lt; 0.25, ≥4 scored uses</td><td class="num">terminal</td><td>else routed to the review queue</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>The principal threshold on negative outcomes closes a live hole. Run the specified arithmetic with <code>c ≈ 1</code> and <code>r = 0</code>: 0.5 → 0.35 → 0.245 → 0.172 → 0.120. Four scored uses, which is exactly the retirement precondition, at one update per day — <strong>four calendar days to retire any memory an attacker chooses</strong>, using outcomes the system is designed to trust because they are unambiguous.</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Feedback adapter</th><th>Example</th><th class="num">Weight w</th><th>Role</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Explicit verdict</td><td>analyst approve/reject with reasoning</td><td class="num">1.0</td><td>gold; rejection reasons feed the distiller</td></tr>
+          <tr><td>Correction</td><td>human edits output before use; the diff is the signal</td><td class="num">0.8</td><td>per-project integration</td></tr>
+          <tr><td>Downstream event</td><td>ticket closed, case reopened, alert re-fired</td><td class="num">0.3</td><td>weak, delayed, joins whenever it arrives</td></tr>
+          <tr><td>Implicit behaviour</td><td>regenerated, abandoned, retried</td><td class="num">0.0</td><td>logged only — a guessed reward is worse than none</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ===================== 6 ===================== -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">Lifecycle · forgetting</div>
+      <h2>Staleness, erasure, and the end of a project</h2>
+    </div>
+    <p class="lede">Forgetting is a subsystem, not cleanup. The success criterion is that the vault <strong>plateaus</strong> while run volume keeps growing — that is what keeps per-project cost flat.</p>
+
+    <div class="plate">
+      <pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'background':'#F4F2EC','primaryColor':'#E8E4DA','primaryTextColor':'#1B1D21','primaryBorderColor':'#8E8878','lineColor':'#6E6A5E','secondaryColor':'#DDE3E7','tertiaryColor':'#EFEDE6','fontFamily':'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace','fontSize':'17px'}}}%%
+flowchart TB
+  subgraph DRIFT["Drift defences — five triggers, one destination"]
+    OK["validated"]
+    EV["Platform event<br/>tool changed · fact updated · template edited"] -->|"provenance selector matches"| STALE
+    TTL["TTL class expiry<br/>intel: days · environment: months"] -->|"valid_to has passed"| STALE
+    REV["Usage-triggered revalidation<br/>retrieved while older than R = 30d"] -->|"async re-verify fails"| STALE
+    OK -->|"new fact, equal or<br/>stronger provenance"| SUP["superseded<br/>validity window closed, link kept"]
+    OK -->|"one week with no retrieval"| DEC["decay × 0.95"]
+    DEC -->|"back in use"| OK
+    DEC -->|"floor 0.15 reached"| ARCH["archived<br/>out of retrieval, recoverable"]
+    STALE["stale — first strike"] -->|"re-verify passes"| OK
+    STALE -->|"second independent failure"| RET["retired — terminal"]
+    ARCH -->|"operator restore"| OK
+  end
+
+  subgraph ERASE["Erasure — two mechanisms"]
+    SUB["Delete by subject"] -->|"look up trace_subject,<br/>destroy that subject's content key"| KEY["key destroyed"]
+    KEY -->|"ciphertext now unreadable"| RESULT["trace object stays byte-immutable<br/>provenance chain of every<br/>derived memory stays intact"]
+    PROJ["Project deleted"] -->|"LIST partition drop"| DROP["O(1) — every row,<br/>index and trace gone at once"]
+  end
+      </pre>
+      <div class="plate-cap">Fig. 5 — Crypto-shredding resolves the contradiction in the spec: the trace is simultaneously the erasure target and the audit record.</div>
+    </div>
+  </section>
+
+  <!-- ===================== 7 ===================== -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">Boundary</div>
+      <h2>What Atom implements, and what ships in the box</h2>
+    </div>
+    <p class="lede">Tracebed is a standalone service. Everything host-specific sits behind a port with a working default, so Atom integration is configuration and a handful of adapter implementations — never a fork.</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Port</th><th>What it answers</th><th>Default in the box</th><th>Atom implementation</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="mono">PrincipalResolver</td><td>who is calling</td><td>OIDC / JWKS · API key</td><td>Keycloak realm <code>atom</code>, NHI client</td></tr>
+          <tr><td class="mono">ProjectResolver</td><td>which project this principal belongs to</td><td>registry table, set at registration</td><td>Atom project entity</td></tr>
+          <tr><td class="mono">FeedbackSource</td><td>what counts as an outcome</td><td>verdict · correction · downstream</td><td><code>/tasks/{id}/resolve</code>, deployment review</td></tr>
+          <tr><td class="mono">InvalidationSource</td><td>what changed in the world</td><td>HTTP webhook + polling</td><td>tool/spec/template change events</td></tr>
+          <tr><td class="mono">LLMProvider</td><td>generation for the workers</td><td>Gemini, OpenAI-compatible</td><td>LiteLLM via <code>gate:8083</code></td></tr>
+          <tr><td class="mono">EmbeddingProvider</td><td>vectors</td><td>Gemini · pinned local ONNX</td><td>either, one config line</td></tr>
+          <tr><td class="mono">ObjectStore</td><td>where traces live</td><td>filesystem · S3-compatible</td><td>SeaweedFS or existing bucket</td></tr>
+          <tr><td class="mono">AuditSink</td><td>where decisions are recorded</td><td>Postgres + structured stdout</td><td>HMAC-signed events</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Integration options, ranked</h3>
+    <ol class="ranked">
+      <li>
+        <span class="rk">01</span>
+        <div class="hd">
+          <b>Fifth GATE mux, GATE-side injection</b>
+          <span class="verdict v-yes">Recommended</span>
+        </div>
+        <p class="body">Audit-only, modelled on <code>aegisGate:8084</code>. GATE already resolves the agent endpoint and rewrites the request, so it can append the memory block itself — <strong>zero agent-code changes</strong>, no codegen prompt edits, no new lint patterns, and ADR-009 satisfied literally. Cost: Go changes in <code>gate/</code>.</p>
+      </li>
+      <li>
+        <span class="rk">02</span>
+        <div class="hd">
+          <b>SDK inside the agent</b>
+          <span class="verdict v-mid">Workable fallback</span>
+        </div>
+        <p class="body">Functions correctly, but the mechanism by which memory reaches production agents becomes an LLM writing the call and a regex lint checking that it did. That is a probabilistic integration surface for infrastructure — and it misses CLI-scaffolded agents entirely, so their runs stay invisible to the trace archive.</p>
+      </li>
+      <li>
+        <span class="rk">03</span>
+        <div class="hd">
+          <b>Memory as a tool behind <code>/tools/{name}/invoke</code></b>
+          <span class="verdict v-no">Rejected</span>
+        </div>
+        <p class="body">AgentArmor's 5&nbsp;s pre-call timeout alone is 16× the entire retrieval budget. Worse semantically: as a tool, the <em>model</em> decides when to retrieve — which destroys the deterministic pre-run pipeline and with it the abstention economics the whole cost model rests on.</p>
+      </li>
+    </ol>
+  </section>
+
+  <footer>
+    <span>Tracebed · project-scoped learning memory</span>
+    <span>Flow &amp; lifecycle reference</span>
+    <span>Rev. 2026-07-25</span>
+  </footer>
+
+</div>
+
+<script>
+  // Diagrams fit the page by default so the whole shape is legible at a glance.
+  // Toggle to intrinsic size when you need to read a dense corner; the plate
+  // scrolls horizontally in that mode.
+  (function () {
+    document.querySelectorAll(".plate").forEach(function (plate) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "zoom-btn";
+      btn.textContent = "Enlarge";
+      btn.setAttribute("aria-pressed", "false");
+      btn.addEventListener("click", function () {
+        var on = plate.classList.toggle("zoomed");
+        btn.setAttribute("aria-pressed", String(on));
+        btn.textContent = on ? "Fit to width" : "Enlarge";
+        if (!on) { plate.scrollLeft = 0; }
+      });
+      plate.insertBefore(btn, plate.firstChild);
+    });
+  })();
+</script>

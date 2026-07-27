@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Tracebed — Operator Console</title>
+    <script>
+      // Runs before first paint so the operator never sees a theme flash: the
+      // persisted choice (or, absent one, the OS preference) is applied to the
+      // root element synchronously, before React or index.css's transitions
+      // exist to animate the "wrong then right" flicker that a post-hydration
+      // toggle would produce. `lib/theme.ts` owns every other read/write of
+      // this key; this is the one inline duplicate, justified because it must
+      // run before any module script loads.
+      (function () {
+        try {
+          var stored = localStorage.getItem("tb:theme");
+          var dark =
+            stored === "dark" ||
+            (stored !== "light" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.classList.toggle("dark", dark);
+        } catch (_e) {
+          // localStorage unavailable (private mode / disabled) — fall back to
+          // whatever @media (prefers-color-scheme) resolves in index.css.
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

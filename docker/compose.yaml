@@ -1,0 +1,142 @@
+# Tracebed local stack (PHASE-0 Task 1).
+#
+# UNVERIFIED IMAGE TAGS: this file was authored on a machine with no Docker daemon, so the
+# image tags below have not been pulled. Confirm them on first `docker compose up` and pin
+# by digest once confirmed. Everything else here — ports, extensions, roles, healthchecks —
+# is dictated by PLAN.md §5 and is not guesswork.
+#
+#   docker compose -f docker/compose.yaml up -d
+#   python -m tracebed.stores.pg.migrate apply
+
+name: tracebed
+
+services:
+  postgres:
+    # Postgres 18 is required, not preferred: pg_textsearch (true BM25, PostgreSQL License)
+    # is what replaced ts_rank after the audit measured ts_rank at nDCG@10 0.07 vs BM25 0.69
+    # on BEIR SciFact — and §7.5's rarity gate is an IDF computation ts_rank cannot provide.
+    # The vchord-suite image bundles pgvector + pg_textsearch on a PG18 base.
+    # Fallback if unavailable: pgvector/pgvector:pg18 + build pg_textsearch from source.
+    image: tensorchord/vchord-suite:pg18-latest
+    container_name: tracebed-pg
+    environment:
+      POSTGRES_USER: tracebed_owner
+      POSTGRES_PASSWORD: ${TB_PG_PASSWORD:-tracebed_dev_only}
+      POSTGRES_DB: tracebed
+      # Deterministic collation: BM25 tokenisation and tsvector behaviour must not vary by host.
+      POSTGRES_INITDB_ARGS: "--locale-provider=icu --icu-locale=en-US --encoding=UTF8"
+    command:
+      - postgres
+      # The queue and the vector index share this buffer cache. PLAN.md §3 records that
+      # coupling as a hot-path latency risk; queue.py alarms on xmin-horizon age because
+      # of exactly this line.
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - work_mem=32MB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - max_connections=200
+      # Long-lived idle transactions hold back the xmin horizon and bloat work_queue.
+      - -c
+      - idle_in_transaction_session_timeout=60s
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+    ports:
+      - "5442:5432"   # not 5432: this must not collide with a host Postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracebed_owner -d tracebed"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  valkey:
+    # Valkey, not Redis: Redis relicensed to RSALv2/SSPL, which scripts/license_policy.toml denies.
+    image: valkey/valkey:8-alpine
+    container_name: tracebed-valkey
+    command:
+      - valkey-server
+      - --save
+      - ""                        # working memory and the tool cache are both reconstructible
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "6389:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  seaweedfs:
+    # Generic S3 target for the TraceStorePort integration tests. SeaweedFS is the primary
+    # target; legacy MinIO still works because the driver speaks plain S3 and never imports
+    # a MinIO SDK (its OSS repo was archived 2026-04-25).
+    image: chrislusf/seaweedfs:latest
+    container_name: tracebed-s3
+    command: "server -dir=/data -s3 -s3.port=8333 -master.volumeSizeLimitMB=256"
+    ports:
+      - "8333:8333"
+      - "9333:9333"
+    volumes:
+      - s3data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:9333/cluster/status || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/api.Dockerfile
+    container_name: tracebed-api
+    depends_on:
+      postgres: { condition: service_healthy }
+      valkey: { condition: service_healthy }
+    environment:
+      TB_STORAGE__PG_DSN: postgresql://tracebed_app:${TB_APP_PASSWORD:-tracebed_app_dev}@postgres:5432/tracebed
+      TB_STORAGE__VALKEY_URL: valkey://valkey:6379/0
+      TB_STORAGE__TRACESTORE__DRIVER: s3
+      TB_STORAGE__TRACESTORE__ENDPOINT: http://seaweedfs:8333
+      TB_STORAGE__TRACESTORE__BUCKET: tracebed-traces
+      TB_EMBEDDING__MODEL_VERSION: ${TB_EMBEDDING_MODEL_VERSION:-unset-pin-me}
+      TB_HOLDOUT_SALT: ${TB_HOLDOUT_SALT:-dev-salt-change-me}
+      # NOT `TB_CRYPTO__MASTER_KEY`. `crypto.shred.EnvMasterKeyProvider` reads the
+      # bare name `TB_MASTER_KEY`, deliberately outside `TracebedSettings` (C-15:
+      # settings objects get repr()'d into logs, and key material must not be one
+      # accidental str(settings) from a leak). A `TB_CRYPTO__` prefix here would be
+      # read by nothing and the api container would abort with MasterKeyMissing.
+      TB_MASTER_KEY: ${TB_MASTER_KEY:-}
+    ports:
+      - "8110:8110"
+    profiles: ["full"]
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ../dashboard
+      dockerfile: ../docker/dashboard.Dockerfile
+    container_name: tracebed-dashboard
+    depends_on: [api]
+    environment:
+      VITE_API_BASE: http://localhost:8110
+    ports:
+      - "8111:8111"
+    profiles: ["full"]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  s3data:

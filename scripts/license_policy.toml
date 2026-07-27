@@ -1,0 +1,59 @@
+# Tracebed dependency licence policy.
+#
+# Enforced by scripts/license_check.py, wired as CI step 1 (PHASE-0 Task 1).
+# Rationale for the LGPL carve-out: PLAN.md §4 mandates psycopg 3, which is
+# LGPL-3.0-only. The original spec's permissive-only allowlist would have failed
+# its own mandated driver (DECISIONS D-036).
+
+# Distributions whose licence must match one of these are accepted outright.
+allow = [
+    "PostgreSQL",
+    "Apache-2.0",
+    "Apache Software License",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSD License",
+    "MIT",
+    "MIT License",
+    "MIT-0",
+    "ISC",
+    "ISC License (ISCL)",
+    "Python Software Foundation License",
+    "PSF-2.0",
+    # MPL-2.0 is file-level copyleft: it obliges us to publish modifications to the
+    # covered files themselves, not to relicense Tracebed. We vendor and modify nothing
+    # under it (certifi ships a CA bundle), so it is compatible with an Apache-2.0 service.
+    "MPL-2.0",
+    "Mozilla Public License 2.0 (MPL 2.0)",
+    "Unlicense",
+]
+
+# Accepted only when the distribution name appears in [lgpl_rationale] below.
+conditional = ["LGPL-3.0-only", "LGPL-3.0", "GNU Lesser General Public License v3 (LGPLv3)"]
+
+# Hard fail, no override path.
+deny = [
+    "SSPL",
+    "SSPL-1.0",
+    "BSL",
+    "BUSL-1.1",
+    "RSAL",
+    "Elastic-2.0",
+    "AGPL-3.0",
+    "AGPL-3.0-only",
+    "AGPL-3.0-or-later",
+    "GNU Affero General Public License v3",
+    "GPL-2.0",
+    "GPL-3.0",
+]
+
+# distribution name -> why the conditional licence is acceptable here.
+[lgpl_rationale]
+psycopg = "LGPL-3.0-only. Dynamically linked, unmodified, distributed as a dependency and not vendored; Tracebed ships no derivative work of psycopg. PLAN.md §4 mandates psycopg 3 as the Postgres driver."
+psycopg-binary = "Binary wheel of psycopg; same rationale."
+psycopg-pool = "Connection pool shipped by the psycopg project; same rationale."
+psycopg2-binary = "Only if pulled transitively by yoyo-migrations; same rationale."
+
+# Distributions with no machine-readable licence metadata, resolved by hand.
+# Every entry here is a human assertion and must cite where the licence was read.
+[manual_overrides]

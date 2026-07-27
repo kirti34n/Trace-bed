@@ -1,0 +1,188 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # Required by the settings model; the pin's value is irrelevant to offline gates.
+  TB_EMBEDDING__MODEL_VERSION: ci-pin
+  TB_HOLDOUT_SALT: ci-salt
+
+jobs:
+  # Gates that need no services. These run first and fast: the licence gate is CI step 1
+  # because psycopg (LGPL-3.0-only) would have failed the original spec's permissive-only
+  # allowlist, and finding that out after the dependency tree is settled is expensive.
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv venv --python 3.13 .venv
+      - run: uv pip install -e ".[dev]"
+        env:
+          VIRTUAL_ENV: .venv
+
+      - name: CI step 1 — licence gate
+        run: |
+          .venv/bin/python scripts/license_check.py --self-test
+          .venv/bin/python scripts/license_check.py
+
+      - name: CI step 2 — raw-SQL containment
+        run: |
+          .venv/bin/python scripts/raw_sql_lint.py --self-test
+          .venv/bin/python scripts/raw_sql_lint.py
+
+      - name: CI step 2b — container-image policy (D-109)
+        run: |
+          .venv/bin/python scripts/image_check.py --self-test
+          .venv/bin/python scripts/image_check.py
+
+      - name: CI step 2c — dependency audit (hard rule 10 / D-104)
+        run: .venv/bin/python scripts/license_check.py --dependency-audit
+
+      - name: CI step 3 — hot-path purity (invariant 1)
+        run: |
+          .venv/bin/python scripts/purity_check.py --self-test
+          .venv/bin/python scripts/purity_check.py
+
+      - name: ruff
+        run: .venv/bin/ruff check src tests harness scripts
+
+      - name: mypy --strict
+        run: .venv/bin/mypy
+
+      # THE WHOLE OFFLINE SUITE, not `-m phase0`. The prompt names six harnesses as running
+      # on every commit and makes invariant 8 CI-blocking from Phase 3 on; a phase0-only
+      # selector ran roughly one test in three and gated none of: the negative probes
+      # (phase1), the render property tests (phase1), the red team (phase3), or the
+      # guessed-reward drill. Integration-marked tests still need the stack and run in the
+      # `integration` job below.
+      - name: offline test suite (every phase)
+        run: .venv/bin/pytest -m "not integration" -q
+        env:
+          TB_STORAGE__PG_DSN: postgresql://unused/unused
+
+      # The harnesses that are scripts rather than pytest modules. Each runs offline against
+      # in-memory doubles and exits non-zero on failure, so they gate here rather than only
+      # being runnable by hand.
+      - name: offline harnesses
+        run: |
+          .venv/bin/python harness/guessed_reward.py
+          .venv/bin/python harness/failopen_drill.py
+          .venv/bin/python harness/consolidation_regression.py
+          .venv/bin/python harness/workflow_scope.py
+        env:
+          TB_STORAGE__PG_DSN: postgresql://unused/unused
+
+  # The operator console. Split from `static` because it needs Node rather than Python,
+  # and kept independent of `integration` because none of these gates touch the stack —
+  # a Postgres outage must not be able to hide a broken dashboard build.
+  #
+  # Ordered the same way `static` is, and for the same reason: the licence gate runs
+  # FIRST. A dependency tree is cheapest to reject before anything has been built on
+  # top of it, and the npm tree is where an unvetted transitive licence actually
+  # arrives — 343 packages resolve from three declared runtime dependencies.
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      # `ci`, not `install`: the gate below must judge the locked tree, not a tree npm
+      # was free to re-resolve on the runner.
+      - run: npm ci
+
+      - name: dashboard step 1 — licence gate
+        run: |
+          node scripts/license_check.mjs --self-test
+          node scripts/license_check.mjs
+
+      - name: dashboard step 2 — typecheck
+        run: npx tsc --noEmit
+
+      - name: dashboard step 3 — lint
+        run: npx eslint src
+
+      # Runs `tsc --noEmit && vite build`. Kept after the standalone typecheck so a type
+      # error is reported as a type error rather than as a build failure.
+      - name: dashboard step 4 — build
+        run: npm run build
+
+  # Gates that need the stack. Split out so a service outage cannot mask a static failure.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: tensorchord/vchord-suite:pg18-latest
+        env:
+          POSTGRES_USER: tracebed_owner
+          POSTGRES_PASSWORD: tracebed_ci
+          POSTGRES_DB: tracebed
+        ports: ["5442:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tracebed_owner -d tracebed"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports: ["6389:6379"]
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      TB_STORAGE__PG_DSN: postgresql://tracebed_owner:tracebed_ci@localhost:5442/tracebed
+      TB_STORAGE__VALKEY_URL: valkey://localhost:6389/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv venv --python 3.13 .venv
+      - run: uv pip install -e ".[dev]"
+        env:
+          VIRTUAL_ENV: .venv
+
+      - name: bootstrap roles
+        run: psql "$TB_STORAGE__PG_DSN" -f docker/initdb/01-roles.sql
+
+      - name: migrate
+        run: .venv/bin/python -m tracebed.stores.pg.migrate apply
+
+      # Every phase gate, not just phase 0. A gate exits non-zero unless its verdict is PASS,
+      # and INCOMPLETE is explicitly not a pass — so with the stack present these are real
+      # gates. Run with `if: always()` chaining so one phase's failure still produces the
+      # later reports rather than hiding them.
+      - name: phase 0 gate
+        run: .venv/bin/python harness/phase0_gate.py
+
+      - name: phase 1 gate
+        if: always()
+        run: .venv/bin/python harness/phase1_gate.py
+
+      - name: phase 2 gate
+        if: always()
+        run: .venv/bin/python harness/phase2_gate.py
+
+      - name: phase 3 gate
+        if: always()
+        run: .venv/bin/python harness/phase3_gate.py
+
+      - name: phase 4 gate
+        if: always()
+        run: .venv/bin/python harness/phase4_gate.py
+
+      - name: full gate
+        if: always()
+        run: .venv/bin/python harness/full_gate.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-reports
+          path: gate_report_*.md

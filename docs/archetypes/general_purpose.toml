@@ -1,0 +1,33 @@
+# general_purpose.toml — the shipped defaults (docs/ARCHETYPE-CONFIGS.md).
+#
+# This file exists to be a REAL, loadable starting point, not a description of one: every
+# section below other than [storage]/[embedding] is intentionally absent, because the
+# shipped default for every other field IS this archetype's value — see
+# src/tracebed/domain/config.py for what each omitted field resolves to.
+#
+# Use this archetype when nothing about your deployment's traffic pattern or regulatory
+# posture argues for [bfsi_soc.toml]'s conservatism or [high_volume.toml]'s throughput
+# tuning. Per-project or per-agent-type deviations from even THIS archetype belong in
+# `project_config` / `agent_type_config` overrides (PLAN.md §6, C-03) — layered on top of
+# whichever archetype a deployment starts from at process-config time — not in a fourth
+# top-level TOML file.
+
+# SUPPLYING THE TWO PLACEHOLDERS BELOW: a key present in this file WINS over the matching
+# TB_* environment variable — pydantic-settings ranks constructor keyword arguments above
+# env vars (init_settings > env_settings), not the other way round. Either replace the
+# placeholder here, or DELETE the whole block and set the environment variable; leaving
+# "CHANGEME" here and setting the env var supplies "CHANGEME". See docs/ARCHETYPE-CONFIGS.md
+# ("Read this before deciding how to supply them") — the embedding case fails silently, by
+# stamping a fictional version onto every embedded row.
+
+[storage]
+# REQUIRED, no default (domain/config.py: StorageConfig.pg_dsn has none). Placeholder —
+# replace with the real DSN before starting the process, or delete this block and set
+# TB_STORAGE__PG_DSN. Never commit a real credential on this line.
+pg_dsn = "postgresql://CHANGEME:CHANGEME@localhost:5432/tracebed"
+
+[embedding]
+# REQUIRED, no default (EmbeddingConfig.model_version). Pin this to the exact version string
+# your deployment's embedding provider reports — re-pinning later is an explicit, versioned
+# re-embedding migration (PLAN.md §10), never a silent edit of this file in place.
+model_version = "CHANGEME"

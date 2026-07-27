@@ -1,0 +1,88 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tracebed"
+version = "0.1.0"
+description = "Project-scoped learning memory for AI agents."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Tracebed" }]
+
+# Every runtime dependency must clear scripts/license_policy.toml.
+# psycopg is LGPL-3.0-only and is allowed only via the `lgpl_rationale` table there.
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "psycopg[binary,pool]>=3.2",
+    "yoyo-migrations>=9.0",
+    "valkey>=6.0",
+    "httpx>=0.28",
+    "cryptography>=44.0",
+    "pyjwt>=2.10",
+    "prometheus-client>=0.21",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "mypy>=1.14",
+    "ruff>=0.9",
+    "types-pyyaml",
+]
+
+[project.scripts]
+tracebed-api = "tracebed.api.main:run"
+tracebed-worker = "tracebed.workers.runner:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tracebed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "harness"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+markers = [
+    "phase0: Phase 0 gate tests",
+    "phase1: Phase 1 gate tests",
+    "phase2: Phase 2 gate tests",
+    "phase3: Phase 3 gate tests",
+    "phase4: Phase 4 gate tests",
+    "integration: requires the docker compose stack (postgres 18, valkey, seaweedfs)",
+    "slow: long-running (soak, bench)",
+]
+filterwarnings = ["error::DeprecationWarning:tracebed.*"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+mypy_path = "src"
+packages = ["tracebed"]
+warn_unreachable = true
+disallow_any_explicit = false
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["valkey.*", "yoyo.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests", "harness", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "C4", "SIM", "RUF"]
+ignore = [
+    "S101",   # assert: used throughout the test suite
+    "E501",   # line length handled by the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S311"]
+"harness/**" = ["S105", "S106", "S311"]

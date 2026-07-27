@@ -1,0 +1,104 @@
+# high_volume.toml — starting configuration for ~100k runs/day deployments
+# (docs/ARCHETYPE-CONFIGS.md). Tighter latency budgets, bigger ingest batches, more
+# aggressive sweeps.
+#
+# Every field below differs from src/tracebed/domain/config.py's shipped default; the
+# comment on each one states WHY. Anything not listed here is unchanged from the shipped
+# default (see general_purpose.toml) — a field is never restated at its default value here,
+# because doing so would silently pin the old number the day the default moves.
+#
+# TWO FIELDS THIS ARCHETYPE DELIBERATELY DOES NOT TOUCH, both because they read as throughput
+# knobs and are governance controls:
+#
+#   * `scoring.updates_per_memory_per_day` stays at the shipped 1 (D-083). Raising call volume
+#     must never raise how fast one feedback source can walk one memory's Q, and D-021 sizes
+#     its four-calendar-day retirement window on this value being 1.
+#   * `derived.keep_versions` stays at the shipped 20. `workers.derived_state` seeds the
+#     divergence alarm's SLOW reference from the earliest still-retained version (D-075(a)/(d)),
+#     so retention IS the reach of the only watchdog that catches a patient baseline-poisoning
+#     walk — its module docstring says the seeded history "reaches back 20 updates, not
+#     necessarily 30 days". Lowering it hurts most at exactly this archetype, where a key
+#     updates many times a day and 10 versions can be hours rather than weeks of history; that
+#     shortens the slow window and quietly raises the drift rate nothing fires on. A
+#     high-volume deployment that needs the full 30-day slow window should RAISE this. The
+#     storage one derived_state row costs is not the thing to optimise here.
+#
+# The two placeholders below WIN over TB_STORAGE__PG_DSN / TB_EMBEDDING__MODEL_VERSION
+# (pydantic-settings ranks init kwargs above env vars): replace them here, or delete the
+# block and use the env var. See docs/ARCHETYPE-CONFIGS.md.
+
+[storage]
+pg_dsn = "postgresql://CHANGEME:CHANGEME@localhost:5432/tracebed"   # replace before deploy
+
+[embedding]
+model_version = "CHANGEME"   # pin to your deployment's real embedding model version
+
+[retrieval]
+# Default 300 / 200. At 100k runs/day, p99 retrieval latency compounds directly into
+# fleet-wide infrastructure cost; tightening both budgets forces more calls onto the
+# degradation ladder's cheaper rungs (lexical-only, then prefix-only) sooner, trading a
+# little recall for materially lower sustained load on Postgres/the embedding endpoint.
+total_budget_ms = 220
+embed_timeout_ms = 120
+# Default 20_000. Bounds the per-query ANN scan cost directly; at this call volume, letting
+# any single query scan the full default tuple budget is the difference between a query that
+# is merely slower and one that starts a queueing cascade behind it.
+hnsw_max_scan_tuples = 8000
+
+[budget]
+# Default 1200 = 700 static (200 prefs + 500 lessons) + 500 dynamic. A smaller context
+# envelope keeps the marginal token cost of memory bounded across 100k runs/day. All five
+# numbers move together and the two sums still close exactly (150 + 350 = 500 static;
+# 500 + 400 = 900 total), because `hotpath.assembler` treats `total_tokens` as the OUTER
+# bound and silently clamps each pool into what is left: an over-subscribed split does not
+# raise, it just makes the per-pool caps documented here unreachable. The static share moves
+# only slightly (58% -> 56%), so the balance between prefix and dynamic block is preserved
+# rather than quietly re-tuned under cover of a size change.
+total_tokens = 900
+static_prefix = 500
+static_prefix_prefs = 150
+static_prefix_lessons = 350
+dynamic = 400
+
+[lifecycle]
+# Default 30 / 45 / 5. "More aggressive sweeps": shorter quarantine and candidate windows
+# force faster resolution of unconfirmed memory before the vault accumulates a backlog that
+# scales with run volume; faster idle decay keeps a vault that is naturally larger at this
+# volume from growing unbounded, since the traffic itself makes idle-vs-active status churn
+# faster too.
+quarantine_ttl_days = 14
+candidate_ttl_days = 21
+decay_pct_per_idle_week = 8
+
+[proposals]
+# Default 50. Higher legitimate propose_memory volume is expected at 100k runs/day -- still
+# a hard cap, not unbounded, and every proposal still lands quarantined with a provenance
+# class that can never skip corroboration (D-023).
+per_project_daily_cap = 200
+
+[killswitch]
+# Default 200. At this call volume, `killswitch.min_cell_n` observations accumulate in a
+# fraction of the window_days a general-purpose deployment needs -- raising the floor keeps
+# the statistical bar meaningful relative to how fast cells actually fill, rather than
+# leaving it trivially satisfied within hours of a window opening.
+min_cell_n = 500
+
+[abstention]
+# Default 200. A high-volume project's corpus crosses this floor quickly; raising it keeps
+# the cold-start abstention gate meaningful for a meaningfully longer fraction of the
+# project's early life, proportional to how fast the corpus actually fills at this volume.
+rarity_min_corpus_docs = 500
+
+[spend]
+# Default 25.0. 100k runs/day drives proportionally more distiller/judge token spend even
+# with per-call batching; the cap is raised so legitimate load does not pause workers on a
+# cap sized for a much smaller fleet -- still a real ceiling, not a removal of one.
+daily_llm_cap_usd = 150.0
+
+[queue]
+# Default 100 / 30. Bigger batches amortise the fixed per-claim overhead of `SKIP LOCKED`
+# work_queue polling across far more items per poll; the lease is extended alongside the
+# batch size so a full batch can be processed within one lease period without triggering
+# the lease-expiry/re-claim churn a bigger batch would otherwise cause at the old 30s lease.
+batch_size = 500
+lease_seconds = 45

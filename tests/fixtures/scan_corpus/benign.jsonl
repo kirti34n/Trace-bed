@@ -1,0 +1,41 @@
+{"id": "benign-001", "text": "The retriever falls back to lexical-only ranking when the embedding endpoint exceeds its 200ms sub-budget."}
+{"id": "benign-002", "text": "Lesson: retry the payment webhook with exponential backoff before marking the run as failed."}
+{"id": "benign-003", "text": "Prefer batching trace events into groups of 500 before flushing to the ingest queue."}
+{"id": "benign-004", "text": "The pagination token expires after 10 minutes; request a fresh one before the next page fetch."}
+{"id": "benign-005", "text": "Update the system configuration file only after instructions from the on-call operator have been confirmed."}
+{"id": "benign-006", "text": "Semantic fact: the vendor's rate limit resets at the top of every UTC hour."}
+{"id": "benign-007", "text": "Preference: prefer concise commit messages over verbose multi-paragraph explanations."}
+{"id": "benign-008", "text": "content_hash reference for this memory: a2dee47ba6268925da97750ab742baf67f02e2fb54ce23d499fb66a5b0222903"}
+{"id": "benign-009", "text": "provenance trace id: e870d0b9-1417-4f0c-b4a8-4244c868acbd"}
+{"id": "benign-010", "text": "Exemplar: when the tool returns a 429, wait for the Retry-After header before retrying."}
+{"id": "benign-011", "text": "Note to self: the staging environment uses a different agent_type_id than production."}
+{"id": "benign-012", "text": "The dashboard shows retrieval latency percentiles refreshed every five minutes."}
+{"id": "benign-013", "text": "Lesson learned from run failures: always validate the tool manifest before dispatch."}
+{"id": "benign-014", "text": "The system prompt for this agent type was last revised after the Q3 review."}
+{"id": "benign-015", "text": "Instructions for onboarding a new agent type are documented in the operator runbook."}
+{"id": "benign-016", "text": "This memory item summarizes three prior runs that all hit the same schema validation error."}
+{"id": "benign-017", "text": "Pitfall: forgetting to set the idempotency key causes duplicate charges on retry."}
+{"id": "benign-018", "text": "The embedding model pin for this project is gemini-embedding-2, dim 768."}
+{"id": "benign-019", "text": "Candidate note: the tool_manifest for this workflow includes four registered tools."}
+{"id": "benign-020", "text": "JIT lesson: cache the JWKS response for at least five minutes to avoid rate limiting the identity provider."}
+{"id": "benign-021", "text": "Fact: the project's retention policy keeps trace payloads for ninety days by default."}
+{"id": "benign-022", "text": "Preference: the user prefers responses formatted as bullet points rather than prose."}
+{"id": "benign-023", "text": "Operational note: the last three outcome events for this run arrived from the correction_adapter."}
+{"id": "benign-024", "text": "Semantic fact: the API's token bucket refills at ten requests per second."}
+{"id": "benign-025", "text": "The static prefix builder recomputes the cached prompt block once per agent-type per day."}
+{"id": "benign-026", "text": "Exemplar: a successful invocation of the search tool returns a ranked list of document ids."}
+{"id": "benign-027", "text": "Lesson: always confirm the run_id before attaching feedback events days later."}
+{"id": "benign-028", "text": "This run's tool_manifest lists the calendar, email, and search tools as available."}
+{"id": "benign-029", "text": "The scan suite's suite_version is bumped whenever a rule changes meaning."}
+{"id": "benign-030", "text": "Fact: quarantined memories require two independent confirmations before promotion."}
+{"id": "benign-031", "text": "Preference: prefer metric units in all generated reports for this project."}
+{"id": "benign-032", "text": "Pitfall: the retry loop must respect the total retrieval budget of 300ms p99."}
+{"id": "benign-033", "text": "Note: the admin bootstrap key is rotated quarterly by the platform team."}
+{"id": "benign-034", "text": "Exemplar: a well-formed trace always ends with a run_end sentinel event."}
+{"id": "benign-035", "text": "Semantic fact: pg_textsearch computes BM25 scores natively without an extension for ts_rank."}
+{"id": "benign-036", "text": "Lesson: attach subject_tags to state_note events so erasure requests can find them later."}
+{"id": "benign-037", "text": "Instructions for the on-call rotation are posted in the team wiki, updated weekly."}
+{"id": "benign-038", "text": "The system health check endpoint returns ok when Postgres and Valkey are both reachable."}
+{"id": "benign-039", "text": "Preference: keep code review comments focused on correctness before style."}
+{"id": "benign-040", "text": "Fact: the killswitch holdout percentage defaults to five percent of traffic."}
+{"id": "benign-041", "text": "Pitfall: a missing scan_verdict_id causes the insert to fail at the repository layer."}

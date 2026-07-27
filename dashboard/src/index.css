@@ -1,0 +1,199 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ------------------------------------------------------------------------ *
+ * Design tokens — the ONE place "validated", "quarantined", "Tier A" etc.
+ * are given a colour. Every component reaches for `bg-status-*` /
+ * `text-status-*` (tailwind.config.ts wires these names to the variables
+ * below) instead of a raw Tailwind colour, which is what makes "a quarantined
+ * Tier B item must never read like a validated one" a property of the
+ * token table, not of each component author's memory.
+ *
+ * Values are HSL *channel triples* (no `hsl()` wrapper, no commas) because
+ * tailwind.config.ts composes them as `hsl(var(--x) / <alpha-value>)` — that
+ * is what lets call sites use opacity modifiers (`bg-status-validated-bg/50`)
+ * without a second variable per alpha step.
+ * ------------------------------------------------------------------------ */
+:root {
+  --tb-bg: 220 20% 98%;
+  --tb-surface: 0 0% 100%;
+  --tb-surface-raised: 0 0% 100%;
+  --tb-border: 220 14% 88%;
+  --tb-border-strong: 220 14% 74%;
+  --tb-text: 222 30% 14%;
+  --tb-text-muted: 222 12% 40%;
+  --tb-text-faint: 222 10% 58%;
+  --tb-accent: 189 65% 34%;
+  --tb-accent-contrast: 0 0% 100%;
+  --tb-danger: 358 70% 42%;
+  --tb-danger-contrast: 0 0% 100%;
+  --tb-focus-ring: 189 90% 40%;
+  --tb-shadow: 222 30% 10%;
+
+  --status-quarantined-bg: 38 92% 94%;
+  --status-quarantined-fg: 28 75% 28%;
+  --status-quarantined-border: 38 80% 62%;
+
+  --status-candidate-bg: 205 80% 95%;
+  --status-candidate-fg: 209 70% 32%;
+  --status-candidate-border: 205 65% 65%;
+
+  --status-validated-bg: 150 55% 94%;
+  --status-validated-fg: 152 55% 22%;
+  --status-validated-border: 150 45% 55%;
+
+  --status-superseded-bg: 262 45% 95%;
+  --status-superseded-fg: 262 40% 36%;
+  --status-superseded-border: 262 35% 68%;
+
+  --status-stale-bg: 68 45% 92%;
+  --status-stale-fg: 68 55% 22%;
+  --status-stale-border: 68 40% 50%;
+
+  --status-retired-bg: 30 8% 93%;
+  --status-retired-fg: 30 10% 30%;
+  --status-retired-border: 30 8% 66%;
+
+  --status-archived-bg: 210 15% 94%;
+  --status-archived-fg: 210 12% 38%;
+  --status-archived-border: 210 12% 70%;
+
+  --status-pinned-bg: 255 55% 95%;
+  --status-pinned-fg: 255 45% 38%;
+  --status-pinned-border: 255 40% 68%;
+
+  --status-tombstoned-bg: 350 25% 91%;
+  --status-tombstoned-fg: 350 55% 24%;
+  --status-tombstoned-border: 350 30% 50%;
+
+  --tier-a: 205 70% 38%;
+  --tier-b: 30 80% 40%;
+
+  --risk-low: 150 50% 32%;
+  --risk-med: 38 80% 38%;
+  --risk-high: 358 70% 42%;
+
+  --chart-line: 205 70% 42%;
+  --chart-band: 205 70% 42%;
+  --chart-grid: 220 14% 88%;
+  --chart-axis: 222 12% 45%;
+}
+
+.dark {
+  --tb-bg: 222 28% 8%;
+  --tb-surface: 222 24% 11%;
+  --tb-surface-raised: 222 22% 14%;
+  --tb-border: 222 16% 20%;
+  --tb-border-strong: 222 14% 32%;
+  --tb-text: 210 25% 93%;
+  --tb-text-muted: 212 12% 68%;
+  --tb-text-faint: 212 10% 50%;
+  --tb-accent: 189 70% 55%;
+  --tb-accent-contrast: 222 30% 8%;
+  --tb-danger: 358 75% 62%;
+  --tb-danger-contrast: 0 0% 100%;
+  --tb-focus-ring: 189 90% 60%;
+  --tb-shadow: 0 0% 0%;
+
+  --status-quarantined-bg: 38 45% 16%;
+  --status-quarantined-fg: 40 90% 74%;
+  --status-quarantined-border: 38 45% 36%;
+
+  --status-candidate-bg: 205 45% 16%;
+  --status-candidate-fg: 205 85% 76%;
+  --status-candidate-border: 205 40% 38%;
+
+  --status-validated-bg: 150 35% 13%;
+  --status-validated-fg: 150 60% 68%;
+  --status-validated-border: 150 35% 32%;
+
+  --status-superseded-bg: 262 30% 18%;
+  --status-superseded-fg: 262 55% 80%;
+  --status-superseded-border: 262 30% 40%;
+
+  --status-stale-bg: 68 30% 15%;
+  --status-stale-fg: 68 55% 70%;
+  --status-stale-border: 68 30% 34%;
+
+  --status-retired-bg: 30 8% 18%;
+  --status-retired-fg: 30 10% 74%;
+  --status-retired-border: 30 8% 34%;
+
+  --status-archived-bg: 210 14% 16%;
+  --status-archived-fg: 210 12% 70%;
+  --status-archived-border: 210 12% 34%;
+
+  --status-pinned-bg: 255 32% 20%;
+  --status-pinned-fg: 255 70% 84%;
+  --status-pinned-border: 255 32% 42%;
+
+  --status-tombstoned-bg: 350 22% 16%;
+  --status-tombstoned-fg: 350 45% 80%;
+  --status-tombstoned-border: 350 25% 38%;
+
+  --tier-a: 205 80% 68%;
+  --tier-b: 38 85% 65%;
+
+  --risk-low: 150 55% 58%;
+  --risk-med: 40 85% 62%;
+  --risk-high: 358 80% 68%;
+
+  --chart-line: 205 80% 65%;
+  --chart-band: 205 80% 65%;
+  --chart-grid: 222 16% 22%;
+  --chart-axis: 212 12% 60%;
+}
+
+/* Fallback for a client that hasn't run index.html's inline script yet (e.g.
+   this stylesheet loaded standalone) — mirrors .dark exactly, kept in sync by
+   hand since CSS has no variable-block inheritance across at-rules. */
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    color-scheme: dark;
+  }
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-bg text-text antialiased;
+    font-feature-settings: "cv11", "ss01";
+  }
+  /* One visible focus style everywhere, never suppressed — keyboard
+     navigation is a hard requirement (PLAN.md task brief), and a component
+     that hides :focus in favour of a custom state that only covers the mouse
+     path is the single most common way that requirement quietly regresses. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-focus ring-offset-2 ring-offset-bg;
+  }
+  ::selection {
+    @apply bg-accent/30;
+  }
+}
+
+@layer components {
+  /* The scrollbar for horizontally-overflowing tables (wide columns, dense
+     numeric data) — styled, not hidden, so its presence is a legible signal
+     that more columns exist rather than a silently clipped table. */
+  .tb-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--tb-border-strong)) transparent;
+  }
+  .tb-scroll::-webkit-scrollbar {
+    height: 8px;
+    width: 8px;
+  }
+  .tb-scroll::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--tb-border-strong));
+    border-radius: 9999px;
+  }
+  .tb-scroll::-webkit-scrollbar-track {
+    background-color: transparent;
+  }
+}

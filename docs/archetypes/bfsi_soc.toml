@@ -1,0 +1,82 @@
+# bfsi_soc.toml — conservative starting configuration for regulated / BFSI / SOC-shaped
+# deployments (docs/ARCHETYPE-CONFIGS.md). High abstention, strict promotion, low spend.
+#
+# Every field below differs from src/tracebed/domain/config.py's shipped default; the
+# comment on each one states WHY. Anything not listed here is unchanged from the shipped
+# default (see general_purpose.toml) — this file is deliberately NOT a full copy of every
+# section, so a future default change is inherited automatically wherever this archetype did
+# not deliberately diverge from it.
+#
+# The two placeholders below WIN over TB_STORAGE__PG_DSN / TB_EMBEDDING__MODEL_VERSION
+# (pydantic-settings ranks init kwargs above env vars): replace them here, or delete the
+# block and use the env var. See docs/ARCHETYPE-CONFIGS.md.
+
+[storage]
+pg_dsn = "postgresql://CHANGEME:CHANGEME@localhost:5432/tracebed"   # replace before deploy
+
+[embedding]
+model_version = "CHANGEME"   # pin to your deployment's real embedding model version
+
+[abstention]
+# Default 0.60 / 0.50. A BFSI/SOC agent fleet is expected to abstain MORE than the general-
+# purpose ≥50% floor, not merely meet it: raising the similarity and lexical bars means fewer,
+# higher-confidence injections reach a regulated agent's context, trading recall for the kind
+# of false-injection risk PLAN.md section 2 invariant 3 explicitly does not try to solve via
+# rendering alone.
+cos_threshold = 0.72
+bm25_norm_threshold = 0.62
+# Default 200. A young or narrow SOC project corpus should be trusted LESS, not more, than
+# the general-purpose cold-start floor — a compliance-sensitive agent type abstaining longer
+# while its corpus is thin is the intended failure mode, not a regression.
+rarity_min_corpus_docs = 400
+
+[promotion]
+# Default 2 / 2. A regulated deployment should require one more corroborating outcome, and
+# one more distinct principal, before content-derived memory is trusted enough to leave
+# `candidate` for `validated` — raising both above the code-shipped floor, not merely meeting
+# it, is the point of "strict promotion" for this archetype.
+min_outcomes = 3
+min_distinct_principals = 3
+
+[retirement]
+# Default 3. Raising K (the distinct-principal floor below which validated -> retired routes
+# to review_queue instead of auto-retiring, D-021) makes it harder for any small number of
+# feedback sources — malicious or merely noisy — to retire a memory unilaterally, at the cost
+# of more review-queue volume for genuinely bad memories with few users. That trade is the
+# right one for a fleet where an incorrectly-retired compliance-relevant memory is more
+# expensive than an analyst's review-queue minute.
+min_distinct_principals = 5
+
+[lifecycle]
+# Default 30. Unconfirmed, content-derived (Tier B) memory should not sit in quarantine as
+# long in a regulated environment as it does in the general-purpose default — a shorter
+# window forces faster resolution (confirmed and promoted, or archived) rather than letting
+# unconfirmed content accumulate.
+quarantine_ttl_days = 20
+
+[scoring]
+# Default 0.3. A slower learning rate means any single outcome -- including a single bad-
+# faith or mistaken one -- moves a memory's Q less per update, which is the conservative
+# choice when regulatory exposure from an over-trusted memory outweighs the cost of learning
+# more slowly from genuinely good outcomes.
+alpha = 0.15
+
+[proposals]
+# Default 50. `propose_memory` (agent_control mode) proposals always land quarantined with
+# `provenance.class = "proposal"`, a class that can never skip corroboration (D-023) -- but
+# the review-queue and moderation load a proposal stream creates should stay small in a
+# regulated deployment, where every proposal is plausibly something a human has to look at
+# before it goes anywhere.
+per_project_daily_cap = 15
+
+[killswitch]
+# Default 200. A higher minimum cell size raises the statistical bar before the kill switch
+# trusts a lift measurement at all -- appropriate where a false "this memory type is safe"
+# reading, reached on thin data, is the costlier mistake to make.
+min_cell_n = 300
+
+[spend]
+# Default 25.0. Low spend cap: a BFSI/SOC deployment is expected to run smaller, more
+# tightly-scoped agent fleets per project than a high-volume consumer deployment, and a lower
+# cap surfaces runaway distiller/judge spend sooner rather than later.
+daily_llm_cap_usd = 8.0

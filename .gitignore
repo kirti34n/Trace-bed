@@ -1,0 +1,62 @@
+# NOTE: no blanket dot-directory rule (e.g. `.*/`) on purpose — it would silently
+# exclude `.claude/` and any future `.claude-plugin/` from commits. Ignore
+# dot-paths individually, as below.
+
+# Dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# Build output
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated gate reports — regenerate, never commit a stale pass
+gate_report_phase*.md
+gate_report_full.md
+bench_report_phase*.md
+
+# Local trace-store root (contains encrypted trace payloads)
+.tracestore/
+var/
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Claude Code: project config IS tracked; only local-only overrides are ignored
+.claude/settings.local.json
