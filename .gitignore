@@ -38,8 +38,13 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
 .coverage
 htmlcov/
+
+# Merge / patch leftovers
+*.orig
+*.rej
 
 # Generated gate reports — regenerate, never commit a stale pass
 gate_report_phase*.md
