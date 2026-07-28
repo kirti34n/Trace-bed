@@ -12,7 +12,7 @@ measurement and update this file** — a stale handoff is worse than none, becau
 |---|---|
 | Working copy | `/home/kirito/Trace-bed` (WSL2, Ubuntu, native ext4 — not `/mnt/c`) |
 | Remote | https://github.com/kirti34n/Trace-bed |
-| Branch | `live-db-bringup` (six commits ahead of `main` at `ff618bf`; merged into `main` in this session) |
+| Branch | `main` at `3f30c0d` — `main` is the only branch; the `live-db-bringup` work is merged and that branch is now deleted (local + remote) |
 | venv | `uv`-managed CPython 3.13 — always use `.venv/bin/python`, never bare `python3` |
 | Stack | `docker/compose.yaml`: Postgres 18 (pgvector + vchord_bm25) on **5442**, Valkey on **6389**, SeaweedFS on **8333** |
 
