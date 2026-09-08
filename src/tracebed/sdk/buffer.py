@@ -32,10 +32,16 @@ ItemKind = Literal["trace", "feedback", "proposal"]
 
 @dataclass(frozen=True, slots=True)
 class FlushReport:
-    """What one `flush()` call accomplished (PHASE0-CONTRACT.md §10)."""
+    """What one ``flush()`` call observed.
+
+    ``sent`` is work accepted by HTTP in this call. ``dropped`` is local
+    terminal loss since the preceding explicit flush. ``pending`` includes
+    queued and in-flight leased items retained for a later attempt.
+    """
 
     sent: int
     dropped: int
+    pending: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +60,11 @@ class BufferedItem:
     kind: ItemKind
     seq: int | None
     body: Mapping[str, object]
+    # Filled only by the flusher, after the first successful model dump.  It
+    # deliberately lives with the queue item rather than the caller's model:
+    # callers may mutate their model/payload after trace() returns, but a retry
+    # must repeat the exact logical event first offered to the server.
+    encoded: dict[str, object] | None = None
 
 
 class RingBuffer:
@@ -69,13 +80,17 @@ class RingBuffer:
     test: N threads tracing the same run must still produce a gapless seq).
     """
 
-    __slots__ = ("_capacity", "_dropped_total", "_items", "_lock", "_run_seq")
+    __slots__ = ("_capacity", "_dropped_total", "_items", "_leased", "_lock", "_run_seq")
 
     def __init__(self, capacity: int) -> None:
         if capacity < 1:
             raise ValueError("RingBuffer capacity must be >= 1")
         self._capacity = capacity
         self._items: deque[BufferedItem] = deque()
+        # A leased batch is absent from _items while the flusher does network
+        # I/O, but it still occupies capacity.  This lets append() stay fast
+        # without allowing a failure to destroy the batch it needs to retry.
+        self._leased: list[BufferedItem] = []
         # Deliberately UNBOUNDED, unlike every other collection in the SDK: an
         # LRU here would evict a live run's counter and restart its seq at 0,
         # and the trace writer dedups on (run_id, seq) — so eviction would not
@@ -93,7 +108,9 @@ class RingBuffer:
 
         Drop-oldest happens here, inside the same critical section as the seq
         assignment, so a dropped item and a newly-admitted item are never
-        computed from an inconsistent snapshot of the buffer.
+        computed from an inconsistent snapshot of the buffer.  The sole
+        exception is a completely leased buffer: the incoming item is dropped
+        because an in-flight retry candidate must not be evicted.
         """
         with self._lock:
             seq = -1
@@ -102,14 +119,65 @@ class RingBuffer:
                 seq = self._run_seq.get(run_id, 0)
                 self._run_seq[run_id] = seq + 1
                 item_seq = seq
-            if len(self._items) >= self._capacity:
-                self._items.popleft()
+            if len(self._items) + len(self._leased) >= self._capacity:
+                if self._items:
+                    self._items.popleft()
+                # When every slot is leased, an in-flight item cannot be
+                # evicted without destroying retry safety.  Reject the new
+                # item instead; this is the only case that is not ordinary
+                # drop-oldest, and it is still counted exactly once.
+                else:
+                    self._dropped_total += 1
+                    return seq
                 self._dropped_total += 1
             self._items.append(BufferedItem(run_id=run_id, kind=kind, seq=item_seq, body=body))
             return seq
 
+    def lease(self, max_items: int) -> list[BufferedItem]:
+        """Lease up to ``max_items`` oldest items without releasing capacity.
+
+        Exactly one batch may be leased at a time.  The SDK's flush lock
+        provides that serialization; keeping the invariant here makes a
+        mistaken future caller fail safely instead of stranding two batches.
+        """
+        with self._lock:
+            if self._leased:
+                raise RuntimeError("RingBuffer already has a leased batch")
+            n = min(max_items, len(self._items))
+            self._leased = [self._items.popleft() for _ in range(n)]
+            return list(self._leased)
+
+    def settle(
+        self,
+        leased: list[BufferedItem],
+        outcomes: list[Literal["sent", "dropped", "retry"]],
+        replacements: Mapping[int, BufferedItem],
+    ) -> None:
+        """Settle one leased batch, returning retries to the FIFO head.
+
+        ``replacements`` carries first-send frozen payloads.  The replacement
+        occupies the original item's position when it is retried.
+        """
+        with self._lock:
+            if leased != self._leased or len(outcomes) != len(leased):
+                raise RuntimeError("RingBuffer settlement does not match leased batch")
+            retries: list[BufferedItem] = []
+            for index, (item, outcome) in enumerate(zip(leased, outcomes, strict=True)):
+                if outcome == "dropped":
+                    self._dropped_total += 1
+                elif outcome == "retry":
+                    retries.append(replacements.get(index, item))
+            self._leased = []
+            for item in reversed(retries):
+                self._items.appendleft(item)
+
     def drain(self, max_items: int) -> list[BufferedItem]:
-        """Pop up to `max_items` items, oldest first. Empty list if the buffer is empty."""
+        """Pop items atomically for legacy buffer-only callers.
+
+        SDK delivery uses ``lease``/``settle``.  Keeping this original one-lock
+        operation avoids exposing a transient leased state to callers that use
+        RingBuffer directly.
+        """
         with self._lock:
             n = min(max_items, len(self._items))
             return [self._items.popleft() for _ in range(n)]
@@ -119,3 +187,9 @@ class RingBuffer:
         """Cumulative drops since construction — monotonically increasing."""
         with self._lock:
             return self._dropped_total
+
+    @property
+    def pending_count(self) -> int:
+        """Items retained for delivery, including an in-flight leased batch."""
+        with self._lock:
+            return len(self._items) + len(self._leased)

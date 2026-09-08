@@ -1,19 +1,34 @@
 # Tracebed — Adapter & Port Authoring Guide
 
-> How to implement each port in `src/tracebed/adapters/ports.py` correctly. Read this before
-> writing a host adapter for any deployment — Atom or otherwise. `src/tracebed/adapters/atom/`
-> is the Atom-specific seam (documented stubs only); this document is the port contract every
-> one of those stubs, and every other host's adapters, must satisfy.
+> Interface reference for the ports in `src/tracebed/adapters/ports.py`. Read this before
+> implementing a host adapter. No host-specific adapter is shipped by this repository; this
+> document describes interface obligations, not a validated integration or release claim.
 >
-> Rev. 2026-07-26 · Companion to `PLAN.md` §3 (ports table) and `PHASE0-CONTRACT.md` §8–9.
+> Rev. 2026-08-19 · Companion to [`docs/capabilities.toml`](capabilities.toml),
+> [`docs/CAPABILITIES.md`](CAPABILITIES.md), and the threat model. This guide is not a
+> production-readiness claim; consult the capability contract rather than historical PLAN anchors.
+
+## Current integration boundaries
+
+Tracebed is installable as a standalone service. A private application-runtime adapter or a
+real-agent pilot is future work, not an installation prerequisite. The SDK's queued evidence
+delivery is at-least-once: trace sequences, feedback identities, and first-send payloads survive
+retry, but a host must not interpret accepted local enqueue as durable server delivery.
+
+For retrieval, a supplied request budget is one cooperative absolute budget propagated through
+admission and the available concrete boundaries. It prevents later work from starting at expiry
+and narrows supported database and request timeouts; it does not forcibly cancel a native active
+socket read, pool health check, parser, or provider implementation.
 
 ## How to read this document
 
-Tracebed runs fully featured against zero host (`PLAN.md` §1). Every place a real deployment
-differs from that zero-host default is exactly one of the eight `Protocol`s below, each with a
-shipped default that already works. Implementing a port wrong does not usually crash
-anything — most of these failure modes are silent, which is why each section below states its
-failure mode explicitly rather than trusting an integrator to infer it.
+These `Protocol`s identify integration decisions a deployment may need to make. The implementation
+notes below are source-level inventory, not a statement that a default is deployed or suitable for
+an operator's environment. Source presence
+and signature checks do not establish that any adapter works in a target environment. Implementing
+a port wrong does not usually crash anything — most of these failure modes are silent, which is
+why each section below states its failure mode explicitly rather than trusting an integrator to
+infer it.
 
 For each port:
 
@@ -27,8 +42,8 @@ For each port:
   (Two further Protocols — `crypto.shred.SubjectKeyStore` and `domain.config.ConfigStorePort`
   — deliberately live beside their consumers per C-18 and are *not* host-implements ports;
   they are out of scope for this document.)
-- **What the shipped default does** — so "just configure the default" is always considered
-  before "implement the port".
+- **What the source tree names** — useful implementation context, never a deployment or control
+  attestation.
 - **What a host implementation must guarantee** — the properties this port's callers assume
   and never re-check.
 - **Failure mode if it gets it wrong** — concretely, what breaks, and how someone would (or
@@ -39,7 +54,7 @@ For each port:
 ## `PrincipalPort` — verify the caller's own credentials
 
 **What it is for.** Tracebed always verifies its own credentials. It never trusts a host's
-asserted actor header — PLAN.md §3 is explicit ("it never trusts a host's actor header") —
+asserted actor header — the repository boundary is intended never to trust a host actor header —
 because that header is exactly what an attacker would forge to cross a project wall
 (invariant 4). This port is the *only* place "who is this caller" gets decided.
 
@@ -47,11 +62,11 @@ because that header is exactly what an attacker would forge to cross a project w
 
 ```python
 class PrincipalPort(Protocol):
-    def authenticate(self, *, authorization: str | None, api_key: str | None) -> Principal:
+    def authenticate(self, *, authorization: str | None, api_key: str | None, deadline: RemainingBudget | None = None) -> Principal:
         """Raises AuthenticationFailed. Never returns an unauthenticated principal."""
 ```
 
-**What the shipped default does.** `adapters.identity.ChainVerifier` dispatches on scheme —
+**What the source tree names.** `adapters.identity.ChainVerifier` dispatches on scheme —
 `Bearer` → `OidcJwksVerifier` (RS256 against a fetched JWKS document, `sub`/`iss`/`aud`/`exp`
 all required and checked, JWKS refetch on an unknown `kid` throttled to one fetch per 10s
 window to stop request-amplification against the IdP); `X-API-Key: tb_sk_<key_id>.<secret>` →
@@ -62,9 +77,11 @@ load-bearing, not an accident (see failure mode below).
 
 **What a host implementation must guarantee.**
 
-1. Every rejection path — malformed credential, unknown principal, revoked principal, wrong
-   secret, expired token, wrong issuer/audience — raises `AuthenticationFailed`. There is no
-   other legal outcome for a call this port cannot authenticate.
+1. A credential conclusively evaluated as malformed, unknown, revoked, wrong, expired, or from
+   the wrong issuer or audience raises `AuthenticationFailed`. A supplied request budget can be
+   exhausted before or during verification; that is an availability condition, not an
+   authentication result. It must reach the request boundary as the opaque deadline response
+   rather than be converted into `AuthenticationFailed` or a 401.
 2. "Unknown principal" and "wrong credential" must be indistinguishable to the caller, in
    **both** the exception message and the wall-clock time taken to produce it. A verifier
    that returns faster for "no such key_id" than for "key_id exists, secret wrong" is a
@@ -90,8 +107,8 @@ against a host's replacement.
 ## `ProjectResolverPort` — principal → project (the isolation root)
 
 **What it is for.** The single function that turns "who is calling" into "which project's
-data they may see". PLAN.md §2 invariant 4: "`project_id` is derived server-side from the
-authenticated principal via the registry — never caller-asserted."
+data they may see". The intended boundary is that `project_id` is derived server-side from the
+authenticated principal via the registry — never caller-asserted.
 
 **The protocol:**
 
@@ -101,7 +118,7 @@ class ProjectResolverPort(Protocol):
         """Raises ScopeResolutionFailed for an unregistered principal."""
 ```
 
-**What the shipped default does.** `Repo.resolve_project` reads the `agent_registration`
+**What the source tree names.** `Repo.resolve_project` reads the `agent_registration`
 table, whose `UNIQUE(principal_id)` constraint is what makes the principal→project mapping a
 total function rather than a choice a caller or a race could influence. A principal with no
 registration row raises `ScopeResolutionFailed` (mapped to HTTP 403), never a default project.
@@ -120,16 +137,15 @@ registration row raises `ScopeResolutionFailed` (mapped to HTTP 403), never a de
    unregistered, not as a live scope pointed at data mid-erasure.
 
 **Failure mode if it gets it wrong.** This is the isolation root every RLS policy, cache key,
-and repository builder is built on top of (`PHASE0-CONTRACT.md` §3.3: "the ONLY carrier of
-project identity from api to repo"). Getting it wrong here is not a narrower version of the
+and repository builder is built on top of. Getting it wrong here is not a narrower version of the
 `PrincipalPort` failure — it is the *same* failure, one layer down: a resolver that can be
 made to return the wrong `ProjectScope` for a correctly-authenticated principal defeats RLS,
 the per-project Valkey key schema, and the leak suite's premise simultaneously, because all
 three trust this port's output unconditionally.
 
-*(No Atom stub ships for this port — see `adapters/atom/README.md`: it is populated by an
-admin API call, not a Protocol implementation, and Atom's own project entity is the natural
-source of the name/`retention_policy` passed to `POST /admin/projects`.)*
+*Project registration is an administrative deployment concern, not a host-specific adapter
+package. An integrator must decide and test the source of the name and `retention_policy` passed
+to `POST /admin/projects`.*
 
 ---
 
@@ -151,7 +167,7 @@ Four adapter classes exist (`domain.enums.AdapterClass`), each with a fixed serv
 weight nothing on the wire can override: `verdict` (1.0), `correction_adapter` (0.8),
 `downstream` (0.3), `implicit` (0.0 — logged only, never scored).
 
-**What the shipped default does.** `adapters/feedback/{verdict,correction,downstream,
+**What the source tree names.** `adapters/feedback/{verdict,correction,downstream,
 implicit}.py` implement the four classes; `adapters/feedback/base.py`'s `dispatch_feedback`
 is the one function that turns a raw signal into at most one `ScorerPort.record_outcome`
 call, with every refusal (`AmbiguousSignal`, `NoSignal`, a caller-supplied weight, `w == 0`)
@@ -181,7 +197,7 @@ adapter code — there is no field to accept it into.
    fully-trusted one.
 
 **Failure mode if it gets it wrong.** An adapter that guesses at ambiguous signals silently
-reintroduces the exact failure MEMORY-FLOW.md documents by name: run the Q arithmetic with
+reintroduces a known scoring failure: run the Q arithmetic with
 `r=0`, `c≈1`, and the shipped `alpha=0.3` — four calendar days at one update per memory per
 day is enough to retire *any* memory an attacker (or a badly-written adapter) chooses, using
 outcomes the system is designed to trust precisely because they are supposed to be
@@ -205,7 +221,7 @@ class InvalidationPort(Protocol):
     def poll(self) -> Sequence[Mapping[str, object]]: ...
 ```
 
-**What the shipped default does.** Two skeletons, both in `adapters/invalidation.py`:
+**What the source tree names.** Two skeletons, both in `adapters/invalidation.py`:
 `WebhookInvalidationSource` (an in-memory receive/drain buffer a host's own HTTP route feeds,
 at-most-once and single-process — durability across a restart is the R-day revalidation
 sweep's job, not this buffer's) and `PollingInvalidationSource` (interval-diffs a
@@ -224,7 +240,7 @@ key, emitting one raw payload per added/changed/removed item). Both emit the sam
    `stale` for no reason (a availability/quality regression that looks like normal churn on
    the staleness dashboard, not like a bug in this adapter).
 3. `poll()` must be safe to call repeatedly and must not re-emit an event already drained —
-   `PollingInvalidationSource`'s diff-by-stable-key is what the shipped default relies on for
+   `PollingInvalidationSource`'s diff-by-stable-key is what the source implementation relies on for
    this; a host source that instead re-lists "everything currently true" on every poll needs
    its own dedup, or every poll re-invalidates the entire dependent set.
 
@@ -250,15 +266,17 @@ class LLMProviderPort(Protocol):
     def complete(self, *, model: str, prompt: str, temperature: float, max_tokens: int) -> str: ...
 ```
 
-**What the shipped default does.** `adapters.llm.openai_compat.OpenAiCompatibleLLMProvider`:
-an OpenAI-compatible `/chat/completions` call over `httpx`, spoken against
-`LLMProviderConfig.base_url` (default Gemini's OpenAI-compatible endpoint; any
-OpenAI-compatible gateway — LiteLLM, Google-direct, a self-hosted proxy — is one config line,
-no code change). The response body is buffered under a byte ceiling derived from the
-request's own `max_tokens`, and a wall-clock deadline anchored to one `clock.monotonic_ms()`
-reading is re-checked after every chunk read — this is what stops a slow-drip response from
-staying inside every individual per-operation `httpx` timeout while consuming unbounded total
-time. There is no internal retry: the caller owns whatever budget or backoff policy applies.
+**What the source tree names.** `adapters.llm.openai_compat.OpenAiCompatibleLLMProvider` is a
+directly constructible OpenAI-compatible `/chat/completions` adapter. It accepts a base URL and
+key, buffers a response under a byte ceiling derived from the request's `max_tokens`, and checks
+its configured elapsed budget between streamed chunks. There is no in-repository factory or
+default worker wiring for this provider, so its presence does not activate a learned-memory loop
+or establish compatibility with an arbitrary gateway. It also does not interrupt a native HTTP
+read already under way. There is no internal retry: the caller owns its budget and backoff policy.
+
+**Activation status.** This is a background-provider adapter and configuration seam, not proof
+that a worker loop is wired or approved for production. Operators may supply paid API keys and
+another OpenAI-compatible endpoint, but must independently approve data egress and activation.
 
 **What a host implementation must guarantee.**
 
@@ -267,21 +285,20 @@ time. There is no internal retry: the caller owns whatever budget or backoff pol
    dependencies can import it, `scripts/purity_check.py` fails the build. A generative call
    the hot path can reach, reachable or not on any given request, is invariant 1 violated
    outright.
-2. Enforces a *total* deadline across the whole call, not merely a per-socket-operation
-   timeout, exactly like the shipped driver — the judge and distiller run behind a
-   `scoring_epoch` and a batch cadence, but an individual call that can block indefinitely
-   still stalls whatever worker loop is waiting on it.
+2. Applies the configured HTTP phase bounds and checks elapsed time between streamed body
+   advances. This is cooperative accounting, not cancellation of a native call already under
+   way; an integration that needs a harder transport bound must supply one and test it.
 3. Every artifact this port's output feeds records the model id, model version, sampling
-   parameters, and prompt hash (`scoring_epoch` — PLAN.md §5). A host implementation must
+   parameters, and prompt hash (`scoring_epoch`). A host implementation must
    expose enough about what it actually called (not merely the configured `judge_model`
    string, which could be silently re-pointed at a different backend by the gateway) for that
    stamp to be true.
 
 **Failure mode if it gets it wrong.** A generative call reachable from the hot path is a
-purity-gate failure (loud, CI-blocking, caught before merge). A *total*-deadline violation is
-quieter — a worker loop that blocks on one hung call stalls the entire batch behind it, which
-looks like "the distiller/judge/shadow-validator got slow" in operational metrics, not like a
-crash. A `scoring_epoch` that does not reflect what was actually called makes a later
+purity-gate failure (loud, CI-blocking, caught before merge). A provider call that outlasts its
+cooperative checks can stall a worker loop, which looks like
+"the distiller/judge/shadow-validator got slow" in operational metrics, not like a crash. A
+`scoring_epoch` that does not reflect what was actually called makes a later
 cross-epoch Q comparison (already rejected by `domain.errors.CrossEpochComparison`) rejected
 for the wrong reason, or — worse — silently accepted as same-epoch when the model backing it
 actually changed underneath the pin.
@@ -291,8 +308,8 @@ actually changed underneath the pin.
 ## `EmbeddingPort` — query and index embedding (the one generative-shaped port the hot path may call)
 
 **What it is for.** Vector search needs a vector for the query. This is explicitly *not* the
-same category as `LLMProviderPort` — PLAN.md §2 invariant 1: "Query embedding is permitted
-only through `EmbeddingPort` with its own sub-budget (200ms) — it is a vector endpoint, not a
+same category as `LLMProviderPort`: query embedding is permitted only through `EmbeddingPort`
+with its own sub-budget (200ms) — it is a vector endpoint, not a
 generative client."
 
 **The protocol:**
@@ -306,32 +323,36 @@ class EmbeddingPort(Protocol):
     def model_version(self) -> str: ...
 ```
 
-**What the shipped default does.** `adapters.embedding.gemini.GeminiEmbeddingClient` (primary
-— accuracy over latency, per PLAN.md §3) and `adapters.embedding.onnx_local` (secondary,
-fully supported, for air-gapped or latency-sensitive deployments: a pinned local model file,
-loaded through `onnxruntime`, sha256-checked against its pin *before* the runtime session is
-even built — a mismatched file raises `OnnxModelIntegrityError` unconditionally, not a
-warning). Both enforce the same total-deadline discipline as `LLMProviderPort`'s driver, and
-neither retries internally — the retriever owns the 200ms sub-budget and degrades to
-lexical-only on timeout.
+**What the source tree names.** Gemini is the default configured embedding driver and uses
+`LLMProviderConfig.base_url` plus the key named by `LLMProviderConfig.api_key_env`. It can send
+query text from the retrieval path to that configured endpoint under the embedding sub-budget.
+The client sends `model` and `input`, but neither its configured `model_version` nor its configured
+dimension. They remain local metadata and response validation, respectively; they do not attest a
+remote revision or request a smaller vector. Google's [embedding guide](https://ai.google.dev/gemini-api/docs/embeddings)
+documents a default 3072-dimensional output and a separate output-dimensionality control. The
+repository has not made a paid provider request or verified the OpenAI-compatible endpoint's
+dimension behavior, so this is an implementation seam with open live-compatibility validation,
+not a deployment claim. The deterministic hash-local driver is a development/test fallback, not
+an accuracy or deployment claim. An alternative endpoint can be configured, but arbitrary
+compatible-provider behavior is not validated by this repository.
 
 **What a host implementation must guarantee.**
 
-1. Raises `domain.errors.EmbeddingTimeout` at `timeout_ms`, never blocks past it, and never
-   retries internally. The retriever's degradation ladder (embed timeout → lexical-only;
-   total budget exceeded → static-prefix-only; store error → nothing) depends on this port
-   failing fast and cleanly, not on it eventually succeeding.
+1. Uses `timeout_ms` to bound new embedding work, checks the supplied budget at its cooperative
+   boundaries, and never retries internally. It cannot forcibly cancel a provider call already
+   in native I/O. The retriever's degradation ladder (embed timeout → lexical-only; total budget
+   exceeded → static-prefix-only; store error → nothing) depends on this port failing cleanly,
+   not on it eventually succeeding.
 2. Every float returned is finite. A single `NaN` in a stored vector poisons the cosine
    distance of every ANN comparison it ever participates in, silently, forever (until that
    row is re-embedded) — there is no downstream check that would catch it after the fact.
-3. `model_id`/`model_version` are the real, currently-serving values, stamped on every row
-   that gets embedded (`memory_item.embedding_model_id`/`embedding_model_version`). Re-pointing
-   a deployment at a different embedding model without bumping these is the exact silent
-   re-embedding PLAN.md §10 forbids by name.
-4. Dimension matches the deployment's pin (`EmbeddingConfig.dim`, `<= 768`, stored as
-   `halfvec(768)`). A driver that returns a different dimension than the pin fails the
-   *insert*, not the embed call — which is the right place for it to fail loudly, but only if
-   the driver does not silently pad or truncate to make the shapes match first.
+3. `model_id`/`model_version` are the configured values stamped on rows
+   (`memory_item.embedding_model_id`/`embedding_model_version`). A deployment must independently
+   verify the provider revision behind those labels; this adapter does not.
+4. The returned dimension must match the deployment's configured pin and storage shape. The
+   shipped Gemini request does not ask the provider for that dimension, so a mismatch is rejected
+   by local response validation rather than repaired by padding or truncation. Verify a provider's
+   dimension-control protocol before relying on the Gemini path.
 
 **Failure mode if it gets it wrong.** A driver that blocks past `timeout_ms` (rather than
 raising) is invisible in exactly the way that matters most: the retriever's fail-open ladder
@@ -359,11 +380,9 @@ class TraceStorePort(Protocol):
         """Raises NotFound on a missing object AND on a ref outside the caller's
         project prefix — checked BEFORE any network call."""
     def exists(self, project_id: ProjectId, ref: PayloadRef) -> bool: ...
-    def delete_project(self, project_id: ProjectId) -> int:
-        """Removes every object under the project's prefix; returns the count removed."""
 ```
 
-**What the shipped default does.** `FsTraceStore` (filesystem, Phase 0 default) and
+**What the source tree names.** `FsTraceStore` (filesystem) and
 `S3TraceStore` (generic S3 REST over `httpx` with hand-rolled SigV4 — no boto3, no MinIO SDK;
 SeaweedFS is the primary S3 target, legacy MinIO stays usable only because the driver speaks
 plain S3, MinIO's own OSS repo having been archived 2026-04-25). Both key every object by
@@ -378,18 +397,27 @@ directory, specifically because a naive prefix check alone is defeated by a
 1. Every key embeds `project_id`, and a `get`/`exists` call for a ref outside the caller's
    resolved project fails exactly like a truly-absent ref (`NotFound`) — invariant 4's
    "uniform 404" property, restated at the object-store layer.
-2. Byte-immutability. Nothing about crypto-shredding works if the store allows rewriting an
-   object in place — erasure is supposed to be *key destruction*, with the object's bytes
-   never touched (see `docs/OPERATIONS.md`'s erasure section). A store that supports
-   overwrite-in-place is not wrong to use, but a host relying on it for erasure has
-   reinvented "delete the payload", which throws away the provenance chain every derived
-   memory needs.
+2. Normal trace ports are non-destructive. E3 uses a distinct `TraceErasurePort` with
+   `erase_run`/`verify_run_absent` and `erase_project`/`verify_project_absent`; it removes the
+   complete canonical run or project prefix and independently proves absence. A host must not
+   add a best-effort delete method to the hot read/write port. Each destructive call has a
+   bounded timeout and accepts the executor's progress callback; adapters call it between
+   pages and between delete and absence proof so a lost lease stops before the next I/O or DB
+   mark. A timeout is retryable, never an absence result. The destructive Valkey command seam
+   receives the remaining deadline on every `SCAN` and `UNLINK`; a deployment must bind that
+   value to a socket/driver timeout (or cancellable async operation) and raise `TimeoutError`.
+   A wall-clock check after an unbounded call is not a timeout implementation.
 3. Path-style addressing / no unintended dot-segment normalisation. `S3TraceStore`'s own
    docstring names the specific hazard: `httpx` applies RFC 3986 dot-segment removal to
    request paths, so an unvalidated ref containing `..` could be silently rewritten onto a
    different project's object *after* a naive prefix check already passed — a host
    implementation using a different HTTP client needs the equivalent structural check
    (`ref_matches_project`, not a substring match) before building any request.
+4. S3 erasure parsing is fail-closed: `IsTruncated` and every required next-page marker must
+   occur exactly once with the exact valid value, and every `Contents`, `Version`, or
+   `DeleteMarker` entry must carry exactly one nonempty canonical key (with a version id for
+   versioned entries). Missing, duplicate, malformed, foreign-prefix, or non-advancing fields
+   block; they cannot be interpreted as an empty prefix.
 
 **Failure mode if it gets it wrong.** A store that fails the cross-project isolation
 guarantee is a straightforward leak — the exact thing leak-suite probe (e) exists to catch,
@@ -415,21 +443,19 @@ class AuditSinkPort(Protocol):
     def emit(self, event: Mapping[str, object]) -> None: ...
 ```
 
-**What the shipped default does — CONTRACT GAP, reported, not papered over.** PLAN.md §3
-names the default as "JSON-lines to stdout + Postgres audit table; optional S3 sink." **No
-concrete implementation of this port exists anywhere in this codebase as of this writing.**
-`AuditSinkPort` appears in exactly two places in `src/tracebed/`: its own Protocol definition
-in `adapters/ports.py`, and one docstring reference in `workers/killswitch.py` describing
-what a caller *would* record. There is no writer for either half of the described default.
-This is the one port in this document where "configure the shipped default" is not an
-available option — a host (Atom or otherwise) wanting durable audit output today must
-implement this port from scratch, and should treat `adapters.atom.stubs.AtomMinioAuditSink`
-as a documented signature to fill in, not a partially-working starting point.
+**Source-level gap — reported, not papered over.** No concrete implementation of this port is
+established as a durable audit sink by this repository.
+Its Protocol is defined in `adapters/ports.py`, while a docstring in `workers/killswitch.py`
+only describes what a caller *would* record. There is no writer for either half of the described
+default.
+This is the one port in this document where "configure the source implementation" is not an
+available option — a host wanting durable audit output must implement this port and validate it
+against its own retention, access, and incident requirements.
 
 **What a host implementation must guarantee.**
 
 1. `emit` must not raise in a way that blocks or fails the governance action it is recording.
-   None of PLAN.md §2's eight invariants makes a kill-switch trigger, a promotion, or a
+   The intended boundary does not make a kill-switch trigger, a promotion, or a
    retirement conditional on audit-sink availability — an audit sink that can take one of
    those down by throwing has turned an observability concern into an availability one.
 2. Every event this port is handed should be treated as append-only and durable at the sink's
@@ -453,12 +479,16 @@ missing-but-harmless gap into an availability or tamper-evidence problem the mom
 
 ---
 
-## Replacing ReMe — what is gained, what is lost, what is not there yet
+## Historical comparison: a session-summary system
+
+> This section preserves a point-in-time design comparison. It is not a current implementation,
+> migration, erasure, or production-capability claim. The authoritative current status is the
+> generated capability contract, which marks retention and erasure/project deletion as blocked.
 
 The instruction this section answers was "replace ReMe — just make sure we are not losing
 anything". D-030 waived a ReMe compatibility shim on the grounds that the delta "is documented
 in the adapter guide instead". It was not: until this section existed, the word "ReMe" appeared
-three times in the entire repository, all three in DECISIONS.md and PLAN.md, and none of them a
+three times in the historical repository record, and none of them a
 parity analysis. This is that analysis, written against the tree as it actually stands rather
 than against the plan.
 
@@ -472,7 +502,7 @@ lessons, facts, exemplars, preferences — each pointing down to the raw trace t
 each quarantined until confirmed, each retrieved only when it clears an abstention gate, and
 each rendered as a labelled data block rather than as instructions.
 
-| Capability | ReMe | Tracebed today | Verdict |
+| Capability | Session-summary system | Historical Tracebed snapshot | Historical verdict |
 |---|---|---|---|
 | Store something at end of session | conversation summary | trace written, payload encrypted, indexed | **kept**, in a stronger form (provenance, crypto-shred per subject) |
 | Hand it back next session | unconditional replay of the summary | **NOT PRESENT** | **LOST — see below** |
@@ -485,11 +515,10 @@ each rendered as a labelled data block rather than as instructions.
 | Deletion / right-to-erasure | delete the row | crypto-shred by subject key | **gained** |
 
 **The honest headline.** A deployment that switches from ReMe to Tracebed *today* loses the one
-thing ReMe actually did — session-to-session recall of a conversation summary — and gains a
+thing the session-summary system actually did — session-to-session recall of a conversation summary — and gains a
 governed pipeline that is not yet closed at the far end. Traces go in faithfully; outcome events
 go in faithfully; nothing derives, promotes, scores, or retires anything, because the write path
-for `memory_item.status` does not exist (PLAN.md, "Known gaps against the original spec", items
-M1–M4). Retrieval works and is well tested, but there is nothing in the vault that got there by
+for `memory_item.status` does not exist in the historical snapshot. Retrieval works and is well tested, but there is nothing in the vault that got there by
 learning.
 
 **Three specific things to do before calling ReMe replaced:**
@@ -509,6 +538,5 @@ learning.
 
 ---
 
-*See also: `PLAN.md` §3 (the ports table this document expands), `docs/OPERATIONS.md`
-(running the service the ports plug into), `src/tracebed/adapters/atom/README.md` (the
-Atom-specific mapping of components to these ports).*
+*See also: [`docs/CAPABILITIES.md`](CAPABILITIES.md), [`docs/OPERATIONS.md`](OPERATIONS.md),
+and [`docs/THREAT-MODEL.md`](THREAT-MODEL.md).*

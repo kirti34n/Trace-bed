@@ -1,4 +1,4 @@
-"""Worker process: per-topic `WorkQueue` dispatch (PLAN.md §7 Phase 2, chunk
+"""Worker process: per-topic `WorkerQueue` dispatch (PLAN.md §7 Phase 2, chunk
 `worker-runner`). `run()` is pyproject's `tracebed-worker` console entry
 point.
 
@@ -29,17 +29,11 @@ injected clock and refuse the one action that turns an overrun into data
 loss. Once a batch's lease has expired, the rows it came from are already
 claimable by another consumer (`_CLAIM_SQL`'s `lease_expires_at < now()`),
 so a second worker may be holding and processing them right now.
-`ack()` after an overrun is still safe -- it deletes a row whose work has
-been done, and the other consumer's later `ack()` is a documented no-op. But
-`nack()` after an overrun is NOT: `_NACK_SQL` sets `lease_expires_at = NULL`
-unconditionally, which CLEARS THE OTHER CONSUMER'S LIVE LEASE and hands the
-row to a third worker while the second is still mid-flight -- unbounded
-concurrent duplicates from what looks like an ordinary retry. So a batch
-whose handler raised AFTER its lease expired is left to expire naturally
-(already redeliverable, no lease to clear) and counted on
-`WORKER_LEASE_OVERRUNS`, rather than nacked. The cost is one lost backoff
-interval on an item that had already overrun; `max_attempts` still bounds it
-into `dead_letter`.
+Every acknowledgement outcome is generation-fenced by the claimed attempt
+and lease expiry. A worker which has been superseded by a renewed lease cannot
+clear, delete, or dead-letter the current claimant's work; its mutation is a
+safe no-op. The runner still records an overrun so operations can tune lease
+duration rather than silently treating the condition as ordinary throughput.
 
 PROJECT-HOMOGENEOUS BATCHES (PLAN.md §10 -- no cross-project aggregation of
 any kind, ever): `work_queue` is unpartitioned (contract §5.3), so a single
@@ -56,27 +50,40 @@ by convention at each call site.
 from __future__ import annotations
 
 import logging
+import os
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 from prometheus_client import Counter
 
+from tracebed.domain.errors import ActivityBusy
+from tracebed.stores.pg.activity import ActivityGate
 from tracebed.stores.pg.queue import QueueItem, compute_backoff
 
 if TYPE_CHECKING:
-    from tracebed.adapters.ports import QueueConsumerPort
+    from psycopg_pool import ConnectionPool
+
+    from tracebed.adapters.ports import EmbeddingPort, QueueConsumerPort, WorkerQueueConsumerPort
     from tracebed.domain.clock import Clock
+    from tracebed.domain.config import TracebedSettings
     from tracebed.domain.ids import ProjectId
+    from tracebed.stores.pg.authority_dsn import RuntimeDsn
+    from tracebed.stores.tracestore import TraceStorePort
 
 __all__ = [
     "BatchHandler",
     "WorkBatch",
+    "WorkerOwnedResources",
+    "WorkerResourceFactories",
     "WorkerRunner",
     "group_by_project",
+    "register_worker_cleanup",
     "run",
+    "supervise_worker_loops",
 ]
 
 logger = logging.getLogger(__name__)
@@ -110,6 +117,159 @@ is an operational polling cadence, not one of PLAN.md §6's business
 thresholds, so a named, explicit default here is not hard rule 4's "magic
 number" -- it is the same choice that sibling module already made, kept
 consistent rather than reinvented."""
+
+
+WorkerLoop = Callable[[threading.Event], None]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerOwnedResources:
+    """Concrete process resources owned together by one private ``ExitStack``.
+
+    The stack is intentionally not exposed to a worker body.  A body can use
+    the resources, but cannot pop or discard their callbacks; normal return,
+    a body exception, and a later construction failure all leave through the
+    same reverse-order cleanup path.
+    """
+
+    pool: object
+    tracestore: object
+    embedding: object
+    valkey: object
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerResourceFactories:
+    """Concrete process-resource constructors, including a narrow test seam.
+
+    Production supplies real constructors below.  Tests may supply closable
+    concrete fakes, but cannot pass cleanup callbacks separately: ownership
+    is always derived from each actual object's ``.close`` method.
+    """
+
+    build_pool: Callable[[], object]
+    build_tracestore: Callable[[], object]
+    build_embedding: Callable[[], object]
+    build_valkey: Callable[[], object]
+
+
+def register_worker_cleanup(resources: ExitStack, close: Callable[[], None]) -> None:
+    """Register one concrete owned resource without widening an adapter port.
+
+    Composition decides ownership from the concrete constructor it called;
+    data ports deliberately do not grow a ``close`` method merely because one
+    process happens to hold a socket.  Registering each concrete closer as it
+    is built gives ``ExitStack`` the same reverse-order guarantee for normal
+    shutdown and partial construction failure.
+    """
+
+    resources.callback(close)
+
+
+def _required_closer(resource: object, *, name: str) -> Callable[[], None]:
+    """Return the real closer for a mandatory concrete process resource."""
+
+    close = getattr(resource, "close", None)
+    if not callable(close):
+        raise TypeError(f"worker {name} resource must expose a callable close()")
+    return cast(Callable[[], None], close)
+
+
+def _optional_closer(resource: object) -> Callable[[], None] | None:
+    """Find an optional concrete closer without widening any data port."""
+
+    close = getattr(resource, "close", None)
+    return cast(Callable[[], None], close) if callable(close) else None
+
+
+@contextmanager
+def _owned_worker_resources(
+    factories: WorkerResourceFactories,
+) -> Iterator[WorkerOwnedResources]:
+    """Acquire pool → trace → embedding → Valkey under one private stack.
+
+    Registration occurs immediately after each construction.  Consequently a
+    trace, embedding, or Valkey construction failure closes exactly the
+    already-owned resources, and every yielded body exits through the same
+    stack in reverse acquisition order.
+    """
+
+    with ExitStack() as resources:
+        pool = factories.build_pool()
+        register_worker_cleanup(resources, _required_closer(pool, name="pool"))
+
+        tracestore = factories.build_tracestore()
+        if close := _optional_closer(tracestore):
+            register_worker_cleanup(resources, close)
+
+        embedding = factories.build_embedding()
+        if close := _optional_closer(embedding):
+            register_worker_cleanup(resources, close)
+
+        valkey = factories.build_valkey()
+        register_worker_cleanup(resources, _required_closer(valkey, name="Valkey"))
+        yield WorkerOwnedResources(
+            pool=pool,
+            tracestore=tracestore,
+            embedding=embedding,
+            valkey=valkey,
+        )
+
+
+def supervise_worker_loops(
+    loops: Sequence[tuple[str, WorkerLoop]],
+    stop: threading.Event,
+) -> None:
+    """Run every process loop under one fail-fast, join-before-reraise policy.
+
+    A loop that returns while no external shutdown was requested is just as
+    unhealthy as one that raises: leaving the other loops alive would make a
+    half-working worker look healthy.  Thread failures are collected under a
+    lock, trigger the shared stop once, and are re-raised on the main thread
+    only after every started thread joined.  An externally-set stop is the
+    normal exit path and records no synthetic failure.
+    """
+
+    failures: list[BaseException] = []
+    failure_lock = threading.Lock()
+
+    def _record(error: BaseException) -> None:
+        with failure_lock:
+            failures.append(error)
+        stop.set()
+
+    def _target(name: str, loop: WorkerLoop) -> None:
+        try:
+            loop(stop)
+        except BaseException as exc:
+            logger.exception("worker process: %s loop died", name)
+            _record(exc)
+            return
+        if not stop.is_set():
+            _record(RuntimeError(f"worker process: {name} loop returned unexpectedly"))
+
+    threads = [
+        threading.Thread(
+            target=_target,
+            args=(name, loop),
+            name=f"tracebed-{name}",
+            daemon=False,
+        )
+        for name, loop in loops
+    ]
+    started: list[threading.Thread] = []
+    try:
+        for thread in threads:
+            thread.start()
+            started.append(thread)
+    except BaseException as exc:
+        _record(exc)
+    finally:
+        for thread in started:
+            thread.join()
+
+    if failures:
+        raise failures[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,19 +334,20 @@ class BatchHandler(Protocol):
 
 
 class WorkerRunner:
-    """Claims from `WorkQueue` by topic, dispatches each project-homogeneous
+    """Claims from `WorkerQueue` by topic, dispatches each project-homogeneous
     batch to its registered handler, and acks/nacks accordingly. See the
     module docstring for the at-least-once/lease/graceful-shutdown contract.
     """
 
     def __init__(
         self,
-        queue: QueueConsumerPort,
+        queue: WorkerQueueConsumerPort,
         clock: Clock,
         handlers: Mapping[str, BatchHandler],
         *,
         batch_size: int,
         lease_seconds: int,
+        activity: ActivityGate | None = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -202,6 +363,7 @@ class WorkerRunner:
         # A default here would be an invented literal silently disagreeing with
         # the store (hard rule 4).
         self._lease_ms = lease_seconds * 1000.0
+        self._activity = activity
         # Every worker takes a Clock (hard rule 3); used here for a
         # wall-clock-free "last time any batch was processed" signal a
         # future health check can read, never for gating dispatch itself.
@@ -250,6 +412,31 @@ class WorkerRunner:
         redelivery.
         """
         try:
+            if self._activity is None:
+                return self._run_batch_while_fenced(topic, handler, batch, claimed_at_ms)
+            # The shared activity lock deliberately includes ACK/NACK. A
+            # request cannot acquire its exclusive drain between a handler's
+            # final durable write and the queue settlement that makes stale
+            # work observable for another consumer.
+            with self._activity.shared(batch.project_id):
+                return self._run_batch_while_fenced(topic, handler, batch, claimed_at_ms)
+        except ActivityBusy:
+            # No handler has run. NACK the claimed attempt so its durable
+            # snapshot is reloaded after the request's exclusive drain ends.
+            if self._lease_expired(claimed_at_ms):
+                WORKER_LEASE_OVERRUNS.labels(topic=topic).inc()
+                return len(batch.items)
+            for item in batch.items:
+                self._nack(item)
+                WORKER_ITEMS_NACKED.labels(topic=topic).inc()
+            return len(batch.items)
+
+    def _run_batch_while_fenced(
+        self, topic: str, handler: BatchHandler, batch: WorkBatch, claimed_at_ms: float
+    ) -> int:
+        """Dispatch and settle while the caller holds the project shared gate."""
+
+        try:
             handler.handle(batch)
         except Exception:
             logger.exception(
@@ -270,7 +457,7 @@ class WorkerRunner:
                 )
                 return len(batch.items)
             for item in batch.items:
-                self._queue.nack(item.id, compute_backoff(item.attempts))
+                self._nack(item)
                 WORKER_ITEMS_NACKED.labels(topic=topic).inc()
             return len(batch.items)
         if self._lease_expired(claimed_at_ms):
@@ -286,9 +473,21 @@ class WorkerRunner:
                 self._lease_ms,
             )
         for item in batch.items:
-            self._queue.ack(item.id)
+            self._ack(item)
         WORKER_BATCHES_PROCESSED.labels(topic=topic).inc()
         return len(batch.items)
+
+    def _ack(self, item: QueueItem) -> None:
+        if item.authority_version == 1:
+            self._queue.ack(item)
+        else:
+            cast("QueueConsumerPort", self._queue).ack(item.id)
+
+    def _nack(self, item: QueueItem) -> None:
+        if item.authority_version == 1:
+            self._queue.nack(item, compute_backoff(item.attempts))
+        else:
+            cast("QueueConsumerPort", self._queue).nack(item.id, compute_backoff(item.attempts))
 
     def run_forever(
         self,
@@ -319,7 +518,7 @@ class WorkerRunner:
 def run() -> None:
     """Console entry point (`tracebed-worker`, pyproject.toml). Builds real
     adapters from `TracebedSettings` read off the process environment and
-    runs FOUR loops -- one thread each -- on one shared shutdown signal:
+    runs FIVE loops -- one thread each -- on one shared shutdown signal:
 
       * the ingest consumer loop (`ingest.runner.ConsumerRunner` over real
         `TraceWriter`/`OutcomeIntake`) -- the two Phase 0 topics this
@@ -372,6 +571,12 @@ def run() -> None:
         RETURN if any module under `workers/` is neither scheduled nor
         accounted for.
 
+      * the trace-learning pull loop, which claims at most one Tier-A/v1 job
+        per project, decrypts its strict archive, plans under freshly resolved
+        config, and makes one fenced finalizer call.  It is intentionally not
+        a periodic Scheduler job: work immediately triggers the next sweep;
+        idle periods wait on the ingest polling cadence.
+
     Cadences come from `domain.config.WorkersConfig`, which exists precisely
     because the previous version of this docstring recorded the contract gap
     that made this loop unbuildable: "`domain/config.py` has no field for how
@@ -392,203 +597,258 @@ def run() -> None:
     loop but still holds the others looks alive to a supervisor while silently
     draining nothing, which is strictly worse than exiting and being restarted.
     """
-    import signal
+    _run_worker_process()
 
+
+def _load_worker_runtime_configuration() -> tuple[RuntimeDsn, TracebedSettings]:
+    """Read the exclusive worker DB credential before non-DB settings.
+
+    Runtime processes intentionally inherit no general PostgreSQL/libpq
+    environment controls: the split worker URL is the sole DB connection
+    input.  The normal settings model still carries Valkey, trace-store,
+    embedding and pool-timeout configuration, while its legacy library
+    ``storage.pg_dsn`` must stay absent in production.
+    """
+
+    from tracebed.domain.config import TracebedSettings
+    from tracebed.domain.errors import ConfigError
+    from tracebed.stores.pg.authority_dsn import runtime_dsn_from_environment
+
+    runtime_dsn = runtime_dsn_from_environment("tracebed_worker", os.environ)
+    settings = TracebedSettings()
+    if settings.storage.pg_dsn is not None:
+        raise ConfigError("runtime database credential configuration is invalid")
+    return runtime_dsn, settings
+
+
+def _run_worker_process(
+    *,
+    resource_factories: WorkerResourceFactories | None = None,
+    process_body: Callable[[WorkerOwnedResources], None] | None = None,
+) -> None:
+    """Construct, supervise, and close the five worker loops.
+
+    Tests can inject only concrete resource constructors and a body.  They
+    still enter the same private ownership context as production; neither the
+    body nor any resource factory receives the ``ExitStack`` itself.
+    """
+
+    if resource_factories is not None:
+        if process_body is None:
+            raise ValueError("injected worker resources require a process body")
+        with _owned_worker_resources(resource_factories) as owned:
+            process_body(owned)
+        return
+    if process_body is not None:
+        raise ValueError("an injected process body requires resource factories")
+
+    import signal
+    from types import FrameType
+
+    from psycopg_pool import ConnectionPool
+
+    from tracebed.adapters.embedding.factory import build_embedding_driver, model_pin_from_settings
+    from tracebed.crypto.shred import EnvMasterKeyProvider, SubjectKeyManager
     from tracebed.domain.clock import SystemClock
-    from tracebed.domain.config import ConfigResolver, TracebedSettings
+    from tracebed.domain.config import ConfigResolver
     from tracebed.domain.errors import ConfigError
     from tracebed.ingest.outcome_intake import OutcomeIntake
     from tracebed.ingest.runner import ConsumerRunner
     from tracebed.ingest.trace_writer import TraceWriter
+    from tracebed.stores.pg.activity import ActivityGate, create_activity_pool
+    from tracebed.stores.pg.erasure import WorkerErasureGuard
     from tracebed.stores.pg.pool import create_pool
-    from tracebed.stores.pg.queue import WorkQueue
-    from tracebed.stores.pg.repo import Repo
-    from tracebed.stores.tracestore import TraceStorePort
-    from tracebed.stores.tracestore.fs import FsTraceStore
-    from tracebed.stores.tracestore.s3 import S3TraceStore
-    from tracebed.workers.registry import WorkerDeps, build_default_registry
-    from tracebed.workflow.agent_control import AgentControl, ProposalIntake
-
-    def _build_tracestore(cfg: TracebedSettings, clock: SystemClock) -> TraceStorePort:
-        tc = cfg.storage.tracestore
-        if tc.driver == "fs":
-            return FsTraceStore(tc.root)
-        if tc.driver == "s3":
-            return S3TraceStore(tc, clock=clock)
-        raise ConfigError(f"unknown storage.tracestore.driver: {tc.driver!r}")
-
-    settings = TracebedSettings()
-    clock = SystemClock()
-    # D-139, same two process-level bounds as `api/main.py`'s hot-path pool. Deliberately NOT the
-    # per-statement bound: a distiller or scorer sweep legitimately runs far longer than any
-    # retrieval budget, and a `statement_timeout` inherited from the hot path is precisely the
-    # cross-plane leak `stores.pg.pool`'s transaction-scoped `set_config` exists to prevent.
-    pool = create_pool(
-        settings.storage.pg_dsn,
-        connect_timeout_s=settings.storage.pg_connect_timeout_s,
-        checkout_timeout_s=settings.storage.pg_checkout_timeout_s,
-    )
-    repo = Repo(pool, clock)
-    queue = WorkQueue(pool, clock, settings.queue)
-    tracestore = _build_tracestore(settings, clock)
-
-    from tracebed.crypto.shred import EnvMasterKeyProvider, SubjectKeyManager
-
-    keys = SubjectKeyManager(store=repo, master=EnvMasterKeyProvider(), clock=clock)
-    writer = TraceWriter(queue, repo, tracestore, keys, clock, settings)
-    outcomes = OutcomeIntake(queue, repo, clock, settings)
-    ingest_runner = ConsumerRunner(writer, outcomes, clock)
-
-    # `Repo` satisfies both AgentControlRepoPort and DurableProposalCapPort, so the
-    # proposal caps this process enforces are exact across processes, not merely across
-    # this process's threads -- asserted below rather than assumed, because the difference
-    # is invisible until a second consumer is running.
-    agent_control = AgentControl(repo, clock)
-    if not agent_control.durable_caps:  # pragma: no cover - wiring assertion
-        raise ConfigError(
-            "the proposal consumer was wired with a store that cannot enforce "
-            "proposals.per_run_cap / per_project_daily_cap across processes"
-        )
-    # One ConfigResolver, reused by the proposal intake AND the periodic plane below. It is
-    # stateless (`effective()` rebuilds its working copy from settings on every call), so a
-    # single instance is the same as N; naming it once keeps both consumers on identical
-    # resolution semantics.
-    resolver = ConfigResolver(settings, repo)
-    proposal_intake = ProposalIntake(
-        queue,
-        agent_control,
-        repo,
-        resolver,
-        batch_size=settings.queue.batch_size,
-    )
-
-    worker_runner = WorkerRunner(
-        queue=queue,
-        clock=clock,
-        handlers=build_default_registry(WorkerDeps()),
-        batch_size=settings.queue.batch_size,
-        lease_seconds=settings.queue.lease_seconds,
-    )
-
-    # ---- the periodic plane (FIDELITY-AUDIT.md M1/M2/M3) --------------------
-    from tracebed.adapters.embedding.factory import (
-        build_embedding_driver,
-        model_pin_from_settings,
-    )
     from tracebed.stores.pg.queue import (
         TOPIC_MEMORY_PROPOSAL,
         TOPIC_OUTCOME_EVENT,
         TOPIC_TRACE_EVENT,
+        WorkerQueue,
     )
+    from tracebed.stores.pg.repo import Repo
+    from tracebed.stores.pg.runtime_identity import (
+        probe_runtime_prepublication_readiness,
+        runtime_pool_configure,
+    )
+    from tracebed.stores.tracestore.fs import FsTraceStore
+    from tracebed.stores.tracestore.s3 import S3TraceStore
     from tracebed.stores.valkey.client import ValkeyClient
-    from tracebed.workers.composition import build_learning_plane, build_scheduled_jobs
+    from tracebed.workers.composition import (
+        build_learning_plane,
+        build_scheduled_jobs,
+        build_trace_learning_runner,
+    )
+    from tracebed.workers.registry import WorkerDeps, build_default_registry
     from tracebed.workers.scheduler import Scheduler
     from tracebed.workers.spend import SpendMeter
+    from tracebed.workflow.agent_control import AgentControl, ProposalIntake
 
-    # The static-prefix cache (StaticPrefixCachePort) the prefix_builder publishes into. Built
-    # once here -- valkey-py is lazy, so no socket opens until the first command, and constructing
-    # it at wiring time is safe (contract §12).
-    valkey = ValkeyClient.from_url(settings.storage.valkey_url)
+    def _build_tracestore(settings: TracebedSettings, clock: SystemClock) -> TraceStorePort:
+        config = settings.storage.tracestore
+        if config.driver == "fs":
+            return FsTraceStore(config.root)
+        if config.driver == "s3":
+            return S3TraceStore(config, clock=clock)
+        raise ConfigError(f"unknown storage.tracestore.driver: {config.driver!r}")
 
-    plane = build_learning_plane(
-        pool=pool,
-        repo=repo,
-        clock=clock,
-        cfg=settings.workers,
-        pin=model_pin_from_settings(settings),
-        # The SAME driver construction the API process uses, imported rather than repeated:
-        # two processes stamping `embedding_model_id` from two independently-built drivers is
-        # how a query embedding and a stored vector end up in different vector spaces.
-        embedding_port=build_embedding_driver(settings, clock),
-        spend=SpendMeter(repo, clock, settings.spend),
-        key_manager=keys,
-        # No implementation exists; see run()'s docstring. Passed explicitly as None rather
-        # than omitted so the absence is visible at the call site, not only in a default.
-        candidate_source=None,
+    runtime_dsn, settings = _load_worker_runtime_configuration()
+    clock = SystemClock()
+
+    def _build_worker_pool() -> ConnectionPool:
+        pool = create_pool(
+            runtime_dsn.value,
+            connect_timeout_s=settings.storage.pg_connect_timeout_s,
+            checkout_timeout_s=settings.storage.pg_checkout_timeout_s,
+            configure=runtime_pool_configure("tracebed_worker"),
+            checkout_check=ConnectionPool.check_connection,
+        )
+        try:
+            probe_runtime_prepublication_readiness(pool, expected_role="tracebed_worker")
+        except Exception:
+            pool.close()
+            raise
+        return pool
+
+    factories = WorkerResourceFactories(
+        build_pool=_build_worker_pool,
+        build_tracestore=lambda: _build_tracestore(settings, clock),
+        build_embedding=lambda: build_embedding_driver(settings, clock),
+        build_valkey=lambda: ValkeyClient.from_url(settings.storage.valkey_url),
     )
-    scheduler = Scheduler(
-        clock,
-        build_scheduled_jobs(
-            plane,
-            cfg=settings.workers,
-            list_project_ids=repo.list_project_ids,
-            queue_observability=queue,
-            topics=(TOPIC_TRACE_EVENT, TOPIC_OUTCOME_EVENT, TOPIC_MEMORY_PROPOSAL),
-            lease_seconds=settings.queue.lease_seconds,
+
+    def _production_body(owned: WorkerOwnedResources) -> None:
+        pool = cast("ConnectionPool", owned.pool)
+        tracestore = cast("TraceStorePort", owned.tracestore)
+        embedding_port = cast("EmbeddingPort", owned.embedding)
+        valkey = cast(ValkeyClient, owned.valkey)
+        repo = Repo(pool, clock)
+        queue = WorkerQueue(pool, clock, settings.queue)
+        activity_pool = create_activity_pool(
+            runtime_dsn.value,
+            connect_timeout_s=settings.storage.pg_connect_timeout_s,
+            checkout_timeout_s=settings.storage.pg_checkout_timeout_s,
+            connection_check=runtime_pool_configure("tracebed_worker"),
+            checkout_check=ConnectionPool.check_connection,
+        )
+        activity = ActivityGate(activity_pool)
+        erasure_guard = WorkerErasureGuard(pool)
+        keys = SubjectKeyManager(store=repo, master=EnvMasterKeyProvider(), clock=clock)
+        writer = TraceWriter(
+            queue,
+            repo,
+            tracestore,
+            keys,
+            clock,
+            settings,
+            activity=activity,
+            erasure_guard=erasure_guard,
+        )
+        outcomes = OutcomeIntake(
+            queue,
+            repo,
+            clock,
+            settings,
+            activity=activity,
+            erasure_guard=erasure_guard,
+        )
+        ingest_runner = ConsumerRunner(writer, outcomes, clock)
+
+        agent_control = AgentControl(repo, clock)
+        if not agent_control.durable_caps:  # pragma: no cover - wiring assertion
+            raise ConfigError(
+                "the proposal consumer was wired with a store that cannot enforce "
+                "proposals.per_run_cap / per_project_daily_cap across processes"
+            )
+        resolver = ConfigResolver(settings, repo)
+        proposal_intake = ProposalIntake(
+            queue,
+            agent_control,
+            repo,
+            resolver,
+            batch_size=settings.queue.batch_size,
+            activity=activity,
+            erasure_guard=erasure_guard,
+        )
+        worker_runner = WorkerRunner(
+            queue=queue,
             clock=clock,
-            config_resolver=resolver,
-            memory_store=repo,
-            prefix_cache=valkey,
-            list_agent_type_ids=repo.list_agent_type_ids,
+            handlers=build_default_registry(WorkerDeps()),
+            batch_size=settings.queue.batch_size,
+            lease_seconds=settings.queue.lease_seconds,
+            activity=activity,
+        )
+        plane = build_learning_plane(
+            pool=pool,
+            repo=repo,
+            clock=clock,
+            cfg=settings.workers,
+            pin=model_pin_from_settings(settings),
+            embedding_port=embedding_port,
+            spend=SpendMeter(repo, clock, settings.spend),
             candidate_source=None,
-        ),
-    )
-
-    from types import FrameType
-
-    stop = threading.Event()
-
-    def _shutdown(signum: int, frame: FrameType | None) -> None:
-        del signum, frame
-        stop.set()
-
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
-
-    def _supervised(name: str, loop: Callable[[threading.Event], None]) -> Callable[[], None]:
-        def _target() -> None:
-            try:
-                loop(stop)
-            except BaseException:
-                logger.exception("worker process: %s loop died", name)
-                raise
-            finally:
-                # Whichever loop ends first ends the process. See the
-                # docstring: a half-dead process is worse than a restarted one.
-                stop.set()
-
-        return _target
-
-    def _proposal_loop(stop_event: threading.Event) -> None:
-        # The SAME cadence the ingest loop polls its own two topics with, read off that
-        # loop's config rather than restated: three consumers of one `work_queue` polling
-        # at three different invented intervals is a load profile nobody chose.
-        proposal_intake.run_forever(
-            stop_event, poll_interval_s=ingest_runner.config.poll_interval_s
+        )
+        scheduler = Scheduler(
+            clock,
+            build_scheduled_jobs(
+                plane,
+                cfg=settings.workers,
+                list_project_ids=repo.list_project_ids,
+                queue_observability=queue,
+                topics=(TOPIC_TRACE_EVENT, TOPIC_OUTCOME_EVENT, TOPIC_MEMORY_PROPOSAL),
+                lease_seconds=settings.queue.lease_seconds,
+                clock=clock,
+                config_resolver=resolver,
+                memory_store=repo,
+                prefix_cache=valkey,
+                list_agent_type_ids=repo.list_agent_type_ids,
+                candidate_source=None,
+                activity=activity,
+            ),
+        )
+        trace_learning_runner = build_trace_learning_runner(
+            pool=pool,
+            repo=repo,
+            tracestore=tracestore,
+            keys=keys,
+            config_resolver=resolver,
+            clock=clock,
+            lease_seconds=settings.queue.lease_seconds,
+            poll_interval=timedelta(seconds=ingest_runner.config.poll_interval_s),
+            activity=activity,
+            erasure_guard=erasure_guard,
         )
 
-    def _scheduler_loop(stop_event: threading.Event) -> None:
-        """Ticks until shutdown. `Scheduler.tick()` decides which jobs are due off the
-        injected clock, so the tick cadence here is only the RESOLUTION at which cadences are
-        observed -- a job never runs more often than its own interval regardless of how fast
-        this loop spins. Sleeps via `stop_event.wait`, never `time.sleep`, so a SIGTERM during
-        an idle wait is honoured immediately (identical to `WorkerRunner.run_forever`)."""
-        while not stop_event.is_set():
-            scheduler.tick()
-            stop_event.wait(settings.workers.scheduler_tick_seconds)
+        stop = threading.Event()
 
-    ingest_thread = threading.Thread(
-        target=_supervised("ingest", ingest_runner.run_forever),
-        name="tracebed-ingest",
-        daemon=True,
-    )
-    scheduler_thread = threading.Thread(
-        target=_supervised("scheduler", _scheduler_loop),
-        name="tracebed-scheduler",
-        daemon=True,
-    )
-    proposal_thread = threading.Thread(
-        target=_supervised("proposal", _proposal_loop),
-        name="tracebed-proposals",
-        daemon=True,
-    )
-    worker_thread = threading.Thread(
-        target=_supervised("worker", worker_runner.run_forever),
-        name="tracebed-worker",
-        daemon=True,
-    )
-    threads = (ingest_thread, proposal_thread, worker_thread, scheduler_thread)
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+        def _shutdown(signum: int, frame: FrameType | None) -> None:
+            del signum, frame
+            stop.set()
+
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
+
+        def _proposal_loop(stop_event: threading.Event) -> None:
+            proposal_intake.run_forever(
+                stop_event, poll_interval_s=ingest_runner.config.poll_interval_s
+            )
+
+        def _scheduler_loop(stop_event: threading.Event) -> None:
+            while not stop_event.is_set():
+                scheduler.tick()
+                stop_event.wait(settings.workers.scheduler_tick_seconds)
+
+        try:
+            supervise_worker_loops(
+                (
+                    ("ingest", ingest_runner.run_forever),
+                    ("proposals", _proposal_loop),
+                    ("worker", worker_runner.run_forever),
+                    ("scheduler", _scheduler_loop),
+                    ("trace-learning", trace_learning_runner.run_forever),
+                ),
+                stop,
+            )
+        finally:
+            activity_pool.close()
+
+    with _owned_worker_resources(factories) as owned:
+        _production_body(owned)

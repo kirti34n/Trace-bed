@@ -66,7 +66,7 @@ class TraceStorePort(Protocol):
 
     def exists(self, project_id: ProjectId, ref: PayloadRef) -> bool: ...
 
-    def delete_project(self, project_id: ProjectId) -> int:
-        """Removes every object under the project's prefix; returns the
-        count of objects removed."""
-        ...
+    # Deliberately no destructive method.  E3 uses the separate
+    # ``tracebed.erasure.ports.TraceErasurePort`` capability, which requires
+    # delete *and* independent absence verification under a short-lived
+    # erasure lease.

@@ -41,6 +41,7 @@ blocks importing this module at all; that is a cross-chunk blocker, not a defect
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -57,8 +58,10 @@ from psycopg.types.json import Json
 from psycopg_pool import ConnectionPool
 
 from tracebed.core.scans import verify_verdict
+from tracebed.crypto.subject_digest import subject_digest
 from tracebed.domain.canonical import content_hash
 from tracebed.domain.clock import Clock
+from tracebed.domain.config import MAX_QUEUE_ATTEMPTS
 from tracebed.domain.enums import (
     Arm,
     InstrumentationSource,
@@ -70,8 +73,14 @@ from tracebed.domain.enums import (
     TrustTier,
 )
 from tracebed.domain.errors import (
+    AuthorizationDenied,
     DuplicateRegistration,
+    ErasureFenced,
+    ErasureSnapshotStale,
     NotFound,
+    RequestDeadlineExceeded,
+    RetrievalAuditUnavailable,
+    RunAuthorityDenied,
     ScopeResolutionFailed,
 )
 from tracebed.domain.ids import AgentTypeId, MemoryId, PrincipalId, ProjectId, RunId, mint_memory_id
@@ -81,13 +90,21 @@ from tracebed.domain.scope import ProjectScope
 from tracebed.domain.signatures import ABSENT_SIGNATURE, is_absent_signature
 from tracebed.domain.state_machine import Status, assert_legal_creation_status
 from tracebed.stores.pg.ddl import LEXICAL_TOKENIZER
-from tracebed.stores.pg.pool import _unscoped, scoped
+from tracebed.stores.pg.pool import (
+    PoolDeadlineExceeded,
+    RemainingBudget,
+    _unscoped,
+    is_expired_deadline_query_cancellation,
+    refresh_deadline_statement_timeout,
+    scoped,
+)
 from tracebed.stores.pg.rows import (
     InjectionRow,
     InvalidationEventRow,
     KillswitchStateRow,
     MemoryItemRow,
     OutcomeEventInsert,
+    OutcomeReplayConflict,
     PrincipalRow,
     RetrievalEventInsert,
     ReviewQueueRow,
@@ -96,6 +113,7 @@ from tracebed.stores.pg.rows import (
     TraceIndexRow,
     TraceIndexUpsert,
 )
+from tracebed.workers.trace_learning import validate_pipeline
 
 __all__ = [
     "MAX_ROW_LIMIT",
@@ -114,6 +132,7 @@ logger = logging.getLogger(__name__)
 # Capability token: holding it is what proves a `ScopedRepo` came from `Repo.tx`. Module-private
 # and never exported, so no other module can pass the check (see `ScopedRepo.__init__`).
 _SCOPED_REPO_TOKEN: Final[object] = object()
+_AUTHORIZED_RETRIEVAL_AUDIT_CAPABILITY: Final[object] = object()
 
 # The exhaustive exception list to "every builder's first parameter is project_id" (contract
 # §5.1). A single source of truth so the repo and its introspection test cannot drift apart.
@@ -170,6 +189,35 @@ _INITIAL_CONFIDENCE = 0.0
 # the id genuinely does not exist or belongs to another project. One literal, used everywhere.
 _NOT_FOUND_MESSAGE = "not found"
 
+# E2 durable disclosure predicates.  Runtime credentials intentionally have
+# no table ACL on the erasure request/fence/set relations.  These predicates
+# therefore call profiled SECURITY DEFINER boolean filters, bound to the RLS
+# project GUC, rather than embedding ACL-empty table joins in application SQL.
+_ERASURE_MEMORY_VISIBLE_SQL: Final[str] = """
+AND public.tracebed_runtime_memory_visible(memory_item.project_id, memory_item.id)
+""".strip()
+
+_ERASURE_PROJECT_READABLE_SQL: Final[str] = """
+public.tracebed_runtime_project_readable(%(project_id)s::uuid)
+""".strip()
+
+_ERASURE_INVALIDATION_VISIBLE_SQL: Final[str] = """
+public.tracebed_runtime_subjects_visible(
+    invalidation_event.project_id, invalidation_event.subject_digests
+)
+""".strip()
+
+_ERASURE_RUN_VISIBLE_TEMPLATE: Final[str] = """
+public.tracebed_runtime_run_visible(@TABLE@project_id, @TABLE@run_id)
+""".strip()
+
+
+def _erasure_run_visible_sql(table: str) -> str:
+    """Render a fixed table-name E2 fence for one export projection."""
+
+    return _ERASURE_RUN_VISIBLE_TEMPLATE.replace("@TABLE@", f"{table}.")
+
+
 # Tables considered "this project's data" for /export/project (contract §5.1 iter_export_rows).
 # Not specified exhaustively by the contract; see this chunk's contract_gaps.
 _EXPORT_TABLES: tuple[str, ...] = (
@@ -190,7 +238,7 @@ _EXPORT_TABLES: tuple[str, ...] = (
 _MEMORY_ITEM_EXPORT_COLUMNS: Final[str] = (
     "id, project_id, scope_type, scope_id, mem_type, kind, lane, trust_tier, status, "
     "content, content_hash, token_count, embedding_model_id, embedding_model_version, "
-    "subject_tag, q_value, confidence, scored_use_count, last_scored_at, strike_count, "
+    "subject_tag, subject_digests, q_value, confidence, scored_use_count, last_scored_at, strike_count, "
     "shadow_confirm_runs, cluster_id, ttl_class, pinned, last_retrieved_at, "
     "last_revalidated_at, status_changed_at, valid_from, valid_to, created_at, expired_at, "
     "provenance, scan_verdict_id, schema_version, epoch_id"
@@ -201,7 +249,8 @@ _MEMORY_ITEM_EXPORT_COLUMNS: Final[str] = (
 # table, because the point of this fix is that a FUTURE column added to any of these five tables
 # has to be a conscious edit here, not a `SELECT *` that picks it up for free.
 _OUTCOME_EVENT_EXPORT_COLUMNS: Final[str] = (
-    "event_id, run_id, project_id, principal_id, adapter, r, payload, occurred_at, arrived_at"
+    "event_id, run_id, project_id, principal_id, adapter, r, payload, occurred_at, arrived_at, "
+    "subject_digests"
 )
 _INJECTION_LOG_EXPORT_COLUMNS: Final[str] = (
     "run_id, project_id, memory_id, slot, score, tokens, injected_at"
@@ -241,12 +290,13 @@ _TRACE_INDEX_UPSERT_TEMPLATE = """
 INSERT INTO trace_index (
     project_id, run_id, agent_type_id, workflow_template_id, submitter_principal,
     input_signature_hash, instrumentation_source, arm, path, started_at, ended_at,
-    payload_ref, outcome_status
+    payload_ref, outcome_status, envelope_versions
 ) VALUES (
     %(project_id)s, %(run_id)s, %(agent_type_id)s, %(workflow_template_id)s,
     %(submitter_principal)s, %(input_signature_hash)s, %(instrumentation_source)s,
     COALESCE(@ARM_SUBQUERY@, '@MEMORY_ON@'),
-    %(path)s, %(started_at)s, %(ended_at)s, %(payload_ref)s, %(outcome_status)s
+    %(path)s, %(started_at)s, %(ended_at)s, %(payload_ref)s, %(outcome_status)s,
+    %(envelope_versions)s::smallint[]
 )
 ON CONFLICT (project_id, run_id) DO UPDATE SET
     -- `agent_type_id` is the third identity-bearing column: it is an INPUT to
@@ -315,6 +365,14 @@ ON CONFLICT (project_id, run_id) DO UPDATE SET
         WHEN EXCLUDED.outcome_status = '@PENDING@' THEN trace_index.outcome_status
         ELSE EXCLUDED.outcome_status
     END,
+    -- A run may accumulate old v1 objects and later gated v2 objects.  The
+    -- index records the exact sorted observed set rather than letting a
+    -- retry erase one version from the archive integrity contract.
+    envelope_versions = ARRAY(
+        SELECT DISTINCT version
+        FROM unnest(trace_index.envelope_versions || EXCLUDED.envelope_versions) AS versions(version)
+        ORDER BY version
+    ),
     -- `arm` is re-derived from the same server-side source on every merge, never from
     -- EXCLUDED: `EXCLUDED.arm` would be whatever the INSERT half computed for THIS batch, and
     -- an earlier batch that ran before the retrieval_event row was visible must not pin the
@@ -322,6 +380,7 @@ ON CONFLICT (project_id, run_id) DO UPDATE SET
     -- value when the subquery finds nothing, so the merge is monotone: it can correct
     -- 'memory_on' upward to the real arm, never downward to a default.
     arm = COALESCE(@ARM_SUBQUERY@, trace_index.arm)
+WHERE trace_index.outcome_status NOT IN ('ok', 'error', 'cancelled')
 """
 
 # `_impl_upsert_trace_index` reads these two columns back after the upsert above to compare
@@ -345,6 +404,46 @@ _TRACE_INDEX_UPSERT_SQL: Final[str] = (
     .replace("@ARM_SUBQUERY@", _SERVER_DERIVED_ARM_SUBQUERY)
 )
 
+# The trace writer calls this only through ``ScopedRepo`` while holding its
+# per-run advisory lock.  The INSERT SELECT makes terminal eligibility a DB
+# fact too: no top-level Repo call can enqueue a pending/incomplete archive,
+# and the full four-part conflict target keeps future pipeline versions
+# independent.
+_SCHEDULE_TRACE_LEARNING_JOB_SQL: Final[str] = """
+INSERT INTO trace_learning_job (
+    project_id, run_id, pipeline, pipeline_version, state, attempts,
+    max_attempts, available_at, trace_ended_at, schedule_source, scheduled_at, updated_at,
+    subject_digests
+)
+SELECT project_id, run_id, %(pipeline)s, %(pipeline_version)s, 'pending', 0,
+       %(max_attempts)s, clock_timestamp(), ended_at, 'live', clock_timestamp(), clock_timestamp(),
+       COALESCE((
+           SELECT array_agg(subject_digest ORDER BY subject_digest)
+           FROM trace_subject
+           WHERE trace_subject.project_id = trace_index.project_id
+             AND trace_subject.run_id = trace_index.run_id
+       ), ARRAY[public.tracebed_subject_digest(trace_index.project_id, '__project__')]::bytea[])
+FROM trace_index
+WHERE project_id = %(project_id)s
+  AND run_id = %(run_id)s
+  AND outcome_status IN ('ok', 'error', 'cancelled')
+  AND ended_at IS NOT NULL
+ON CONFLICT (project_id, run_id, pipeline, pipeline_version) DO NOTHING
+RETURNING 1
+"""
+
+_SCHEDULE_TRACE_LEARNING_JOB_EXISTING_SQL: Final[str] = """
+SELECT job.trace_ended_at, job.schedule_source, job.max_attempts, idx.ended_at
+FROM trace_learning_job AS job
+JOIN trace_index AS idx
+  ON idx.project_id = job.project_id AND idx.run_id = job.run_id
+WHERE job.project_id = %(project_id)s
+  AND job.run_id = %(run_id)s
+  AND job.pipeline = %(pipeline)s
+  AND job.pipeline_version = %(pipeline_version)s
+FOR UPDATE OF job
+"""
+
 if "@" in _TRACE_INDEX_UPSERT_SQL:  # pragma: no cover - import-time structural guard
     raise RuntimeError(
         "trace_index upsert template has an unsubstituted placeholder; the merge rules would "
@@ -354,7 +453,7 @@ if "@" in _TRACE_INDEX_UPSERT_SQL:  # pragma: no cover - import-time structural 
 _TRACE_INDEX_COLUMNS: Final[str] = (
     "project_id, run_id, agent_type_id, workflow_template_id, submitter_principal, "
     "input_signature_hash, instrumentation_source, arm, path, started_at, ended_at, "
-    "payload_ref, outcome_status"
+    "payload_ref, outcome_status, envelope_versions"
 )
 
 # Explicit column list instead of `SELECT *` on `memory_item`. Three reasons, all real:
@@ -385,7 +484,7 @@ INSERT INTO memory_item (
     content, content_hash, token_count, subject_tag, q_value, confidence,
     scored_use_count, strike_count, cluster_id, ttl_class, pinned, valid_from,
     valid_to, created_at, status_changed_at, provenance, scan_verdict_id,
-    schema_version, lexemes, content_bm25
+    schema_version, lexemes, content_bm25, subject_digests
 ) VALUES (
     %(id)s, %(project_id)s, %(scope_type)s, %(scope_id)s, %(mem_type)s, %(kind)s,
     %(lane)s, %(trust_tier)s, %(status)s, %(content)s, %(content_hash)s,
@@ -394,7 +493,8 @@ INSERT INTO memory_item (
     %(pinned)s, %(valid_from)s, %(valid_to)s, %(created_at)s, %(status_changed_at)s,
     %(provenance)s, %(scan_verdict_id)s, %(schema_version)s,
     to_tsvector('english', %(content)s),
-    tokenizer_catalog.tokenize(%(content)s, '@TOKENIZER@')::bm25_catalog.bm25vector
+    tokenizer_catalog.tokenize(%(content)s, '@TOKENIZER@')::bm25_catalog.bm25vector,
+    %(subject_digests)s::bytea[]
 )
 """.strip()
 _INSERT_MEMORY_ITEM_SQL: Final[str] = _INSERT_MEMORY_ITEM_TEMPLATE.replace(
@@ -402,6 +502,47 @@ _INSERT_MEMORY_ITEM_SQL: Final[str] = _INSERT_MEMORY_ITEM_TEMPLATE.replace(
 )
 if "@" in _INSERT_MEMORY_ITEM_SQL:  # pragma: no cover - import-time structural guard
     raise RuntimeError("insert_memory_item template has an unsubstituted placeholder")
+
+_LOCK_ERASURE_SNAPSHOT_SQL: Final[str] = """
+SELECT public.tracebed_lock_run_subject_snapshot(
+    %(project_id)s::uuid,
+    %(run_id)s::uuid,
+    %(subject_digests)s::bytea[]
+) AS subject_digests
+""".strip()
+
+_BIND_RUN_MEMORY_SQL: Final[str] = """
+SELECT public.tracebed_bind_run_memory(
+    %(project_id)s::uuid,
+    %(run_id)s::uuid,
+    %(memory_id)s::uuid,
+    %(subject_digests)s::bytea[]
+) AS subject_digests
+""".strip()
+
+_INSERT_SUBJECT_KEY_V2_SECDEF_SQL: Final[str] = """
+SELECT public.tracebed_insert_subject_key_v2(
+    %(project_id)s::uuid,
+    %(subject_digest)s::bytea,
+    %(key_id)s::uuid,
+    %(wrapped_kek)s::bytea
+)
+""".strip()
+
+_ASSERT_ERASURE_RUN_WRITE_SQL: Final[str] = """
+SELECT public.tracebed_assert_erasure_write_allowed(
+    %(project_id)s::uuid,
+    ARRAY[%(run_id)s::uuid],
+    %(subject_digests)s::bytea[]
+)
+""".strip()
+
+_ERASURE_RUN_SUBJECT_DIGESTS_SQL: Final[str] = """
+SELECT public.tracebed_erasure_run_subject_digests(
+    %(project_id)s::uuid,
+    %(run_id)s::uuid
+) AS subject_digests
+""".strip()
 
 # `trace_index`'s export list is the same projection the upsert already writes
 # (`_TRACE_INDEX_COLUMNS` above -- deliberately reused, not duplicated, since it is already every
@@ -432,10 +573,53 @@ _EXPORT_COLUMNS: Final[Mapping[str, str]] = {
 # an export means more than "what a retrieval-path row needs".
 _EXPORT_EXCLUDED_COLUMNS: Final[Mapping[str, frozenset[str]]] = {
     "memory_item": frozenset({"embedding", "lexemes", "content_bm25"}),
-    "trace_index": frozenset(),
-    "outcome_event": frozenset(),
-    "injection_log": frozenset(),
-    "retrieval_event": frozenset(),
+    # E2 uses these internal opaque digests solely for durable fence
+    # predicates. An export must never turn them into a target-enumeration
+    # surface; the rows are filtered server-side instead.
+    "trace_index": frozenset({"subject_digests"}),
+    # Authority-envelope provenance is intentionally withheld until the 0011
+    # export-role/redaction contract decides which authority metadata can
+    # leave a project export. It is present in 0010 solely for dual-mode
+    # queue/outcome storage, not as a public export-field commitment.
+    "outcome_event": frozenset(
+        {
+            "authority_version",
+            "source_agent_type_id",
+            "source_grant_id",
+            "feedback_source",
+            "run_owner_principal_id",
+            "run_owner_agent_type_id",
+        }
+    ),
+    "injection_log": frozenset({"subject_digests"}),
+    "retrieval_event": frozenset({"subject_digests"}),
+}
+
+_ERASURE_INJECTION_EXPORT_SQL: Final[str] = (
+    (
+        "@RUN@ AND EXISTS (SELECT 1 FROM memory_item WHERE "
+        "memory_item.project_id = injection_log.project_id "
+        "AND memory_item.id = injection_log.memory_id @MEMORY@)"
+    )
+    .replace("@RUN@", _erasure_run_visible_sql("injection_log"))
+    .replace("@MEMORY@", _ERASURE_MEMORY_VISIBLE_SQL)
+)
+
+# Every exported relation has its own durable fence predicate.  Keeping an
+# explicit entry for every table makes adding a new export projection an
+# auditable decision rather than falling back to generic ``project_id``.
+_EXPORT_ERASURE_VISIBILITY_SQL: Final[Mapping[str, str]] = {
+    # Export appends exactly one ``AND`` before every entry below.  The general
+    # memory predicate deliberately includes its own leading ``AND`` because it
+    # is also interpolated into several fixed queries above, so normalise only
+    # this export-facing entry rather than producing ``AND AND`` for the live
+    # stream.  The value remains a fixed module constant, never SQL assembled
+    # from a route input.
+    "memory_item": _ERASURE_MEMORY_VISIBLE_SQL.removeprefix("AND "),
+    "trace_index": _erasure_run_visible_sql("trace_index"),
+    "outcome_event": _erasure_run_visible_sql("outcome_event"),
+    "injection_log": _ERASURE_INJECTION_EXPORT_SQL,
+    "retrieval_event": _erasure_run_visible_sql("retrieval_event"),
 }
 
 if frozenset(_EXPORT_COLUMNS) != frozenset(_EXPORT_TABLES) or frozenset(
@@ -445,6 +629,9 @@ if frozenset(_EXPORT_COLUMNS) != frozenset(_EXPORT_TABLES) or frozenset(
         "_EXPORT_COLUMNS/_EXPORT_EXCLUDED_COLUMNS and _EXPORT_TABLES have drifted -- every "
         "exported table needs exactly one explicit column list and one explicit excluded set"
     )
+
+if frozenset(_EXPORT_ERASURE_VISIBILITY_SQL) != frozenset(_EXPORT_TABLES):  # pragma: no cover
+    raise RuntimeError("every exported table must have one durable erasure predicate")
 
 
 # Advisory-lock class id for the proposal-cap critical section. `pg_advisory_xact_lock`'s
@@ -601,6 +788,11 @@ def _row_to_trace_index(row: DictRow) -> TraceIndexRow:
         ended_at=row["ended_at"],
         payload_ref=row["payload_ref"],
         outcome_status=TraceOutcomeStatus(row["outcome_status"]),
+        envelope_versions=(
+            tuple(int(version) for version in row["envelope_versions"])
+            if row["envelope_versions"] is not None
+            else None
+        ),
     )
 
 
@@ -618,6 +810,7 @@ def _trace_index_params(project_id: ProjectId, row: TraceIndexUpsert) -> dict[st
         "ended_at": row.ended_at,
         "payload_ref": row.payload_ref,
         "outcome_status": row.outcome_status.value,
+        "envelope_versions": list(row.envelope_versions),
     }
 
 
@@ -641,6 +834,40 @@ class Repo:
         """
         with scoped(self._pool, project_id) as conn:
             yield ScopedRepo(self, conn, project_id, _token=_SCOPED_REPO_TOKEN)
+
+    def _authorized_retrieval_audit(
+        self,
+        conn: psycopg.Connection[Any],
+        project_id: ProjectId,
+        run_id: RunId,
+        deadline: RemainingBudget,
+        *,
+        _capability: object,
+    ) -> _AuthorizedRetrievalAudit:
+        if _capability is not _AUTHORIZED_RETRIEVAL_AUDIT_CAPABILITY:
+            raise TypeError("authorized retrieval audit factory is private")
+        return _AuthorizedRetrievalAudit(
+            self, conn, project_id, run_id, deadline, _capability=_capability
+        )
+
+    @contextmanager
+    def _config_read_connection(
+        self, project_id: ProjectId, *, deadline: RemainingBudget | None
+    ) -> Iterator[psycopg.Connection[Any]]:
+        """Translate only an expired config-read boundary into request expiry.
+
+        A non-expired query failure remains an ordinary repository failure.  The resolver uses
+        this named signal to avoid treating an exhausted request as malformed configuration.
+        """
+        try:
+            with scoped(self._pool, project_id, deadline=deadline) as conn:
+                yield conn
+        except PoolDeadlineExceeded as exc:
+            raise RequestDeadlineExceeded() from exc
+        except Exception as exc:
+            if is_expired_deadline_query_cancellation(exc, deadline):
+                raise RequestDeadlineExceeded() from exc
+            raise
 
     # ------------------------------------------------------------------ registry [registry]-
 
@@ -708,7 +935,11 @@ class Repo:
         return principal_id
 
     def get_principal_by_external_ref(
-        self, external_ref: str, *, kind: Literal["oidc_sub", "api_key"] | None = None
+        self,
+        external_ref: str,
+        *,
+        kind: Literal["oidc_sub", "api_key"] | None = None,
+        deadline: RemainingBudget | None = None,
     ) -> PrincipalRow | None:
         """Authentication's identity lookup (contract §9.1: `ApiKeyVerifier`/`OidcJwksVerifier`
         both reach a principal through this one method).
@@ -738,9 +969,19 @@ class Repo:
             # the ambiguity branch below is unreachable rather than merely unlikely.
             sql += "kind = %(kind)s AND external_ref = %(external_ref)s LIMIT 2"
             params["kind"] = kind
-        with _unscoped(self._pool) as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+        try:
+            with _unscoped(self._pool, deadline=deadline) as conn:
+                if deadline is not None:
+                    refresh_deadline_statement_timeout(conn, deadline)
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
+        except PoolDeadlineExceeded as exc:
+            raise RequestDeadlineExceeded() from exc
+        except Exception as exc:
+            if is_expired_deadline_query_cancellation(exc, deadline):
+                raise RequestDeadlineExceeded() from exc
+            raise
         if len(rows) != 1:
             return None
         row = rows[0]
@@ -944,6 +1185,8 @@ class Repo:
         item: NewMemoryItem,
         scan_verdict: ScanVerdict,
         content_hash_hex: str,
+        *,
+        subject_digests: Sequence[bytes] | None = None,
     ) -> MemoryId:
         memory_id = item.id if item.id is not None else mint_memory_id()
         now = self._clock.now()
@@ -962,7 +1205,13 @@ class Repo:
                 "content": item.content,
                 "content_hash": content_hash_hex,
                 "token_count": item.token_count,
-                "subject_tag": item.subject_tag,
+                # E2 writes no raw subject tag.  Run-bound paths supply the
+                # full authoritative union after the profiled snapshot check;
+                # legacy/unbound data is made project-attributed by the E2
+                # schema trigger rather than pretending an empty array means
+                # identity is unknown.
+                "subject_tag": None,
+                "subject_digests": list(subject_digests or ()),
                 "q_value": _INITIAL_Q_VALUE,
                 "confidence": _INITIAL_CONFIDENCE,
                 "scored_use_count": 0,
@@ -985,6 +1234,52 @@ class Repo:
         )
         return memory_id
 
+    def _impl_bind_run_memory(
+        self,
+        conn: psycopg.Connection[Any],
+        project_id: ProjectId,
+        run_id: RunId,
+        memory_id: MemoryId,
+        subject_digests: Sequence[bytes],
+    ) -> tuple[bytes, ...]:
+        expected = tuple(subject_digests)
+        if (
+            len(expected) > 64
+            or any(type(value) is not bytes or len(value) != 32 for value in expected)
+            or tuple(sorted(expected)) != expected
+            or len(set(expected)) != len(expected)
+        ):
+            raise ValueError("subject_digests must be canonical")
+        try:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    _BIND_RUN_MEMORY_SQL,
+                    {
+                        "project_id": project_id.value,
+                        "run_id": run_id.value,
+                        "memory_id": memory_id.value,
+                        "subject_digests": list(expected),
+                    },
+                )
+                row = cur.fetchone()
+        except psycopg.Error as error:
+            if error.sqlstate == "P0002":
+                raise ErasureFenced() from None
+            if error.sqlstate == "P0003":
+                raise ErasureSnapshotStale() from None
+            raise
+        if row is None or type(row["subject_digests"]) not in {list, tuple}:
+            raise ErasureSnapshotStale()
+        actual = tuple(bytes(value) for value in row["subject_digests"])
+        if (
+            len(actual) > 64
+            or any(len(value) != 32 for value in actual)
+            or tuple(sorted(actual)) != actual
+            or len(set(actual)) != len(actual)
+        ):
+            raise ErasureSnapshotStale()
+        return actual
+
     # ---------------------------------------------------------------- proposals ------------
     # `workflow.agent_control.AgentControlRepoPort`'s three proposal queries plus the one
     # method that makes the caps hold across processes. See `PROPOSAL_CAP_LOCK_CLASS`.
@@ -996,7 +1291,9 @@ class Repo:
     def _impl_count_proposals_in_run(
         self, conn: psycopg.Connection[Any], project_id: ProjectId, run_id: RunId
     ) -> int:
-        row = conn.execute(_COUNT_PROPOSALS_IN_RUN_SQL, _proposal_run_params(project_id, run_id)).fetchone()
+        row = conn.execute(
+            _COUNT_PROPOSALS_IN_RUN_SQL, _proposal_run_params(project_id, run_id)
+        ).fetchone()
         return _scalar_count(row)
 
     def count_proposals_in_project_day(self, project_id: ProjectId, day: date) -> int:
@@ -1047,6 +1344,7 @@ class Repo:
         per_run_cap: int,
         per_project_daily_cap: int,
         day: date,
+        subject_digests: tuple[bytes, ...] | None = None,
     ) -> ProposalInsertResult:
         """Dedup-check, both caps, and the INSERT as ONE transaction, serialised across
         every process that shares this database.
@@ -1069,6 +1367,10 @@ class Repo:
         ch = content_hash(item.content)
         verify_verdict(scan_verdict, ch)
         with scoped(self._pool, project_id) as conn:
+            if subject_digests is not None:
+                actual = self._impl_lock_erasure_snapshot(conn, project_id, run_id, subject_digests)
+                if actual != subject_digests:  # defensive; helper rejects mismatch
+                    raise ErasureSnapshotStale()
             conn.execute(
                 "SELECT pg_advisory_xact_lock(%(cls)s, hashtext(%(project_id)s::text))",
                 {"cls": PROPOSAL_CAP_LOCK_CLASS, "project_id": project_id},
@@ -1090,7 +1392,22 @@ class Repo:
                     memory_id=None,
                     observed_count=day_count,
                 )
-            memory_id = self._impl_insert_memory_item(conn, project_id, item, scan_verdict, ch)
+            memory_id = self._impl_insert_memory_item(
+                conn,
+                project_id,
+                item,
+                scan_verdict,
+                ch,
+                subject_digests=subject_digests,
+            )
+            # A proposal admitted from the authority-v1 queue is part of its
+            # originating run's durable lineage in the *same* transaction as
+            # the memory row.  Without this normalized edge, a later bind or
+            # erasure closure can see the run but miss the memory entirely.
+            # The profiled binder rechecks the current snapshot before it
+            # writes, so a stale/fenced queue item rolls the insert back.
+            if subject_digests is not None:
+                self._impl_bind_run_memory(conn, project_id, run_id, memory_id, subject_digests)
         return ProposalInsertResult(
             outcome=ProposalCapOutcome.INSERTED, memory_id=memory_id, observed_count=run_count
         )
@@ -1106,7 +1423,8 @@ class Repo:
             cur.execute(
                 # _MEMORY_ITEM_COLUMNS is a fixed module constant, never caller data.
                 f"SELECT {_MEMORY_ITEM_COLUMNS} FROM memory_item "  # noqa: S608
-                "WHERE project_id = %(project_id)s AND id = %(id)s",
+                "WHERE project_id = %(project_id)s AND id = %(id)s "
+                f"{_ERASURE_MEMORY_VISIBLE_SQL}",
                 {"project_id": project_id, "id": memory_id},
             )
             row = cur.fetchone()
@@ -1139,7 +1457,9 @@ class Repo:
                 cur.execute(
                     f"SELECT {_MEMORY_ITEM_COLUMNS} FROM memory_item "  # noqa: S608
                     "WHERE project_id = %(project_id)s "
-                    "AND status = ANY(%(statuses)s) ORDER BY created_at DESC LIMIT %(limit)s",
+                    "AND status = ANY(%(statuses)s) "
+                    f"{_ERASURE_MEMORY_VISIBLE_SQL} "
+                    "ORDER BY created_at DESC LIMIT %(limit)s",
                     {
                         "project_id": project_id,
                         "statuses": [s.value for s in statuses],
@@ -1150,17 +1470,156 @@ class Repo:
                 cur.execute(
                     f"SELECT {_MEMORY_ITEM_COLUMNS} FROM memory_item "  # noqa: S608
                     "WHERE project_id = %(project_id)s "
+                    f"{_ERASURE_MEMORY_VISIBLE_SQL} "
                     "ORDER BY created_at DESC LIMIT %(limit)s",
                     {"project_id": project_id, "limit": bounded},
                 )
             rows = cur.fetchall()
         return [_row_to_memory_item(r) for r in rows]
 
+    def list_memories_page(
+        self,
+        project_id: ProjectId,
+        *,
+        statuses: Sequence[Status] | None = None,
+        limit: int = 100,
+        before_created_at: datetime | None = None,
+        before_id: MemoryId | None = None,
+    ) -> list[MemoryItemRow]:
+        """A stable keyset page for the control-plane vault.
+
+        ``created_at, id`` is a total ordering.  Fetching one extra row makes
+        ``limit`` page size observable to the API without a count query and
+        without accepting an attacker-controlled OFFSET.
+        """
+        if (before_created_at is None) != (before_id is None):
+            raise ValueError("memory cursor is incomplete")
+        if statuses is not None and not statuses:
+            return []
+        bounded = _bounded_limit(limit)
+        params: dict[str, object] = {"project_id": project_id, "limit": bounded + 1}
+        predicates = [
+            "project_id = %(project_id)s",
+            _ERASURE_MEMORY_VISIBLE_SQL.removeprefix("AND "),
+        ]
+        if statuses is not None:
+            predicates.append("status = ANY(%(statuses)s)")
+            params["statuses"] = [status.value for status in statuses]
+        if before_created_at is not None and before_id is not None:
+            predicates.append("(created_at, id) < (%(before_created_at)s, %(before_id)s)")
+            params["before_created_at"] = before_created_at
+            params["before_id"] = before_id
+        with scoped(self._pool, project_id) as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT {_MEMORY_ITEM_COLUMNS} FROM memory_item "  # noqa: S608
+                f"WHERE {' AND '.join(predicates)} "
+                "ORDER BY created_at DESC, id DESC LIMIT %(limit)s",
+                params,
+            )
+            rows = cur.fetchall()
+        return [_row_to_memory_item(row) for row in rows]
+
     # ------------------------------------------------------------------ trace index --------
 
     def upsert_trace_index(self, project_id: ProjectId, row: TraceIndexUpsert) -> None:
         with scoped(self._pool, project_id) as conn:
             self._impl_upsert_trace_index(conn, project_id, row)
+
+    def _impl_lock_erasure_snapshot(
+        self,
+        conn: psycopg.Connection[Any],
+        project_id: ProjectId,
+        run_id: RunId,
+        subject_digests: Sequence[bytes],
+    ) -> tuple[bytes, ...]:
+        expected = tuple(subject_digests)
+        if (
+            len(expected) > 64
+            or any(type(digest) is not bytes or len(digest) != 32 for digest in expected)
+            or tuple(sorted(expected)) != expected
+            or len(set(expected)) != len(expected)
+        ):
+            raise ValueError("subject digests are not canonical")
+        try:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    _LOCK_ERASURE_SNAPSHOT_SQL,
+                    {
+                        "project_id": project_id.value,
+                        "run_id": run_id.value,
+                        "subject_digests": list(expected),
+                    },
+                )
+                row = cur.fetchone()
+        except psycopg.Error as error:
+            if error.sqlstate == "P0002":
+                raise ErasureFenced() from None
+            if error.sqlstate == "P0003":
+                raise ErasureSnapshotStale() from None
+            raise
+        if row is None or type(row.get("subject_digests")) not in {list, tuple}:
+            raise ErasureSnapshotStale()
+        actual = tuple(row["subject_digests"])
+        if (
+            len(actual) > 64
+            or any(type(digest) is not bytes or len(digest) != 32 for digest in actual)
+            or tuple(sorted(actual)) != actual
+            or len(set(actual)) != len(actual)
+            or actual != expected
+        ):
+            raise ErasureSnapshotStale()
+        return actual
+
+    def _impl_assert_erasure_run_write(
+        self,
+        conn: psycopg.Connection[Any],
+        project_id: ProjectId,
+        run_id: RunId,
+        *,
+        deadline: RemainingBudget | None = None,
+    ) -> None:
+        """Derive the current run union inside the DB fence before a write.
+
+        Retrieval/injection rows do not carry caller-supplied subject arrays.
+        The SECURITY DEFINER assertion derives the canonical union from
+        ``trace_subject`` while taking the E2 project/run/fence locks, so an
+        API caller cannot omit a newly bound target from a telemetry write.
+        """
+
+        try:
+            if deadline is not None:
+                refresh_deadline_statement_timeout(conn, deadline)
+            row = conn.execute(
+                _ERASURE_RUN_SUBJECT_DIGESTS_SQL,
+                {"project_id": project_id.value, "run_id": run_id.value},
+            ).fetchone()
+            if row is None or len(row) != 1 or type(row[0]) not in {list, tuple}:
+                raise ErasureSnapshotStale()
+            subject_digests = tuple(row[0])
+            if (
+                not subject_digests
+                or len(subject_digests) > 64
+                or any(type(digest) is not bytes or len(digest) != 32 for digest in subject_digests)
+                or tuple(sorted(subject_digests)) != subject_digests
+                or len(set(subject_digests)) != len(subject_digests)
+            ):
+                raise ErasureSnapshotStale()
+            if deadline is not None:
+                refresh_deadline_statement_timeout(conn, deadline)
+            conn.execute(
+                _ASSERT_ERASURE_RUN_WRITE_SQL,
+                {
+                    "project_id": project_id.value,
+                    "run_id": run_id.value,
+                    "subject_digests": list(subject_digests),
+                },
+            )
+        except psycopg.Error as error:
+            if error.sqlstate == "P0002":
+                raise ErasureFenced() from None
+            if error.sqlstate == "P0003":
+                raise ErasureSnapshotStale() from None
+            raise
 
     def _impl_upsert_trace_index(
         self, conn: psycopg.Connection[Any], project_id: ProjectId, row: TraceIndexUpsert
@@ -1186,7 +1645,8 @@ class Repo:
         # cry Sybil on the single most common shape of at-least-once delivery, and a signal that
         # fires on the normal path is a signal nobody reads.
         signature_conflict = (
-            not is_absent_signature(claimed_signature) and bytes(kept_signature) != claimed_signature
+            not is_absent_signature(claimed_signature)
+            and bytes(kept_signature) != claimed_signature
         )
         if kept_principal != row.submitter_principal or signature_conflict:
             # The COALESCE fix above means THIS call's claimed identity lost to
@@ -1211,6 +1671,50 @@ class Repo:
                 row.submitter_principal,
                 claimed_signature.hex(),
             )
+
+    def _impl_schedule_trace_learning_job(
+        self,
+        conn: psycopg.Connection[Any],
+        project_id: ProjectId,
+        run_id: RunId,
+        *,
+        pipeline: str,
+        pipeline_version: int,
+        max_attempts: int,
+    ) -> bool:
+        """Insert one terminal trace's durable learning outbox row.
+
+        Private by design: an unscoped caller could otherwise schedule in a
+        different transaction from the terminal index write.  The SQL itself
+        repeats the terminal/ended predicate as the DB-side defense.
+        """
+        validate_pipeline(pipeline, pipeline_version)
+        if not 1 <= max_attempts <= MAX_QUEUE_ATTEMPTS:
+            raise ValueError(f"max_attempts must be in 1..{MAX_QUEUE_ATTEMPTS}")
+        params = {
+            "project_id": project_id,
+            "run_id": run_id,
+            "pipeline": pipeline,
+            "pipeline_version": pipeline_version,
+            "max_attempts": max_attempts,
+        }
+        row = conn.execute(
+            _SCHEDULE_TRACE_LEARNING_JOB_SQL,
+            params,
+        ).fetchone()
+        if row is not None:
+            return True
+        existing = conn.execute(_SCHEDULE_TRACE_LEARNING_JOB_EXISTING_SQL, params).fetchone()
+        if existing is None:
+            raise RuntimeError("terminal trace learning schedule conflict could not be resolved")
+        trace_ended_at, schedule_source, existing_max_attempts, indexed_ended_at = existing
+        if (
+            trace_ended_at != indexed_ended_at
+            or schedule_source != "live"
+            or existing_max_attempts != max_attempts
+        ):
+            raise RuntimeError("terminal trace learning job conflicts with a non-idempotent row")
+        return False
 
     def get_trace_index(self, project_id: ProjectId, run_id: RunId) -> TraceIndexRow:
         with scoped(self._pool, project_id) as conn:
@@ -1324,35 +1828,6 @@ class Repo:
                 },
             )
 
-    def append_trace_subject(
-        self, project_id: ProjectId, run_id: RunId, subject_tags: Sequence[str]
-    ) -> None:
-        with scoped(self._pool, project_id) as conn:
-            self._impl_append_trace_subject(conn, project_id, run_id, subject_tags)
-
-    def _impl_append_trace_subject(
-        self, conn: psycopg.Connection[Any], project_id: ProjectId, run_id: RunId, subject_tags: Sequence[str]
-    ) -> None:
-        # `subject_tags` originates in a caller-supplied trace payload (`SUBJECT_TAGS_KEY` on
-        # state_note/artifact_ref, contract C-05), so the same tag repeated N times is one
-        # cheap way for a client to turn one event into N round-trips. De-duplicated here,
-        # order-preserving, so the statement count is bounded by the number of DISTINCT tags.
-        # A cap on tag COUNT and LENGTH belongs to the ingest validator, not to storage --
-        # reported as a cross-chunk issue.
-        deduped = list(dict.fromkeys(subject_tags))
-        if not deduped:
-            return
-        with conn.cursor() as cur:
-            cur.executemany(
-                "INSERT INTO trace_subject (run_id, project_id, subject_tag) "
-                "VALUES (%(run_id)s, %(project_id)s, %(subject_tag)s) "
-                "ON CONFLICT (project_id, run_id, subject_tag) DO NOTHING",
-                [
-                    {"run_id": run_id, "project_id": project_id, "subject_tag": tag}
-                    for tag in deduped
-                ],
-            )
-
     # ------------------------------------------------------------------ outcomes -----------
 
     def insert_outcome_event(self, project_id: ProjectId, row: OutcomeEventInsert) -> bool:
@@ -1360,6 +1835,12 @@ class Repo:
         `event_id` (contract §5.1) -- `ingest.outcome_intake` relies on this for replay safety.
         """
         with scoped(self._pool, project_id) as conn:
+            if row.authority_version == 1:
+                actual = self._impl_lock_erasure_snapshot(
+                    conn, project_id, row.run_id, row.subject_digests
+                )
+                if actual != row.subject_digests:  # defensive; the helper already rejects this
+                    raise ErasureSnapshotStale()
             return self._impl_insert_outcome_event(conn, project_id, row)
 
     def _impl_insert_outcome_event(
@@ -1369,33 +1850,115 @@ class Repo:
         # folded into payload["_w_zero"] here, the one place that reserved key is written.
         payload = dict(row.payload)
         payload["_w_zero"] = row.w_zero
+        params: dict[str, object] = {
+            "event_id": row.event_id,
+            "run_id": row.run_id,
+            "project_id": project_id,
+            "principal_id": row.principal_id,
+            "adapter": row.adapter.value,
+            "r": row.r,
+            "payload": Json(payload),
+            "occurred_at": row.occurred_at,
+            "arrived_at": row.arrived_at,
+            "subject_digests": list(row.subject_digests),
+        }
+        if row.authority_version == 0:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO outcome_event (
+                        event_id, run_id, project_id, principal_id, adapter, r, payload,
+                        occurred_at, arrived_at, subject_digests
+                    ) VALUES (
+                        %(event_id)s, %(run_id)s, %(project_id)s, %(principal_id)s, %(adapter)s,
+                        %(r)s, %(payload)s, %(occurred_at)s, %(arrived_at)s, %(subject_digests)s::bytea[]
+                    )
+                    ON CONFLICT (project_id, event_id) DO NOTHING
+                    RETURNING event_id
+                    """,
+                    params,
+                )
+                return cur.fetchone() is not None
+        if (
+            row.authority_version != 1
+            or row.source_agent_type_id is None
+            or row.source_grant_id is None
+            or row.feedback_source is None
+            or row.run_owner_principal_id is None
+            or row.run_owner_agent_type_id is None
+            or row.adapter.value != row.feedback_source.value
+        ):
+            raise ValueError("outcome authority envelope is invalid")
+        params.update(
+            {
+                "authority_version": 1,
+                "source_agent_type_id": row.source_agent_type_id,
+                "source_grant_id": row.source_grant_id,
+                "feedback_source": row.feedback_source.value,
+                "run_owner_principal_id": row.run_owner_principal_id,
+                "run_owner_agent_type_id": row.run_owner_agent_type_id,
+            }
+        )
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO outcome_event (
                     event_id, run_id, project_id, principal_id, adapter, r, payload,
-                    occurred_at, arrived_at
+                    occurred_at, arrived_at, authority_version, source_agent_type_id,
+                    source_grant_id, feedback_source, run_owner_principal_id,
+                    run_owner_agent_type_id, subject_digests
                 ) VALUES (
                     %(event_id)s, %(run_id)s, %(project_id)s, %(principal_id)s, %(adapter)s,
-                    %(r)s, %(payload)s, %(occurred_at)s, %(arrived_at)s
+                    %(r)s, %(payload)s, %(occurred_at)s, %(arrived_at)s, %(authority_version)s,
+                    %(source_agent_type_id)s, %(source_grant_id)s, %(feedback_source)s,
+                    %(run_owner_principal_id)s, %(run_owner_agent_type_id)s, %(subject_digests)s::bytea[]
                 )
                 ON CONFLICT (project_id, event_id) DO NOTHING
                 RETURNING event_id
                 """,
-                {
-                    "event_id": row.event_id,
-                    "run_id": row.run_id,
-                    "project_id": project_id,
-                    "principal_id": row.principal_id,
-                    "adapter": row.adapter.value,
-                    "r": row.r,
-                    "payload": Json(payload),
-                    "occurred_at": row.occurred_at,
-                    "arrived_at": row.arrived_at,
-                },
+                params,
             )
-            inserted = cur.fetchone() is not None
-        return inserted
+            if cur.fetchone() is not None:
+                return True
+            cur.execute(
+                """
+                SELECT run_id, principal_id, adapter, r, payload, occurred_at,
+                       authority_version, source_agent_type_id, source_grant_id,
+                       feedback_source, run_owner_principal_id, run_owner_agent_type_id
+                FROM outcome_event
+                WHERE project_id = %(project_id)s AND event_id = %(event_id)s
+                """,
+                params,
+            )
+            existing = cur.fetchone()
+        if existing is None:  # pragma: no cover - conflict winner cannot disappear
+            raise OutcomeReplayConflict()
+        expected = (
+            row.run_id.value,
+            row.principal_id.value,
+            row.adapter.value,
+            row.r,
+            payload,
+            row.occurred_at,
+            1,
+            row.source_agent_type_id.value,
+            row.source_grant_id,
+            row.feedback_source.value,
+            row.run_owner_principal_id.value,
+            row.run_owner_agent_type_id.value,
+        )
+        # `occurred_at` is a business field only when the caller supplied it.
+        # A v1 item with an omitted time uses its own immutable queue
+        # `created_at`; a second HTTP delivery is a second queue row and has
+        # a different creation time even though it is an exact event replay.
+        # Comparing that derived transport timestamp would incorrectly poison
+        # safe retries.  Explicit occurrence times remain fenced exactly.
+        actual = tuple(existing)
+        replay_actual = actual[:5] + actual[6:] if row.occurred_at_is_derived else actual
+        replay_expected = expected[:5] + expected[6:] if row.occurred_at_is_derived else expected
+        if replay_actual != replay_expected:
+            raise OutcomeReplayConflict()
+        return False
 
     # ------------------------------------------------------------------ telemetry ----------
 
@@ -1404,8 +1967,16 @@ class Repo:
             self._impl_insert_retrieval_event(conn, project_id, row)
 
     def _impl_insert_retrieval_event(
-        self, conn: psycopg.Connection[Any], project_id: ProjectId, row: RetrievalEventInsert
+        self,
+        conn: psycopg.Connection[Any],
+        project_id: ProjectId,
+        row: RetrievalEventInsert,
+        *,
+        deadline: RemainingBudget | None = None,
     ) -> None:
+        self._impl_assert_erasure_run_write(conn, project_id, row.run_id, deadline=deadline)
+        if deadline is not None:
+            refresh_deadline_statement_timeout(conn, deadline)
         conn.execute(
             """
             INSERT INTO retrieval_event (
@@ -1437,21 +2008,53 @@ class Repo:
             self._impl_insert_injection_rows(conn, project_id, run_id, rows)
 
     def _impl_insert_injection_rows(
-        self, conn: psycopg.Connection[Any], project_id: ProjectId, run_id: RunId, rows: Sequence[InjectionRow]
+        self,
+        conn: psycopg.Connection[Any],
+        project_id: ProjectId,
+        run_id: RunId,
+        rows: Sequence[InjectionRow],
+        *,
+        deadline: RemainingBudget | None = None,
     ) -> None:
         if not rows:
             return
+        self._impl_assert_erasure_run_write(conn, project_id, run_id, deadline=deadline)
         now = self._clock.now()
         with conn.cursor() as cur:
-            cur.executemany(
-                """
+            if deadline is None:
+                cur.executemany(
+                    """
+                    INSERT INTO injection_log (run_id, project_id, memory_id, slot, score, tokens,
+                                                injected_at)
+                    VALUES (%(run_id)s, %(project_id)s, %(memory_id)s, %(slot)s, %(score)s,
+                            %(tokens)s, %(injected_at)s)
+                    ON CONFLICT (project_id, run_id, memory_id) DO NOTHING
+                    """,
+                    [
+                        {
+                            "run_id": run_id,
+                            "project_id": project_id,
+                            "memory_id": r.memory_id,
+                            "slot": r.slot.value,
+                            "score": r.score,
+                            "tokens": r.tokens,
+                            "injected_at": now,
+                        }
+                        for r in rows
+                    ],
+                )
+                return
+            for r in rows:
+                if deadline is not None:
+                    refresh_deadline_statement_timeout(conn, deadline)
+                cur.execute(
+                    """
                 INSERT INTO injection_log (run_id, project_id, memory_id, slot, score, tokens,
                                             injected_at)
                 VALUES (%(run_id)s, %(project_id)s, %(memory_id)s, %(slot)s, %(score)s,
                         %(tokens)s, %(injected_at)s)
                 ON CONFLICT (project_id, run_id, memory_id) DO NOTHING
                 """,
-                [
                     {
                         "run_id": run_id,
                         "project_id": project_id,
@@ -1460,10 +2063,8 @@ class Repo:
                         "score": r.score,
                         "tokens": r.tokens,
                         "injected_at": now,
-                    }
-                    for r in rows
-                ],
-            )
+                    },
+                )
 
     def spend_add(
         self,
@@ -1538,9 +2139,11 @@ class Repo:
         """
         with scoped(self._pool, project_id) as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT day, worker, model_id, tokens_in, tokens_out, cost_usd FROM spend_ledger "
-                "WHERE project_id = %(project_id)s AND day >= %(since)s "
-                "ORDER BY day ASC, worker ASC, model_id ASC LIMIT %(limit)s",
+                (
+                    "SELECT day, worker, model_id, tokens_in, tokens_out, cost_usd FROM spend_ledger "
+                    "WHERE project_id = %(project_id)s AND day >= %(since)s "
+                    "AND @ERASURE@ ORDER BY day ASC, worker ASC, model_id ASC LIMIT %(limit)s"
+                ).replace("@ERASURE@", _ERASURE_PROJECT_READABLE_SQL),
                 {"project_id": project_id, "since": since, "limit": MAX_ROW_LIMIT},
             )
             rows = cur.fetchall()
@@ -1561,7 +2164,7 @@ class Repo:
     def get_subject_key(self, project_id: ProjectId, subject_tag: str) -> SubjectKeyRow | None:
         with scoped(self._pool, project_id) as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT subject_tag, key_id, wrapped_kek, created_at, destroyed_at "
+                "SELECT subject_tag, subject_digest, wrap_version, key_id, wrapped_kek, created_at, destroyed_at "
                 "FROM subject_key WHERE project_id = %(project_id)s "
                 "AND subject_tag = %(subject_tag)s",
                 {"project_id": project_id, "subject_tag": subject_tag},
@@ -1571,6 +2174,40 @@ class Repo:
             return None
         return SubjectKeyRow(
             subject_tag=row["subject_tag"],
+            subject_digest=bytes(row["subject_digest"]),
+            wrap_version=int(row["wrap_version"]),
+            key_id=row["key_id"],
+            wrapped_kek=bytes(row["wrapped_kek"]),
+            created_at=row["created_at"],
+            destroyed_at=row["destroyed_at"],
+        )
+
+    def get_subject_key_by_digest(
+        self, project_id: ProjectId, subject_digest: bytes
+    ) -> SubjectKeyRow | None:
+        """Resolve an E1 v2 envelope wrap without accepting a raw subject tag.
+
+        This query is intentionally a new call path: legacy v1 callers keep
+        using ``get_subject_key`` until the activated E1 profile allows v2
+        archive emission.  Calling it against a pre-0012 schema is therefore
+        a fail-closed programmer/configuration error, not a compatibility
+        fallback that could reinterpret opaque envelope bytes.
+        """
+
+        with scoped(self._pool, project_id) as conn, conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT subject_tag, subject_digest, wrap_version, key_id, wrapped_kek, created_at, "
+                "destroyed_at FROM subject_key WHERE project_id = %(project_id)s "
+                "AND subject_digest = %(subject_digest)s",
+                {"project_id": project_id, "subject_digest": subject_digest},
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return SubjectKeyRow(
+            subject_tag=row["subject_tag"],
+            subject_digest=bytes(row["subject_digest"]),
+            wrap_version=int(row["wrap_version"]),
             key_id=row["key_id"],
             wrapped_kek=bytes(row["wrapped_kek"]),
             created_at=row["created_at"],
@@ -1582,44 +2219,45 @@ class Repo:
     ) -> None:
         with scoped(self._pool, project_id) as conn:
             conn.execute(
-                "INSERT INTO subject_key (project_id, subject_tag, key_id, wrapped_kek, "
-                "created_at) VALUES (%(project_id)s, %(subject_tag)s, %(key_id)s, "
-                "%(wrapped_kek)s, %(created_at)s)",
+                "INSERT INTO subject_key (project_id, subject_tag, subject_digest, wrap_version, "
+                "key_id, wrapped_kek, created_at) VALUES (%(project_id)s, %(subject_tag)s, "
+                "%(subject_digest)s, 1, %(key_id)s, %(wrapped_kek)s, %(created_at)s)",
                 {
                     "project_id": project_id,
                     "subject_tag": subject_tag,
+                    "subject_digest": subject_digest(project_id, subject_tag),
                     "key_id": key_id,
                     "wrapped_kek": wrapped_kek,
                     "created_at": self._clock.now(),
                 },
             )
 
-    def destroy_subject_key(self, project_id: ProjectId, subject_tag: str) -> bool:
-        """Crypto-shredding (PHASE-0 Task 10): zeroes `wrapped_kek` and stamps `destroyed_at`.
-        `False` iff no row exists for this `(project_id, subject_tag)`; re-destroying an already
-        -destroyed key is idempotent and still returns `True`.
+    def insert_subject_key_v2(
+        self, project_id: ProjectId, subject_digest: bytes, key_id: UUID, wrapped_kek: bytes
+    ) -> None:
+        """Persist one opaque v2 KEK row after a current run snapshot.
 
-        `destroyed_at` is set with `COALESCE` so a repeat call cannot move it. The first value is
-        the record of WHEN the erasure happened -- the evidence an erasure request was honoured
-        within its statutory window. A retry, a replayed queue item, or an operator clicking twice
-        would otherwise silently rewrite that timestamp forward, and the original is unrecoverable
-        (the row is the only place it exists).
+        c12 intentionally does not expose a generic raw ``subject_key``
+        INSERT.  The profiled function consumes the transaction-bound worker
+        snapshot capability minted by ``lock_erasure_snapshot``; callers that
+        have not proved a live run union fail closed instead of creating an
+        arbitrary digest key.
         """
-        with scoped(self._pool, project_id) as conn, conn.cursor() as cur:
-            cur.execute(
-                "UPDATE subject_key "
-                "SET destroyed_at = COALESCE(destroyed_at, %(destroyed_at)s), "
-                "    wrapped_kek = %(empty)s "
-                "WHERE project_id = %(project_id)s AND subject_tag = %(subject_tag)s "
-                "RETURNING subject_tag",
+
+        if type(subject_digest) is not bytes or len(subject_digest) != 32:
+            raise ValueError("subject digest is invalid")
+        if type(key_id) is not UUID or type(wrapped_kek) is not bytes or len(wrapped_kek) != 60:
+            raise ValueError("v2 subject key material is invalid")
+        with scoped(self._pool, project_id) as conn:
+            conn.execute(
+                _INSERT_SUBJECT_KEY_V2_SECDEF_SQL,
                 {
-                    "destroyed_at": self._clock.now(),
-                    "empty": b"",
                     "project_id": project_id,
-                    "subject_tag": subject_tag,
+                    "subject_digest": subject_digest,
+                    "key_id": key_id,
+                    "wrapped_kek": wrapped_kek,
                 },
             )
-            return cur.fetchone() is not None
 
     # ------------------------------------------------------------------ review + config ----
 
@@ -1627,17 +2265,26 @@ class Repo:
         self, project_id: ProjectId, reason: str, memory_id: MemoryId | None = None
     ) -> None:
         with scoped(self._pool, project_id) as conn:
-            conn.execute(
-                "INSERT INTO review_queue (project_id, item_id, reason, memory_id, opened_at) "
-                "VALUES (%(project_id)s, %(item_id)s, %(reason)s, %(memory_id)s, %(opened_at)s)",
-                {
-                    "project_id": project_id,
-                    "item_id": uuid4(),
-                    "reason": reason,
-                    "memory_id": memory_id,
-                    "opened_at": self._clock.now(),
-                },
-            )
+            self._impl_insert_review_item(conn, project_id, reason, memory_id)
+
+    def _impl_insert_review_item(
+        self,
+        conn: psycopg.Connection[Any],
+        project_id: ProjectId,
+        reason: str,
+        memory_id: MemoryId | None = None,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO review_queue (project_id, item_id, reason, memory_id, opened_at) "
+            "VALUES (%(project_id)s, %(item_id)s, %(reason)s, %(memory_id)s, %(opened_at)s)",
+            {
+                "project_id": project_id,
+                "item_id": uuid4(),
+                "reason": reason,
+                "memory_id": memory_id,
+                "opened_at": self._clock.now(),
+            },
+        )
 
     def list_review_items(
         self, project_id: ProjectId, *, include_resolved: bool = False, limit: int = 100
@@ -1659,6 +2306,12 @@ class Repo:
                 "SELECT item_id, reason, memory_id, opened_at, resolved_at, resolution "  # noqa: S608
                 "FROM review_queue WHERE project_id = %(project_id)s "
                 f"{clause}"
+                "AND (memory_id IS NULL OR EXISTS ("
+                "SELECT 1 FROM memory_item WHERE memory_item.project_id = review_queue.project_id "
+                "AND memory_item.id = review_queue.memory_id "
+                f"{_ERASURE_MEMORY_VISIBLE_SQL}"
+                ")) "
+                f"AND {_ERASURE_PROJECT_READABLE_SQL} "
                 "ORDER BY opened_at DESC LIMIT %(limit)s",
                 {"project_id": project_id, "limit": bounded},
             )
@@ -1698,9 +2351,11 @@ class Repo:
         """
         with scoped(self._pool, project_id) as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT agent_type_id, mem_type, disabled, evidence, changed_at "
-                "FROM killswitch_state WHERE project_id = %(project_id)s "
-                "ORDER BY changed_at DESC LIMIT %(limit)s",
+                (
+                    "SELECT agent_type_id, mem_type, disabled, evidence, changed_at "
+                    "FROM killswitch_state WHERE project_id = %(project_id)s "
+                    "AND @ERASURE@ ORDER BY changed_at DESC LIMIT %(limit)s"
+                ).replace("@ERASURE@", _ERASURE_PROJECT_READABLE_SQL),
                 {"project_id": project_id, "limit": MAX_ROW_LIMIT},
             )
             rows = cur.fetchall()
@@ -1717,35 +2372,6 @@ class Repo:
             for r in rows
         ]
 
-    def insert_invalidation_event(
-        self, project_id: ProjectId, event_type: str, selector: Mapping[str, object] | None = None
-    ) -> UUID:
-        """One `invalidation_event` row (PLAN.md §5; C-31).
-
-        Added at integration so `POST /v1/invalidation` stops returning "accepted" for data it
-        drops. `event_id` is server-generated here, matching the column's own DDL comment
-        ("the caller's webhook payload never determines the row's identity") -- a caller-chosen
-        event_id is a way to overwrite or collide with an existing row.
-
-        A synchronous, scoped insert rather than a queue write: §14's queue DO-NOT list forbids
-        a fourth topic, and this is a small bounded row on a low-rate route, not a trace payload.
-        """
-        event_id = uuid4()
-        with scoped(self._pool, project_id) as conn:
-            conn.execute(
-                "INSERT INTO invalidation_event "
-                "(project_id, event_id, event_type, selector, fired_at) "
-                "VALUES (%(project_id)s, %(event_id)s, %(event_type)s, %(selector)s, %(fired_at)s)",
-                {
-                    "project_id": project_id,
-                    "event_id": event_id,
-                    "event_type": event_type,
-                    "selector": Json(dict(selector)) if selector is not None else None,
-                    "fired_at": self._clock.now(),
-                },
-            )
-        return event_id
-
     def list_invalidation_events(
         self, project_id: ProjectId, *, limit: int = 100
     ) -> list[InvalidationEventRow]:
@@ -1760,8 +2386,11 @@ class Repo:
         bounded = _bounded_limit(limit)
         with scoped(self._pool, project_id) as conn, conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT event_id, event_type, selector, fired_at FROM invalidation_event "
-                "WHERE project_id = %(project_id)s ORDER BY fired_at DESC LIMIT %(limit)s",
+                (
+                    "SELECT event_id, event_type, selector, fired_at FROM invalidation_event "
+                    "WHERE project_id = %(project_id)s "
+                    "AND @ERASURE@ ORDER BY fired_at DESC LIMIT %(limit)s"
+                ).replace("@ERASURE@", _ERASURE_INVALIDATION_VISIBLE_SQL),
                 {"project_id": project_id, "limit": bounded},
             )
             rows = cur.fetchall()
@@ -1775,30 +2404,56 @@ class Repo:
             for r in rows
         ]
 
-    def get_project_config(self, project_id: ProjectId) -> Mapping[str, object]:
+    def get_project_config(
+        self, project_id: ProjectId, *, deadline: RemainingBudget | None = None
+    ) -> Mapping[str, object]:
         """Satisfies `domain.config.ConfigStorePort` structurally (contract §3.4)."""
-        with scoped(self._pool, project_id) as conn, conn.cursor() as cur:
+        with (
+            self._config_read_connection(project_id, deadline=deadline) as conn,
+            conn.cursor() as cur,
+        ):
+            if deadline is not None:
+                refresh_deadline_statement_timeout(conn, deadline)
             cur.execute(
-                "SELECT key, value FROM project_config WHERE project_id = %(project_id)s",
+                (
+                    "SELECT key, value FROM project_config WHERE project_id = %(project_id)s "
+                    "AND @ERASURE@"
+                ).replace("@ERASURE@", _ERASURE_PROJECT_READABLE_SQL),
                 {"project_id": project_id},
             )
             rows = cur.fetchall()
         return dict(rows)
 
     def get_agent_type_config(
-        self, project_id: ProjectId, agent_type_id: AgentTypeId
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId,
+        *,
+        deadline: RemainingBudget | None = None,
     ) -> Mapping[str, object]:
-        with scoped(self._pool, project_id) as conn, conn.cursor() as cur:
+        with (
+            self._config_read_connection(project_id, deadline=deadline) as conn,
+            conn.cursor() as cur,
+        ):
+            if deadline is not None:
+                refresh_deadline_statement_timeout(conn, deadline)
             cur.execute(
-                "SELECT key, value FROM agent_type_config "
-                "WHERE project_id = %(project_id)s AND agent_type_id = %(agent_type_id)s",
+                (
+                    "SELECT key, value FROM agent_type_config "
+                    "WHERE project_id = %(project_id)s AND agent_type_id = %(agent_type_id)s "
+                    "AND @ERASURE@"
+                ).replace("@ERASURE@", _ERASURE_PROJECT_READABLE_SQL),
                 {"project_id": project_id, "agent_type_id": agent_type_id},
             )
             rows = cur.fetchall()
         return dict(rows)
 
     def get_killswitch_overlay(
-        self, project_id: ProjectId, agent_type_id: AgentTypeId | None
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId | None,
+        *,
+        deadline: RemainingBudget | None = None,
     ) -> Mapping[str, bool]:
         """Exact `ConfigStorePort` signature (contract §3.4): `agent_type_id` has no default, so
         a caller cannot accidentally read the project-wide overlay when it meant an agent-type
@@ -1826,7 +2481,12 @@ class Repo:
         actually disagrees with. `list_killswitch_state`'s docstring carries the same warning,
         because that is the surface where the two rows are read side by side.
         """
-        with scoped(self._pool, project_id) as conn, conn.cursor() as cur:
+        with (
+            self._config_read_connection(project_id, deadline=deadline) as conn,
+            conn.cursor() as cur,
+        ):
+            if deadline is not None:
+                refresh_deadline_statement_timeout(conn, deadline)
             cur.execute(
                 "SELECT mem_type, disabled FROM killswitch_state "
                 "WHERE project_id = %(project_id)s "
@@ -1872,6 +2532,22 @@ class Repo:
         with scoped(self._pool, project_id) as conn:
             yield from self._impl_iter_export_rows(conn, project_id)
 
+    def _iter_export_rows_on(
+        self, conn: psycopg.Connection[Any], project_id: ProjectId
+    ) -> Iterator[dict[str, object]]:
+        """Private same-transaction export hook for the E2 disclosure gate.
+
+        ``api.admin`` obtains ``conn`` only from ``AuthorizedReadGate.hold``.
+        Keeping the cursor under that transaction means the exact EXPORT-grant
+        recheck, project authority locks, read predicates, and the last NDJSON
+        byte share one lifetime.  The ordinary public method above retains its
+        standalone repository contract for non-HTTP callers.
+        """
+
+        if type(project_id) is not ProjectId:
+            raise TypeError("export requires a ProjectId")
+        yield from self._impl_iter_export_rows(conn, project_id)
+
     def _impl_iter_export_rows(
         self, conn: psycopg.Connection[Any], project_id: ProjectId
     ) -> Iterator[dict[str, object]]:
@@ -1892,10 +2568,12 @@ class Repo:
             # decided it should leave the repository. Both the table name and the column list
             # come from fixed module constants, never caller data.
             columns = _EXPORT_COLUMNS[table]
+            erasure_visibility = _EXPORT_ERASURE_VISIBILITY_SQL[table]
             with conn.cursor(name=cursor_name, row_factory=dict_row) as cur:
                 cur.itersize = 500
                 cur.execute(
-                    f"SELECT {columns} FROM {table} WHERE project_id = %(project_id)s",  # noqa: S608
+                    f"SELECT {columns} FROM {table} WHERE project_id = %(project_id)s "  # noqa: S608
+                    f"AND {erasure_visibility}",
                     {"project_id": project_id},
                 )
                 for row in cur:
@@ -1903,6 +2581,85 @@ class Repo:
                         "table": table,
                         "row": {str(k): _json_safe(v) for k, v in dict(row).items()},
                     }
+
+
+class _AuthorizedRetrievalAudit:
+    """Private, single-use audit writer bound to an authorized hold transaction."""
+
+    def __init__(
+        self,
+        repo: Repo,
+        conn: psycopg.Connection[Any],
+        project_id: ProjectId,
+        run_id: RunId,
+        deadline: RemainingBudget,
+        *,
+        _capability: object,
+    ) -> None:
+        if _capability is not _AUTHORIZED_RETRIEVAL_AUDIT_CAPABILITY:
+            raise TypeError("authorized retrieval audit handle is private")
+        self._repo, self._conn, self._project_id, self._run_id, self._deadline = (
+            repo,
+            conn,
+            project_id,
+            run_id,
+            deadline,
+        )
+        self._used = False
+        self._completed = False
+        self._failed = False
+        self._closed = False
+        self._thread_id = threading.get_ident()
+
+    def _close(self) -> None:
+        self._closed = True
+
+    def _require_complete(self) -> None:
+        if not self._completed or self._failed:
+            raise RetrievalAuditUnavailable("authorized retrieval terminal audit did not complete")
+
+    def record_terminal(
+        self, *, injections: Sequence[InjectionRow], row: RetrievalEventInsert
+    ) -> None:
+        if self._closed or threading.get_ident() != self._thread_id:
+            raise RuntimeError("authorized retrieval audit handle is outside its hold lifetime")
+        if self._used:
+            raise RuntimeError("authorized retrieval audit handle was already used")
+        if row.run_id != self._run_id:
+            raise ValueError("terminal audit row run_id does not match authorized run")
+        if self._deadline.remaining_ms() <= 0:
+            raise RequestDeadlineExceeded()
+        self._used = True
+        try:
+            self._repo._impl_insert_injection_rows(
+                self._conn,
+                self._project_id,
+                self._run_id,
+                injections,
+                deadline=self._deadline,
+            )
+            if self._deadline.remaining_ms() <= 0:
+                raise RequestDeadlineExceeded()
+            self._repo._impl_insert_retrieval_event(
+                self._conn, self._project_id, row, deadline=self._deadline
+            )
+            if self._deadline.remaining_ms() <= 0:
+                raise RequestDeadlineExceeded()
+        except (RequestDeadlineExceeded, ErasureFenced, AuthorizationDenied, RunAuthorityDenied):
+            self._failed = True
+            raise
+        except PoolDeadlineExceeded as exc:
+            self._failed = True
+            raise RequestDeadlineExceeded() from exc
+        except Exception as exc:
+            self._failed = True
+            if is_expired_deadline_query_cancellation(exc, self._deadline):
+                raise RequestDeadlineExceeded() from exc
+            raise RetrievalAuditUnavailable() from exc
+        except BaseException:
+            self._failed = True
+            raise
+        self._completed = True
 
 
 class ScopedRepo:
@@ -1921,7 +2678,12 @@ class ScopedRepo:
     """
 
     def __init__(
-        self, repo: Repo, conn: psycopg.Connection[Any], project_id: ProjectId, *, _token: object = None
+        self,
+        repo: Repo,
+        conn: psycopg.Connection[Any],
+        project_id: ProjectId,
+        *,
+        _token: object = None,
     ) -> None:
         if _token is not _SCOPED_REPO_TOKEN:
             raise TypeError(
@@ -1933,13 +2695,24 @@ class ScopedRepo:
         self._conn = conn
         self._project_id = project_id
 
-    def insert_memory_item(self, item: NewMemoryItem, scan_verdict: ScanVerdict) -> MemoryId:
+    def insert_memory_item(
+        self,
+        item: NewMemoryItem,
+        scan_verdict: ScanVerdict,
+        *,
+        subject_digests: Sequence[bytes] | None = None,
+    ) -> MemoryId:
         assert_legal_creation_status(item.status)
         validate_provenance(item.provenance)
         ch = content_hash(item.content)
         verify_verdict(scan_verdict, ch)
         return self._repo._impl_insert_memory_item(
-            self._conn, self._project_id, item, scan_verdict, ch
+            self._conn,
+            self._project_id,
+            item,
+            scan_verdict,
+            ch,
+            subject_digests=subject_digests,
         )
 
     def get_memory_by_id(self, memory_id: MemoryId) -> MemoryItemRow:
@@ -1957,10 +2730,97 @@ class ScopedRepo:
             self._conn, self._project_id, run_id, for_update=for_update
         )
 
-    def append_trace_subject(self, run_id: RunId, subject_tags: Sequence[str]) -> None:
-        self._repo._impl_append_trace_subject(
-            self._conn, self._project_id, run_id, subject_tags
+    def lock_erasure_snapshot(
+        self, run_id: RunId, subject_digests: Sequence[bytes]
+    ) -> tuple[bytes, ...]:
+        """Verify the claimed queue attribution before any worker side effect.
+
+        The function performs the canonical project/run/subject fence locks
+        under the transaction this handle already owns.  A mismatch is a
+        retry signal, while a durable fence is a refusal; neither permits the
+        caller to proceed to archive or model I/O.
+        """
+
+        return self._repo._impl_lock_erasure_snapshot(
+            self._conn, self._project_id, run_id, subject_digests
         )
+
+    def bind_run_memory(
+        self,
+        run_id: RunId,
+        memory_id: MemoryId,
+        subject_digests: Sequence[bytes],
+    ) -> tuple[bytes, ...]:
+        """Append a profiled run→memory link and recompute its full union."""
+
+        return self._repo._impl_bind_run_memory(
+            self._conn,
+            self._project_id,
+            run_id,
+            memory_id,
+            subject_digests,
+        )
+
+    def get_subject_key_by_digest(self, subject_digest: bytes) -> SubjectKeyRow | None:
+        if type(subject_digest) is not bytes or len(subject_digest) != 32:
+            raise ValueError("subject digest is invalid")
+        with self._conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT subject_tag, subject_digest, wrap_version, key_id, wrapped_kek, created_at, "
+                "destroyed_at FROM subject_key WHERE project_id = %(project_id)s "
+                "AND subject_digest = %(subject_digest)s",
+                {"project_id": self._project_id, "subject_digest": subject_digest},
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return SubjectKeyRow(
+            subject_tag=row["subject_tag"],
+            subject_digest=bytes(row["subject_digest"]),
+            wrap_version=int(row["wrap_version"]),
+            key_id=row["key_id"],
+            wrapped_kek=bytes(row["wrapped_kek"]),
+            created_at=row["created_at"],
+            destroyed_at=row["destroyed_at"],
+        )
+
+    def insert_subject_key_v2(
+        self, subject_digest: bytes, key_id: UUID, wrapped_kek: bytes
+    ) -> None:
+        if type(subject_digest) is not bytes or len(subject_digest) != 32:
+            raise ValueError("subject digest is invalid")
+        if type(key_id) is not UUID or type(wrapped_kek) is not bytes or len(wrapped_kek) != 60:
+            raise ValueError("v2 subject key material is invalid")
+        self._conn.execute(
+            _INSERT_SUBJECT_KEY_V2_SECDEF_SQL,
+            {
+                "project_id": self._project_id,
+                "subject_digest": subject_digest,
+                "key_id": key_id,
+                "wrapped_kek": wrapped_kek,
+            },
+        )
+
+    def schedule_trace_learning_job(
+        self,
+        run_id: RunId,
+        *,
+        pipeline: str,
+        pipeline_version: int,
+        max_attempts: int,
+    ) -> bool:
+        """Schedule a terminal trace only within this scoped transaction."""
+        return self._repo._impl_schedule_trace_learning_job(
+            self._conn,
+            self._project_id,
+            run_id,
+            pipeline=pipeline,
+            pipeline_version=pipeline_version,
+            max_attempts=max_attempts,
+        )
+
+    def insert_review_item(self, reason: str, memory_id: MemoryId | None = None) -> None:
+        self._repo._impl_insert_review_item(self._conn, self._project_id, reason, memory_id)
 
     def insert_outcome_event(self, row: OutcomeEventInsert) -> bool:
         return self._repo._impl_insert_outcome_event(self._conn, self._project_id, row)

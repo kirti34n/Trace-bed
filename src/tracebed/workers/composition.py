@@ -9,7 +9,8 @@ for one. `domain.config.WorkersConfig` supplies the cadences; this module suppli
 construction.
 
 WHY A SEPARATE MODULE AND NOT `runner.run()`'s BODY. `run()` is a console entry point that
-opens a real connection pool, installs signal handlers, and blocks on three threads — nothing
+opens a real connection pool, installs signal handlers, and blocks on its supervised worker
+loops — nothing
 about it is callable from a test or a drill. Every decision that matters here (which worker is
 schedulable, which is not and why, what cadence each gets) is a pure function of injected
 dependencies, so it lives where `harness/closed_loop.py` and `tests/phase2/test_composition.py`
@@ -37,7 +38,7 @@ WHAT IS SCHEDULABLE TODAY: `workers.embedder` (its `EmbeddingRepoPort` now has
 `stores.pg.learning.EmbeddingRepo`), `workers.corroboration` (its `CorroborationRepoPort` now has
 `stores.pg.learning.CorroborationRepo`, and only when the host supplies the
 `CorroborationCandidateSource` that decides which runs corroborate which memory — a declared seam,
-D-121), `workers.gc` (`stores.pg.queue.WorkQueue` already satisfies `QueueObservabilityPort`
+D-121), `workers.gc` (`stores.pg.queue.WorkerQueue` already satisfies `QueueObservabilityPort`
 structurally), and — now that the per-project config driver is wired — `workers.sweeps` (once per
 project, handed `ConfigResolver.effective(project_id)`) and `workers.prefix_builder` (once per
 (project, agent_type), over `Repo.list_agent_type_ids` and the Valkey-backed `StaticPrefixCachePort`,
@@ -56,14 +57,16 @@ one worker at a time in `UNSCHEDULED_WORKERS` below; `consolidator` alone is sti
 from __future__ import annotations
 
 import logging
+import os
 import pkgutil
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
+from uuid import uuid4
 
-from tracebed.domain.errors import ConfigError
+from tracebed.domain.errors import ActivityBusy, ConfigError
 from tracebed.workers.scheduler import ScheduledJob
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -71,11 +74,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
     from tracebed.adapters.embedding.pinning import ModelPin
     from tracebed.adapters.ports import EmbeddingPort
+    from tracebed.crypto.shred import SubjectKeyManager
     from tracebed.domain.clock import Clock
-    from tracebed.domain.config import WorkersConfig
+    from tracebed.domain.config import ConfigResolver, EffectiveConfig, WorkersConfig
     from tracebed.domain.ids import AgentTypeId, ProjectId
+    from tracebed.stores.pg.activity import ActivityGate
     from tracebed.stores.pg.derived_state_store import DerivedStateStore
     from tracebed.stores.pg.distillation import KnownDistillationRepo
+    from tracebed.stores.pg.erasure import ErasureSnapshotGuard
     from tracebed.stores.pg.killswitch import KillswitchWriter
     from tracebed.stores.pg.lifecycle import LifecycleWriter
     from tracebed.stores.pg.memory_lifecycle import MemoryLifecycleRepo
@@ -83,6 +89,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from tracebed.stores.pg.repo import Repo
     from tracebed.stores.pg.scoring import ScorerRepo
     from tracebed.stores.pg.shadow_validator import ShadowValidatorRepo
+    from tracebed.stores.tracestore import TraceStorePort
     from tracebed.workers.corroboration import (
         CorroborationCandidateSource,
         CorroborationWriter,
@@ -97,6 +104,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
         MemoryStorePort,
         StaticPrefixCachePort,
     )
+    from tracebed.workers.tier_a_lane import TierALane
+    from tracebed.workers.trace_learning_coordinator import TraceLearningRunner
 
 __all__ = [
     "NON_PERIODIC_WORKERS",
@@ -104,6 +113,7 @@ __all__ = [
     "LearningPlane",
     "build_learning_plane",
     "build_scheduled_jobs",
+    "build_trace_learning_runner",
     "discover_worker_modules",
     "validate_worker_coverage",
 ]
@@ -135,6 +145,11 @@ NON_PERIODIC_WORKERS: Final[Mapping[str, str]] = MappingProxyType(
         "scheduled; being scheduled by its own output would be a cycle, not a pass.",
         "runner": "the worker process entry point; it OWNS the scheduler thread rather than "
         "being scheduled by it",
+        "ready": "the worker database-readiness command is invoked by the process supervisor "
+        "and Compose healthcheck; it is a startup probe, not a unit of periodic work",
+        "drain": "the worker-identity queue counter is invoked only by the closed Compose "
+        "upgrade/rollback controller after admission is fenced; it proves an exact terminal "
+        "drain and must never be scheduled as a competing queue consumer",
         "scheduler": "the generic cadence harness every ScheduledJob below is handed to; it "
         "owns WHEN a job runs and knows nothing at all about what any job does",
         "registry": "the queue-topic -> BatchHandler map for the push plane; the pull plane "
@@ -158,8 +173,13 @@ NON_PERIODIC_WORKERS: Final[Mapping[str, str]] = MappingProxyType(
         "(`run_guarded`); it has no unit of its own",
         "review_queue": "the human-review store surface; a queue an operator drains, not a "
         "pass a scheduler drives",
-        "tier_a_lane": "runs synchronously on the trace path (`ingest`), once per trace, not "
-        "on a cadence",
+        "tier_a_lane": "pure per-job planning invoked by the trace-learning pull loop after "
+        "strict archive decryption; it has no cadence or durable I/O of its own",
+        "trace_learning": "P2A/P2B durable job, receipt, and finalizer contracts; they are "
+        "called by the trace-learning coordinator and have no cadence by themselves",
+        "trace_learning_coordinator": "one-job Tier-A/v1 pull-loop coordination directly "
+        "supervised by the worker process; it is not a periodic Scheduler job with an invented "
+        "cadence",
         "extractors": "structural Tier A extractors, driven per trace by tier_a_lane",
         "edit_ops": "operator-invoked (pin/merge/correct/delete-by-subject); every call has a "
         "human actor and a request behind it, so a cadence would be an actor-less edit",
@@ -268,6 +288,63 @@ class LearningPlane:
     known_distillations: KnownDistillationRepo
 
 
+def build_trace_learning_runner(
+    *,
+    pool: ConnectionPool,
+    repo: Repo,
+    tracestore: TraceStorePort,
+    keys: SubjectKeyManager,
+    config_resolver: ConfigResolver,
+    clock: Clock,
+    lease_seconds: int,
+    poll_interval: timedelta,
+    owner: str | None = None,
+    lane_factory: Callable[[EffectiveConfig, Clock], TierALane] | None = None,
+    activity: ActivityGate | None = None,
+    erasure_guard: ErasureSnapshotGuard | None = None,
+) -> TraceLearningRunner:
+    """Build the one real serial Tier-A/v1 pull loop for this worker process.
+
+    The owner is generated once per factory invocation, rather than once per
+    claim, so every lease taken by this process has a stable auditable owner.
+    The optional ``owner`` and ``lane_factory`` parameters are deliberate
+    composition-test seams; production uses the process-bound owner and the
+    coordinator's real pure-lane factory.
+    """
+
+    from tracebed.ingest.trace_archive import TraceArchiveReader
+    from tracebed.stores.pg.trace_learning import TraceLearningFinalizer, TraceLearningJobStore
+    from tracebed.workers.trace_learning_coordinator import (
+        TraceLearningCoordinator,
+        TraceLearningRunner,
+        build_tier_a_lane,
+    )
+
+    resolved_owner = owner or f"trace-learning:{os.getpid()}:{uuid4().hex}"
+    jobs = TraceLearningJobStore(
+        pool,
+        lease_duration=timedelta(seconds=lease_seconds),
+        max_claim_limit=1,
+    )
+    coordinator = TraceLearningCoordinator(
+        jobs=jobs,
+        reader=TraceArchiveReader(repo, tracestore, keys),
+        config=config_resolver,
+        lane_factory=lane_factory or build_tier_a_lane,
+        finalizer=TraceLearningFinalizer(repo),
+        clock=clock,
+        owner=resolved_owner,
+        lease_seconds=lease_seconds,
+        activity=activity,
+        erasure_guard=erasure_guard,
+    )
+    return TraceLearningRunner(
+        coordinator=coordinator,
+        list_project_ids=repo.list_project_ids,
+        poll_interval=poll_interval,
+    )
+
+
 def build_learning_plane(
     *,
     pool: ConnectionPool,
@@ -277,15 +354,9 @@ def build_learning_plane(
     pin: ModelPin,
     embedding_port: EmbeddingPort,
     spend: SpendRecorderPort,
-    key_manager: object,
     candidate_source: CorroborationCandidateSource | None = None,
 ) -> LearningPlane:
     """Construct the learning plane against real stores.
-
-    `key_manager` is typed `object` and passed straight through to `EditOps` because
-    `crypto.shred.SubjectKeyManager` is a concrete class with a `Repo`-shaped store dependency;
-    naming it here would make this module import the crypto package for a type it never calls.
-    `EditOps` does the real typing.
 
     Note what is NOT optional: `lifecycle`, `edit_ops`, `forensics` and `preferences` are always
     constructed. That is the point of M1's closure -- `persist_status`, whose only
@@ -327,7 +398,7 @@ def build_learning_plane(
 
     return LearningPlane(
         lifecycle=lifecycle,
-        edit_ops=EditOps(edit_repo, key_manager, clock),  # type: ignore[arg-type]
+        edit_ops=EditOps(edit_repo, clock),
         forensics=Forensics(forensics_repo, clock),
         preferences=PreferenceManager(edit_repo, clock),
         embedder=embedder,
@@ -358,6 +429,7 @@ def build_scheduled_jobs(
     prefix_cache: StaticPrefixCachePort,
     list_agent_type_ids: Callable[[ProjectId], Sequence[AgentTypeId]],
     candidate_source: CorroborationCandidateSource | None = None,
+    activity: ActivityGate | None = None,
 ) -> tuple[ScheduledJob, ...]:
     """The `ScheduledJob`s a `workers.scheduler.Scheduler` should be constructed with.
 
@@ -384,7 +456,19 @@ def build_scheduled_jobs(
         def _run() -> None:
             for project_id in list_project_ids():
                 try:
-                    body(project_id)
+                    if activity is None:
+                        body(project_id)
+                    else:
+                        # Cache, graph, embedding, and model calls inside a
+                        # scheduled project pass are side effects too. Keep a
+                        # shared E2 drain until that full pass returns.
+                        with activity.shared(project_id):
+                            body(project_id)
+                except ActivityBusy:
+                    # A request owns the exclusive drain. This project will
+                    # be revisited on the next scheduler tick without having
+                    # performed a partial periodic side effect.
+                    continue
                 except Exception:
                     logger.exception("scheduled job %r failed for project %s", name, project_id)
 

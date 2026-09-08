@@ -28,9 +28,10 @@ import os
 import secrets
 import uuid
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any
 
 import psycopg
 import pytest
@@ -47,14 +48,17 @@ from tracebed.api.deps import AppDeps
 from tracebed.api.main import create_app
 from tracebed.core.scans import ScanContext, scan
 from tracebed.crypto.shred import EnvMasterKeyProvider, PlainSection, SubjectKeyManager
+from tracebed.domain.authority import AccessContext, GrantBinding
 from tracebed.domain.canonical import canonical_json, content_hash
 from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import EmbeddingConfig, QueueConfig, StorageConfig, TracebedSettings
 from tracebed.domain.enums import (
     AdapterClass,
+    FeedbackSource,
     InstrumentationSource,
     Lane,
     MemType,
+    ProjectRole,
     ProvenanceClass,
     ScopeType,
     TraceOutcomeStatus,
@@ -103,9 +107,10 @@ __all__ = [
     "two_leak_projects",
 ]
 
-# `tracebed_app`'s credential belongs to deployment, not to this harness
-# (docker/initdb/01-roles.sql for compose/CI) — overridable so the probe can
-# run against a stack that rotated it, mirroring test_partitions.py's pattern.
+# `tracebed_app`'s credential belongs to deployment, not to this harness. The
+# owner bootstrap / Compose ``db-bootstrap`` one-shot establishes it; this
+# override lets the probe run against a stack that rotated it, mirroring
+# test_partitions.py's pattern.
 APP_ROLE_PASSWORD: str = os.environ.get("TB_APP_ROLE_PASSWORD", "tracebed_app_dev")
 
 _ADMIN_KEY_ENV = "TB_ADMIN_KEY"
@@ -211,35 +216,72 @@ class _FakeResolver:
         return scope
 
 
+class _FakeAccessResolver:
+    """Offline grant source matching the normal API's B2 access boundary."""
+
+    def __init__(self, scopes: Mapping[PrincipalId, ProjectScope]) -> None:
+        self._scopes = scopes
+
+    def resolve_access(self, principal_id: PrincipalId) -> AccessContext:
+        scope = self._scopes.get(principal_id)
+        if scope is None:
+            raise ScopeResolutionFailed("no active access for principal")
+        return AccessContext(
+            project_id=scope.project_id,
+            agent_type_id=scope.agent_type_id,
+            principal_id=scope.principal_id,
+            grants=(
+                GrantBinding(uuid.uuid4(), ProjectRole.DATA),
+                GrantBinding(uuid.uuid4(), ProjectRole.FEEDBACK, FeedbackSource.VERDICT),
+                GrantBinding(uuid.uuid4(), ProjectRole.ADMIN),
+                GrantBinding(uuid.uuid4(), ProjectRole.EXPORT),
+            ),
+        )
+
+
 class _FakeQueue:
     def __init__(self) -> None:
-        self.enqueued: list[tuple[str, ProjectId, dict[str, object]]] = []
+        self.enqueued: list[tuple[AccessContext, tuple[object, ...]]] = []
 
-    def enqueue(
+    def enqueue_many_authorized(
         self,
-        topic: str,
-        project_id: ProjectId,
-        payload: Mapping[str, object],
-        priority: int = 100,
-        available_at: datetime | None = None,
-    ) -> int:
-        del priority, available_at
-        self.enqueued.append((topic, project_id, dict(payload)))
-        return len(self.enqueued)
+        access: AccessContext,
+        writes: tuple[object, ...],
+    ) -> tuple[int, ...]:
+        self.enqueued.append((access, writes))
+        return tuple(range(1, len(writes) + 1))
 
 
 class _FakeInvalidations:
     def __init__(self) -> None:
         self.rows: list[tuple[ProjectId, str, Mapping[str, object] | None]] = []
 
-    def insert_invalidation_event(
+    def insert(
         self,
-        project_id: ProjectId,
+        access: AccessContext,
         event_type: str,
         selector: Mapping[str, object] | None = None,
     ) -> uuid.UUID:
-        self.rows.append((project_id, event_type, selector))
+        self.rows.append((access.project_id, event_type, selector))
         return uuid.uuid4()
+
+
+class _FakeRetrievalOpener:
+    def open(self, access: AccessContext, run_id: RunId) -> object:
+        del access, run_id
+        return object()
+
+    @contextmanager
+    def hold(
+        self,
+        access: object,
+        run_id: object,
+        *,
+        subject_tags: tuple[str, ...] = (),
+        deadline: object = None,
+    ) -> Iterator[object]:
+        del access, run_id, subject_tags, deadline
+        yield object()
 
 
 class _FakeTelemetry:
@@ -264,35 +306,6 @@ class _FakeExporter:
 
     def iter_export_rows(self, project_id: ProjectId) -> Iterator[dict[str, object]]:
         yield from self._rows.get(project_id, [])
-
-
-class _UnusedAdmin:
-    """Offline probes never call `/admin/projects` or `/admin/agents/register`
-    (they need no admin-key bootstrap flow to exercise by-id/export routing),
-    so these raise loudly rather than silently no-op if a probe ever does."""
-
-    def create_project(self, name: str, retention_policy: Mapping[str, object] | None = None) -> ProjectId:
-        raise NotImplementedError("offline leak fixtures do not provision new projects")
-
-    def create_agent_registration(
-        self,
-        project_id: ProjectId,
-        agent_type_name: str,
-        principal_kind: Literal["oidc_sub", "api_key"],
-        external_ref: str,
-        key_hash: str | None,
-    ) -> tuple[PrincipalId, AgentTypeId]:
-        raise NotImplementedError("offline leak fixtures do not register agents")
-
-
-class _UnusedPartitions:
-    def create_project_partitions(self, project_id: ProjectId) -> None:
-        raise NotImplementedError("offline leak fixtures create no partitions")
-
-
-class _UnusedKeys:
-    def ensure_project_kek(self, project_id: ProjectId) -> None:
-        raise NotImplementedError("offline leak fixtures provision no KEKs")
 
 
 def _fake_memory_row(
@@ -414,9 +427,8 @@ def offline_two_projects() -> Iterator[tuple[LeakProject, LeakProject, TestClien
         memory_reader=_FakeMemoryReader(memory_rows),
         exporter=_FakeExporter(export_rows),
         invalidations=_FakeInvalidations(),
-        admin=_UnusedAdmin(),
-        partitions=_UnusedPartitions(),
-        keys=_UnusedKeys(),
+        retrieval_opener=_FakeRetrievalOpener(),
+        access_resolver=_FakeAccessResolver(scopes),
         clock=clock,
     )
     settings = TracebedSettings(
@@ -569,9 +581,7 @@ def leak_app(
     """
     del leak_admin_key_env
     principals = _RepoPrincipalLookup(leak_repo)
-    verifier = ChainVerifier(
-        oidc=None, api_key=ApiKeyVerifier(principals), api_key_mode=True
-    )
+    verifier = ChainVerifier(oidc=None, api_key=ApiKeyVerifier(principals), api_key_mode=True)
     deps = AppDeps(
         verifier=verifier,
         resolver=leak_repo,
@@ -595,9 +605,7 @@ def leak_client(leak_app: Any) -> Iterator[TestClient]:
 
 
 def _http_provision_project(client: TestClient, admin_key: str, name: str) -> ProjectId:
-    resp = client.post(
-        "/admin/projects", json={"name": name}, headers={"X-Admin-Key": admin_key}
-    )
+    resp = client.post("/admin/projects", json={"name": name}, headers={"X-Admin-Key": admin_key})
     assert resp.status_code == 201, f"provisioning {name!r} failed: {resp.status_code} {resp.text}"
     return ProjectId(uuid.UUID(resp.json()["project_id"]))
 
@@ -614,7 +622,9 @@ def _http_register_agent(
         },
         headers={"X-Admin-Key": admin_key},
     )
-    assert resp.status_code == 201, f"registering {agent_type!r} failed: {resp.status_code} {resp.text}"
+    assert resp.status_code == 201, (
+        f"registering {agent_type!r} failed: {resp.status_code} {resp.text}"
+    )
     body = resp.json()
     return (
         PrincipalId(uuid.UUID(body["principal_id"])),
@@ -740,7 +750,9 @@ def _provision_leak_project(
     store: FsTraceStore,
     label: str,
 ) -> LeakProject:
-    project_id = _http_provision_project(client, admin_key, f"leak-suite-{label}-{uuid.uuid4().hex[:8]}")
+    project_id = _http_provision_project(
+        client, admin_key, f"leak-suite-{label}-{uuid.uuid4().hex[:8]}"
+    )
     principal_id, _agent_type_id, api_key = _http_register_agent(
         client, admin_key, project_id, f"leak-agent-{label}"
     )
@@ -777,10 +789,22 @@ def two_leak_projects(
     leaked row from a previous run can never be mistaken for a passing probe.
     """
     project_a = _provision_leak_project(
-        leak_client, leak_admin_key_env, leak_repo, leak_clock, leak_keys_manager, leak_tracestore, "a"
+        leak_client,
+        leak_admin_key_env,
+        leak_repo,
+        leak_clock,
+        leak_keys_manager,
+        leak_tracestore,
+        "a",
     )
     project_b = _provision_leak_project(
-        leak_client, leak_admin_key_env, leak_repo, leak_clock, leak_keys_manager, leak_tracestore, "b"
+        leak_client,
+        leak_admin_key_env,
+        leak_repo,
+        leak_clock,
+        leak_keys_manager,
+        leak_tracestore,
+        "b",
     )
     return project_a, project_b
 
@@ -910,6 +934,21 @@ SEED_ROW_SQL: dict[str, str] = {
         " contribution, epoch_id, scored_at)"
         " VALUES (%(pid)s, gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),"
         " 0.5, 0.6, 0.1, 1, now())"
+    ),
+    # trace_learning_job: the 16th partitioned table (0008). A pending row
+    # exercises the parent/child RLS wall without pretending P2B schedules it.
+    "trace_learning_job": (
+        "INSERT INTO trace_learning_job"
+        " (project_id, run_id, pipeline, pipeline_version, state, attempts, max_attempts,"
+        " available_at, trace_ended_at, schedule_source, scheduled_at, updated_at)"
+        " VALUES (%(pid)s, gen_random_uuid(), 'tier_a', 1, 'pending', 0, 3,"
+        " now(), now(), 'live', now(), now())"
+    ),
+    # run_owner: the 17th partitioned table (0010), with an immutable trace
+    # origin record suitable for the generic RLS probe.
+    "run_owner": (
+        "INSERT INTO run_owner (project_id, run_id, principal_id, agent_type_id, origin, bound_at)"
+        " VALUES (%(pid)s, gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'trace', now())"
     ),
 }
 

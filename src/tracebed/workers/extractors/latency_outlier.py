@@ -21,23 +21,15 @@ import statistics
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 
-from tracebed.core.scans import ReviewQueueWriter
 from tracebed.core.scans.tier_a_template import ErrorClassEnum
-from tracebed.domain.clock import Clock
-from tracebed.domain.config import EffectiveConfig
 from tracebed.domain.enums import MemType
 from tracebed.domain.events import TraceEvent
 from tracebed.domain.ids import RunId
-from tracebed.domain.scope import ProjectScope
 from tracebed.workers.extractors.base import (
-    CandidateCapTracker,
-    ExtractionOutcome,
-    MemoryWriterPort,
+    TierACandidateProposal,
     ToolEventRecord,
-    emit_candidate,
     mean_duration_ms,
     read_tool_events,
-    resolve_cap_tracker,
     structural_hash,
     try_build_note,
 )
@@ -98,18 +90,13 @@ class LatencyOutlierExtractor:
         self._zscore = zscore
         self._min_repeat_count = min_repeat_count
 
-    def extract(
+    def propose(
         self,
-        scope: ProjectScope,
         traces: Mapping[RunId, Sequence[TraceEvent]],
         *,
-        cfg: EffectiveConfig,
-        clock: Clock,
-        writer: MemoryWriterPort,
-        review_writer: ReviewQueueWriter | None = None,
-        cap_tracker: CandidateCapTracker | None = None,
         require_declared_tools: bool = True,
-    ) -> list[ExtractionOutcome]:
+    ) -> list[TierACandidateProposal]:
+        """Return deterministic structural findings without scanning or I/O."""
         by_tool: dict[_ToolKey, list[ToolEventRecord]] = defaultdict(list)
         for run_id, events in traces.items():
             for record in read_tool_events(
@@ -124,8 +111,7 @@ class LatencyOutlierExtractor:
                     continue
                 by_tool[(record.tool_id, record.tool_version_hash)].append(record)
 
-        tracker = resolve_cap_tracker(cap_tracker, cfg)
-        outcomes: list[ExtractionOutcome] = []
+        proposals: list[TierACandidateProposal] = []
         for key in sorted(by_tool):
             records = by_tool[key]
             durations = [r.duration_ms for r in records if r.duration_ms is not None]
@@ -151,7 +137,11 @@ class LatencyOutlierExtractor:
 
             tool_id, tool_version_hash = key
             ordered = sorted(outliers, key=lambda r: r.order_key())
-            trace_ids = tuple(sorted({r.run_id for r in ordered}, key=str))
+            # The threshold is derived from *every* record for this tool, not
+            # merely the calls that crossed it.  Persisting only outlier runs
+            # would leave a later auditor unable to reconstruct the baseline
+            # which made those calls exceptional in the first place.
+            trace_ids = tuple(sorted({r.run_id for r in records}, key=str))
             primary_run_id = ordered[-1].run_id
 
             duration_ms = mean_duration_ms(
@@ -173,19 +163,13 @@ class LatencyOutlierExtractor:
             if note is None:
                 continue
 
-            outcomes.append(
-                emit_candidate(
-                    scope=scope,
-                    clock=clock,
-                    cfg=cfg,
-                    writer=writer,
+            proposals.append(
+                TierACandidateProposal(
                     note=note,
                     mem_type=_MEM_TYPE,
                     kind=_KIND,
-                    trace_ids=trace_ids,
+                    contributing_run_ids=trace_ids,
                     primary_run_id=primary_run_id,
-                    cap_tracker=tracker,
-                    review_writer=review_writer,
                 )
             )
-        return outcomes
+        return proposals

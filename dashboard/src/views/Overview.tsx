@@ -647,7 +647,7 @@ export default function Overview() {
         ) : totalOutcomes === 0 ? (
           <EmptyState
             title="No outcomes to break down yet"
-            description="Every /v1/retrieve call writes one retrieval_event row; none exist for this project so far."
+            description="No persisted retrieval events exist for this project so far."
           />
         ) : (
           <div className="rounded-lg border border-border bg-surface p-4">

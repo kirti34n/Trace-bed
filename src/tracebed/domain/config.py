@@ -18,14 +18,21 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Final, Literal, Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from tracebed.domain.errors import ConfigError
+from tracebed.domain.deadline import RemainingBudget
+from tracebed.domain.errors import ConfigError, RequestDeadlineExceeded
 from tracebed.domain.ids import AgentTypeId, ProjectId
 
 __all__ = [
+    "HASH_LOCAL_MODEL_ID",
+    "HASH_LOCAL_MODEL_VERSION",
+    "MAX_QUEUE_ATTEMPTS",
+    "MAX_TIER_A_CANDIDATES_PER_RESULT",
+    "MAX_TIER_A_INDIVIDUAL_REJECTIONS_PER_RESULT",
     "OVERRIDABLE_SECTIONS",
     "AbstentionConfig",
     "ApiConfig",
@@ -43,6 +50,7 @@ __all__ = [
     "LifecycleConfig",
     "PromotionConfig",
     "ProposalConfig",
+    "QueueAdmissionLimits",
     "QueueConfig",
     "RetirementConfig",
     "RetrievalConfig",
@@ -55,6 +63,19 @@ __all__ = [
     "TraceStoreConfig",
     "TracebedSettings",
 ]
+
+
+# Both work-queue configuration and the durable trace-learning job schema
+# bound attempts at this value.  Keep the application side fail-fast: a value
+# a scheduler can emit must be accepted by its database destination.
+MAX_QUEUE_ATTEMPTS: Final = 32
+
+# One Tier-A job must fit in the finalizer's bounded atomic transaction.  The
+# planner imports these limits rather than carrying a parallel, potentially
+# divergent cap.  Individual scanner rejections beyond the retained bound are
+# represented by a deterministic aggregate receipt, not silently discarded.
+MAX_TIER_A_CANDIDATES_PER_RESULT: Final = 100
+MAX_TIER_A_INDIVIDUAL_REJECTIONS_PER_RESULT: Final = 100
 
 
 class _StrictModel(BaseModel):
@@ -95,6 +116,8 @@ class ApiConfig(_StrictModel):
 
     port: int = 8110
     workers: int = 2
+    retrieval_request_ceiling_ms: int = Field(default=1000, ge=1)
+    retrieval_admission_capacity: int = Field(default=4, ge=1)
 
 
 class DashboardConfig(_StrictModel):
@@ -108,10 +131,47 @@ class AuthConfig(_StrictModel):
 
     oidc_jwks_url: str | None = None
     oidc_issuer: str | None = None
+    oidc_audience: str | None = None
     api_key_mode: bool = True
     admin_key_env: str = "TB_ADMIN_KEY"
     """C-02: the only config field added beyond Task 2's listing — names the
     env var holding the static bootstrap admin credential (§9.1)."""
+
+    @field_validator("oidc_jwks_url", "oidc_issuer", "oidc_audience", mode="before")
+    @classmethod
+    def _empty_optional_oidc_value_is_unset(cls, value: object) -> object:
+        """Compose renders absent optional values as empty strings.
+
+        Treat an entirely empty group as disabled, while the model validator
+        still rejects any genuine partial configuration.
+        """
+        return None if value == "" else value
+
+    @model_validator(mode="after")
+    def _validate_oidc_configuration(self) -> AuthConfig:
+        """OIDC is an all-or-nothing deployment boundary, never a partial fallback."""
+
+        values = (self.oidc_issuer, self.oidc_jwks_url, self.oidc_audience)
+        if any(value is not None for value in values) and not all(values):
+            raise ValueError("auth OIDC issuer, JWKS URL, and audience must be configured together")
+        if self.oidc_issuer is None:
+            return self
+        for name, value in (("issuer", self.oidc_issuer), ("JWKS URL", self.oidc_jwks_url)):
+            if value is None:
+                raise ValueError("auth OIDC configuration is incomplete")
+            parsed = urlsplit(value)
+            if (
+                parsed.scheme != "https"
+                or not parsed.netloc
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(f"auth OIDC {name} must be a controlled HTTPS URL")
+        if not self.oidc_audience or len(self.oidc_audience) > 255:
+            raise ValueError("auth OIDC audience is invalid")
+        return self
 
 
 class TraceStoreConfig(_StrictModel):
@@ -127,9 +187,15 @@ class TraceStoreConfig(_StrictModel):
 
 
 class StorageConfig(_StrictModel):
-    """Postgres, Valkey, and trace-store wiring. `pg_dsn` is required."""
+    """Library Postgres, Valkey, and trace-store wiring.
 
-    pg_dsn: str
+    ``pg_dsn`` remains available to direct-library and isolated-test callers,
+    but is deliberately optional here: production API/worker factories take
+    their separate process credential from ``TB_API_DB_DSN`` or
+    ``TB_WORKER_DB_DSN`` before they construct any dependency.
+    """
+
+    pg_dsn: str | None = None
     valkey_url: str = "valkey://localhost:6379/0"
     tracestore: TraceStoreConfig = Field(default_factory=TraceStoreConfig)
 
@@ -158,15 +224,55 @@ class StorageConfig(_StrictModel):
     not to be the hot path's budget."""
 
 
+HASH_LOCAL_MODEL_ID: Final = "tracebed-hash-local"
+HASH_LOCAL_MODEL_VERSION: Final = "sha256-unigram-bigram-v1"
+
+
 class EmbeddingConfig(_StrictModel):
-    """The embedding pin (D-007): model id/version/dim stamped on every row."""
+    """The embedding pin (D-007): model id/version/dim stamped on every row.
+
+    ``hash-local`` is an algorithm, not an alias for the configured Gemini
+    model.  Its identity is fixed so a row created by that fallback can never
+    be stamped as a Gemini vector.  Omitted hash-local identity fields are
+    derived; explicitly supplied fields must match the fixed identity.  Other
+    drivers retain the existing explicit ``model_version`` requirement.
+    """
 
     model_id: str = "gemini-embedding-2"
-    model_version: str
+    model_version: str = ""
     dim: int = 768
-    driver: Literal["gemini", "onnx-local"] = "gemini"
+    driver: Literal["gemini", "hash-local", "onnx-local"] = "gemini"
     onnx_model_path: Path | None = None
     onnx_model_hash: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_driver_identity(self) -> EmbeddingConfig:
+        if self.driver == "hash-local":
+            supplied_mismatches = []
+            if "model_id" in self.model_fields_set and self.model_id != HASH_LOCAL_MODEL_ID:
+                supplied_mismatches.append("model_id")
+            if (
+                "model_version" in self.model_fields_set
+                and self.model_version != HASH_LOCAL_MODEL_VERSION
+            ):
+                supplied_mismatches.append("model_version")
+            if supplied_mismatches:
+                fields = ", ".join(supplied_mismatches)
+                raise ValueError(
+                    "embedding.driver='hash-local' requires fixed "
+                    f"{HASH_LOCAL_MODEL_ID!r}/{HASH_LOCAL_MODEL_VERSION!r}; "
+                    f"mismatched explicit {fields}"
+                )
+            # Pydantic's top-level ``mode='after'`` validators must return
+            # this instance (a copied model is ignored by ``__init__``). The
+            # model is frozen for callers, while this normalization happens
+            # during its one-time construction before it is exposed.
+            object.__setattr__(self, "model_id", HASH_LOCAL_MODEL_ID)
+            object.__setattr__(self, "model_version", HASH_LOCAL_MODEL_VERSION)
+            return self
+        if not self.model_version:
+            raise ValueError(f"embedding.driver={self.driver!r} requires embedding.model_version")
+        return self
 
 
 class LLMProviderConfig(_StrictModel):
@@ -377,11 +483,13 @@ class ProposalConfig(_StrictModel):
 class TierAConfig(_StrictModel):
     """Tier A operational-note caps (D-019)."""
 
-    candidate_cap_per_run: int = Field(default=1, ge=0)
+    candidate_cap_per_run: int = Field(default=1, ge=0, le=MAX_TIER_A_CANDIDATES_PER_RESULT)
     """`ge=0`, not `ge=1`: zero is a meaningful setting (a project that wants
-    the Tier A lane to observe and merge but never emit a new candidate), while
-    a negative cap would make `CandidateCapTracker` reject every run with no
-    way for an operator to tell that from "the extractor found nothing"."""
+    the Tier A lane to observe and merge but never emit a new candidate).  One
+    one hundred is the hard durable-finalizer bound, so configuration cannot ask
+    the planner to create a result the finalizer must reject.  A negative cap
+    would make `CandidateCapTracker` reject every run with no way for an
+    operator to tell that from "the extractor found nothing"."""
 
 
 class KillswitchConfig(_StrictModel):
@@ -416,9 +524,7 @@ class SpendConfig(_StrictModel):
 class CacheConfig(_StrictModel):
     """Valkey TTL classes by cache kind."""
 
-    ttl_class: dict[str, str] = Field(
-        default_factory=lambda: {"intel": "24h", "registry": "14d"}
-    )
+    ttl_class: dict[str, str] = Field(default_factory=lambda: {"intel": "24h", "registry": "14d"})
 
 
 class SessionConfig(_StrictModel):
@@ -428,12 +534,40 @@ class SessionConfig(_StrictModel):
     offload_threshold_tokens: int = 20_000
 
 
+class QueueAdmissionLimits(_StrictModel):
+    """Bounded authorized-producer admission, independent of legacy consumers.
+
+    The byte limits constrain the portable queue envelope before it reaches a
+    JSONB codec.  Depth limits apply to all non-dead queued work, including
+    leases and legacy rows, so one producer cannot bypass backpressure by
+    choosing a different queue state.
+    """
+
+    max_item_bytes: int = Field(default=256 * 1024, ge=1, le=256 * 1024)
+    max_batch_bytes: int = Field(default=4 * 1024 * 1024, ge=1, le=4 * 1024 * 1024)
+    max_batch_items: int = Field(default=500, ge=1, le=500)
+    max_project_depth: int = Field(default=10_000, ge=1)
+    max_topic_depth: int = Field(default=50_000, ge=1)
+    max_global_depth: int = Field(default=100_000, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_admission_relationships(self) -> QueueAdmissionLimits:
+        if self.max_item_bytes > self.max_batch_bytes:
+            raise ValueError("queue admission max_item_bytes must not exceed max_batch_bytes")
+        if self.max_project_depth > self.max_global_depth:
+            raise ValueError("queue admission max_project_depth must not exceed max_global_depth")
+        if self.max_topic_depth > self.max_global_depth:
+            raise ValueError("queue admission max_topic_depth must not exceed max_global_depth")
+        return self
+
+
 class QueueConfig(_StrictModel):
     """`work_queue` lease/retry constants (§5.3)."""
 
     lease_seconds: int = Field(default=30, ge=1)
-    max_attempts: int = Field(default=5, ge=1)
+    max_attempts: int = Field(default=5, ge=1, le=MAX_QUEUE_ATTEMPTS)
     batch_size: int = Field(default=100, ge=1)
+    admission: QueueAdmissionLimits = Field(default_factory=lambda: QueueAdmissionLimits())
 
 
 class WorkersConfig(_StrictModel):
@@ -541,18 +675,18 @@ class TracebedSettings(BaseSettings):
     `extra="forbid"` here (and on every nested `_StrictModel`) rejects any
     env var under the `TB_` prefix that does not map to a declared field —
     the contract's "unknown key rejected" test exercises exactly this.
-    `storage` and `embedding` have no default: `TB_STORAGE__PG_DSN` and
-    `TB_EMBEDDING__MODEL_VERSION` must be set for the process to start.
+    Production runtime factories independently require their split database
+    secret before startup. ``storage`` still uses ordinary settings loading,
+    but its legacy ``pg_dsn`` field defaults to ``None`` and cannot provide a
+    runtime database credential.
     """
 
-    model_config = SettingsConfigDict(
-        env_prefix="TB_", env_nested_delimiter="__", extra="forbid"
-    )
+    model_config = SettingsConfigDict(env_prefix="TB_", env_nested_delimiter="__", extra="forbid")
 
     api: ApiConfig = Field(default_factory=ApiConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
-    storage: StorageConfig
+    storage: StorageConfig = Field(default_factory=StorageConfig)
     embedding: EmbeddingConfig
     llm: LLMProviderConfig = Field(default_factory=LLMProviderConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
@@ -619,18 +753,28 @@ class ConfigStorePort(Protocol):
     module must not import.
     """
 
-    def get_project_config(self, project_id: ProjectId) -> Mapping[str, object]:
+    def get_project_config(
+        self, project_id: ProjectId, *, deadline: RemainingBudget | None = None
+    ) -> Mapping[str, object]:
         """Dotted-key -> JSON-value overrides set at the project level."""
         ...
 
     def get_agent_type_config(
-        self, project_id: ProjectId, agent_type_id: AgentTypeId
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId,
+        *,
+        deadline: RemainingBudget | None = None,
     ) -> Mapping[str, object]:
         """Dotted-key -> JSON-value overrides set at the agent-type level."""
         ...
 
     def get_killswitch_overlay(
-        self, project_id: ProjectId, agent_type_id: AgentTypeId | None
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId | None,
+        *,
+        deadline: RemainingBudget | None = None,
     ) -> Mapping[str, bool]:
         """mem_type -> disabled, from `killswitch_state`. Read-only to resolution."""
         ...
@@ -749,7 +893,11 @@ class ConfigResolver:
         self._store = store
 
     def effective(
-        self, project_id: ProjectId, agent_type_id: AgentTypeId | None = None
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId | None = None,
+        *,
+        deadline: RemainingBudget | None = None,
     ) -> EffectiveConfig:
         """Resolve the layered config for one (project, agent_type) pair.
 
@@ -764,13 +912,15 @@ class ConfigResolver:
             for section in OVERRIDABLE_SECTIONS
         }
 
-        for key, value in self._store.get_project_config(project_id).items():
+        project_overrides = self._read_project_config(project_id, deadline=deadline)
+        for key, value in project_overrides.items():
             _apply_override(merged, key, value)
 
         if agent_type_id is not None:
-            for key, value in self._store.get_agent_type_config(
-                project_id, agent_type_id
-            ).items():
+            agent_overrides = self._read_agent_type_config(
+                project_id, agent_type_id, deadline=deadline
+            )
+            for key, value in agent_overrides.items():
                 _apply_override(merged, key, value)
 
         sections: dict[str, object] = {}
@@ -782,11 +932,9 @@ class ConfigResolver:
                 # pydantic's __init__ signature rather than on extra="forbid".
                 sections[section] = model_cls.model_validate(merged[section])
             except ValidationError as exc:
-                raise ConfigError(
-                    f"invalid override(s) in section {section!r}: {exc}"
-                ) from exc
+                raise ConfigError(f"invalid override(s) in section {section!r}: {exc}") from exc
 
-        overlay = self._store.get_killswitch_overlay(project_id, agent_type_id)
+        overlay = self._read_killswitch_overlay(project_id, agent_type_id, deadline=deadline)
         try:
             # Cross-section constraints (see EffectiveConfig's validators) can
             # only fire here, once every section has been rebuilt. Translating
@@ -795,3 +943,56 @@ class ConfigResolver:
             return EffectiveConfig(killswitch_overlay=dict(overlay), **sections)
         except ValidationError as exc:
             raise ConfigError(f"invalid override combination across sections: {exc}") from exc
+
+    @staticmethod
+    def _require_remaining(deadline: RemainingBudget | None) -> None:
+        if deadline is not None and deadline.remaining_ms() <= 0:
+            raise RequestDeadlineExceeded()
+
+    def _read_project_config(
+        self, project_id: ProjectId, *, deadline: RemainingBudget | None
+    ) -> Mapping[str, object]:
+        self._require_remaining(deadline)
+        if deadline is None:
+            result = self._store.get_project_config(project_id)
+        else:
+            result = self._store.get_project_config(project_id, deadline=deadline)
+        self._require_remaining(deadline)
+        return result
+
+    def _read_agent_type_config(
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId,
+        *,
+        deadline: RemainingBudget | None,
+    ) -> Mapping[str, object]:
+        self._require_remaining(deadline)
+        if deadline is None:
+            result = self._store.get_agent_type_config(project_id, agent_type_id)
+        else:
+            result = self._store.get_agent_type_config(project_id, agent_type_id, deadline=deadline)
+        self._require_remaining(deadline)
+        return result
+
+    def _read_killswitch_overlay(
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId | None,
+        *,
+        deadline: RemainingBudget | None,
+    ) -> Mapping[str, bool]:
+        self._require_remaining(deadline)
+        if deadline is None:
+            result = self._store.get_killswitch_overlay(project_id, agent_type_id)
+        else:
+            result = self._store.get_killswitch_overlay(
+                project_id, agent_type_id, deadline=deadline
+            )
+        self._require_remaining(deadline)
+        return result
+
+    @field_validator("oidc_jwks_url", "oidc_issuer", "oidc_audience", mode="before")
+    @classmethod
+    def _empty_optional_oidc_value_is_unset(cls, value: object) -> object:
+        return None if value == "" else value

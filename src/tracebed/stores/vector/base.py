@@ -4,9 +4,8 @@
 Extracted from the EXISTING pgvector usage, not invented aspirationally: for the vector arm
 `hotpath.retriever` calls exactly ONE thing on `stores.pg.search.SearchStore` —
 `vector_arm(project_id, embedding, top_n, hnsw_iterative_scan=..., hnsw_max_scan_tuples=...)`
-— plus, at the write/lifecycle edges nothing in `hotpath/` touches, an upsert of one memory's
-embedding and a delete-by-project for GC/project-deletion. That is the whole surface this port
-declares: three methods, matching `pgvector.py`'s three faithful wrappers.
+— plus an upsert of one memory's embedding.  Erasure is intentionally absent:
+the separately credentialed E3 erasure port owns destructive work.
 
 CONTRACT GAP (wiring): `hotpath.retriever.Retriever` holds a concrete `SearchStore`, not this
 port — swapping a driver in for real needs a constructor change in `hotpath/retriever.py`,
@@ -46,6 +45,7 @@ from typing import Protocol, runtime_checkable
 from tracebed.domain.enums import TrustTier
 from tracebed.domain.ids import MemoryId, ProjectId
 from tracebed.domain.state_machine import Status
+from tracebed.stores.pg.pool import RemainingBudget
 from tracebed.stores.pg.search import ArmHit
 
 __all__ = ["VectorStorePort"]
@@ -64,6 +64,7 @@ class VectorStorePort(Protocol):
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
         statement_timeout_ms: int | None = None,
+        deadline: RemainingBudget | None = None,
     ) -> list[ArmHit]:
         """Same contract as `SearchStore.vector_arm`: retrievability-predicate-filtered
         (`RETRIEVABLE_STATUSES` minus `pinned`, `candidate` restricted to Tier A), ordered by
@@ -107,11 +108,4 @@ class VectorStorePort(Protocol):
         retrievability check runs on every hit a dynamic arm returns, regardless of which
         store produced it.
         """
-        ...
-
-    def delete_by_project(self, project_id: ProjectId) -> None:
-        """Erase every vector belonging to `project_id` — the vector-store half of project
-        deletion/GC. Idempotent: deleting an already-empty/absent project is a no-op, never an
-        error (mirrors `stores.pg.partitions.drop_project`'s own tolerance of a partially
-        provisioned project)."""
         ...

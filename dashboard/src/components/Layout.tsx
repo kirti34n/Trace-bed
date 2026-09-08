@@ -1,6 +1,7 @@
 import { useEffect, useState, type SVGProps } from "react";
 import { NavLink, Outlet } from "react-router-dom";
-import { credentials } from "../api/client";
+import { useDemoManifest, useScope } from "../api/hooks";
+import { useSession } from "../auth/session";
 import { getResolvedTheme, toggleTheme } from "../lib/theme";
 
 // The shell: sidebar nav for every view group PLAN.md §7 assigns across the
@@ -37,6 +38,7 @@ const Icons = {
   registry: icon("M3 17h14M5 17V7l5-3 5 3v10M8 10h4M8 13h4"),
   health: icon("M3 11h3l2-5 3 9 2-4h4"),
   settings: icon("M10 12.7a2.7 2.7 0 1 0 0-5.4 2.7 2.7 0 0 0 0 5.4Zm7-2.7c0 .4 0 .8-.1 1.2l1.6 1.2-1.5 2.6-1.9-.6c-.6.5-1.3.9-2 1.1L12.7 18H7.3l-.4-2.6c-.7-.2-1.4-.6-2-1.1l-1.9.6-1.5-2.6 1.6-1.2C3 10.8 3 10.4 3 10s0-.8.1-1.2L1.5 7.6l1.5-2.6 1.9.6c.6-.5 1.3-.9 2-1.1L7.3 2h5.4l.4 2.6c.7.2 1.4.6 2 1.1l1.9-.6 1.5 2.6-1.6 1.2c.1.4.1.8.1 1.2Z"),
+  validationRuns: icon("M4 10.5 8 14l8-8M3 4h14v12H3z"),
 };
 
 interface NavItem {
@@ -63,6 +65,7 @@ const NAV_GROUPS: { label: string; items: NavItem[] }[] = [
       { to: "/injections", label: "Injections", Icon: Icons.injections },
       { to: "/abstention", label: "Abstention", Icon: Icons.abstention },
       { to: "/health", label: "Health", Icon: Icons.health },
+      { to: "/validation-runs", label: "Validation Runs", Icon: Icons.validationRuns },
     ],
   },
   {
@@ -120,43 +123,50 @@ function ThemeToggle() {
   );
 }
 
-function CredentialStatus() {
-  const [principal, setPrincipal] = useState(() => credentials.getPrincipal());
-  const [adminKey, setAdminKey] = useState(() => credentials.getAdminKey() !== null);
-
-  // Settings (a route this shell scaffolds but does not itself implement)
-  // writes to the same localStorage keys via `api/client.ts`'s `credentials`
-  // module — poll on focus so a credential entered there shows up here
-  // without wiring a cross-component event bus for two booleans.
-  useEffect(() => {
-    function refresh() {
-      setPrincipal(credentials.getPrincipal());
-      setAdminKey(credentials.getAdminKey() !== null);
-    }
-    window.addEventListener("focus", refresh);
-    return () => window.removeEventListener("focus", refresh);
-  }, []);
-
+function ResolvedIdentity() {
+  // This call is intentionally made by the shell, rather than only Settings:
+  // the project/identity displayed beside every operator view is the scope the
+  // API actually derives from the BFF session.
+  const scope = useScope();
   return (
-    <div className="flex items-center gap-3 text-xs text-text-muted">
-      <span className="inline-flex items-center gap-1.5">
-        <span
-          aria-hidden="true"
-          className={`h-1.5 w-1.5 rounded-full ${principal !== null ? "bg-status-validated-fg" : "bg-status-quarantined-fg"}`}
-        />
-        {principal !== null ? `Signed in (${principal.mode})` : "No credential"}
-      </span>
-      {adminKey && (
-        <span className="inline-flex items-center gap-1.5">
-          <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full bg-tier-a" />
-          Admin key set
-        </span>
+    <>
+      {scope.status === "loading" && "Resolving identity"}
+      {scope.status === "success" && scope.data !== undefined && (
+          <>Project {scope.data.project_id} · Principal {scope.data.principal_id}</>
       )}
+      {scope.status === "error" && "Identity unavailable"}
+    </>
+  );
+}
+
+function SessionIdentity() {
+  const session = useSession();
+  const demo = useDemoManifest();
+  return (
+    <div className="flex items-center gap-3 text-xs text-text-muted" aria-live="polite">
+      <span className="inline-flex items-center gap-1.5">
+        <span aria-hidden="true" className={`h-1.5 w-1.5 rounded-full ${session.phase === "authenticated" ? "bg-status-validated-fg" : "bg-status-quarantined-fg"}`} />
+        {session.phase === "loading" && "Checking session"}
+        {session.phase === "anonymous" && "Not signed in"}
+        {session.phase === "error" && "Session unavailable"}
+        {session.phase === "authenticated" && <ResolvedIdentity />}
+      </span>
+      {demo.status === "success" && demo.data?.mode === "local_demo" && <span className="rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 font-medium text-accent">Local demo</span>}
+      {session.phase === "anonymous" ? (
+        <button type="button" onClick={session.login} className="font-medium text-accent hover:underline">
+          Sign in
+        </button>
+      ) : session.phase === "authenticated" ? (
+        <button type="button" onClick={() => void session.logout()} className="font-medium text-text-muted hover:text-danger">
+          Sign out
+        </button>
+      ) : null}
     </div>
   );
 }
 
 export function Layout() {
+  const demo = useDemoManifest();
   return (
     <div className="flex min-h-screen bg-bg text-text">
       <a
@@ -182,7 +192,7 @@ export function Layout() {
                 {group.label}
               </h2>
               <ul className="space-y-0.5">
-                {group.items.map(({ to, label, Icon }) => (
+                {group.items.filter(({ to }) => to !== "/validation-runs" || demo.status === "success").map(({ to, label, Icon }) => (
                   <li key={to}>
                     <NavLink
                       to={to}
@@ -211,7 +221,7 @@ export function Layout() {
 
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex items-center justify-between border-b border-border bg-surface px-6 py-3">
-          <CredentialStatus />
+          <SessionIdentity />
           <ThemeToggle />
         </header>
         <main id="main-content" className="min-w-0 flex-1 overflow-y-auto p-6">

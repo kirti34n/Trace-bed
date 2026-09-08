@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Final, Literal
 
 import httpx
@@ -51,6 +52,21 @@ _HTTP_DELETE = "DEL" + "ETE"
 # ListObjectsV2 returns at most 1000 keys per page; a gateway that keeps
 # handing back the same continuation token would otherwise spin forever.
 _MAX_LIST_PAGES: Final = 10_000
+
+
+def _credential_from_environment(env_name: str) -> str | None:
+    """Read a conventional value or a Compose-v1 ``*_FILE`` secret reference."""
+
+    if env_name.endswith("_FILE"):
+        path_value = os.environ.get(env_name)
+        if not path_value:
+            return None
+        try:
+            value = Path(path_value).read_text(encoding="utf-8")
+        except OSError:
+            return None
+        return value[:-1] if value.endswith("\n") else value
+    return os.environ.get(env_name)
 
 
 def _parse_list_response(xml_text: str) -> tuple[list[str], str | None]:
@@ -86,8 +102,8 @@ class S3TraceStore:
             raise ConfigError("S3TraceStore requires storage.tracestore.bucket")
         if not cfg.endpoint:
             raise ConfigError("S3TraceStore requires storage.tracestore.endpoint")
-        access_key = os.environ.get(cfg.access_key_env)
-        secret_key = os.environ.get(cfg.secret_key_env)
+        access_key = _credential_from_environment(cfg.access_key_env)
+        secret_key = _credential_from_environment(cfg.secret_key_env)
         if not access_key or not secret_key:
             raise ConfigError(f"S3TraceStore: {cfg.access_key_env}/{cfg.secret_key_env} not set")
 
@@ -101,6 +117,17 @@ class S3TraceStore:
         # source -- so no caller signature changes, and an injected `FakeClock` makes a signed
         # request byte-reproducible.
         self._clock: Clock = clock if clock is not None else SystemClock()
+
+    def close(self) -> None:
+        """Close this driver's owned HTTP client during worker shutdown.
+
+        ``TraceStorePort`` intentionally stays a minimal data port, so this
+        concrete lifecycle hook is registered only by composition when it
+        constructed an S3 driver.  Filesystem and test stores need no such
+        method.
+        """
+
+        self._http.close()
 
     # -- key layout -----------------------------------------------------------
 
@@ -161,6 +188,40 @@ class S3TraceStore:
         out.update(signed)
         out.pop("host", None)  # httpx derives Host from the request URL itself
         return out
+
+    # -- bucket bootstrap ------------------------------------------------------
+
+    def head_bucket(self) -> httpx.Response:
+        """Return the signed bucket-level HEAD response without remapping status.
+
+        Provisioning needs to distinguish an absent bucket from an access
+        denial or gateway failure.  Object-level ``exists()`` intentionally
+        collapses 403/404 to avoid an existence oracle; bucket initialization
+        must not, so it uses this explicit raw-response surface instead.
+        """
+        headers = self._signed_headers(method="HEAD", object_key="")
+        return self._http.head(self._url(""), headers=headers)
+
+    def create_bucket(self) -> httpx.Response:
+        """Return the signed bucket-level PUT response without remapping status."""
+        headers = self._signed_headers(method="PUT", object_key="")
+        return self._http.put(self._url(""), headers=headers)
+
+    def bucket_versioning(self) -> httpx.Response:
+        """Return the signed bucket-versioning response without collapsing status."""
+
+        query = {"versioning": ""}
+        headers = self._signed_headers(method="GET", object_key="", query=query)
+        return self._http.get(self._url("", query), headers=headers)
+
+    def enable_bucket_versioning(self) -> httpx.Response:
+        """Request S3's exact ``Enabled`` bucket-versioning state."""
+
+        query = {"versioning": ""}
+        payload = b"<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status></VersioningConfiguration>"
+        headers = self._signed_headers(method="PUT", object_key="", payload=payload, query=query)
+        headers["content-type"] = "application/xml"
+        return self._http.put(self._url("", query), content=payload, headers=headers)
 
     # -- TraceStorePort ---------------------------------------------------------
 

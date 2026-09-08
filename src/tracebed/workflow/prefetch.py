@@ -121,6 +121,7 @@ from tracebed.domain.canonical import canonical_json
 from tracebed.domain.clock import Clock
 from tracebed.domain.config import RetrievalConfig
 from tracebed.domain.ids import ProjectId
+from tracebed.hotpath.budget import Deadline
 
 __all__ = ["PrefetchingRetriever", "RetrieverPort", "combined_project_flush"]
 
@@ -143,7 +144,12 @@ class RetrieverPort[Outcome_co](Protocol):
     thing that computes a different answer (property (b))."""
 
     def retrieve(
-        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig
+        self,
+        project_id: ProjectId,
+        query_text: str,
+        *,
+        cfg: RetrievalConfig,
+        deadline: Deadline | None = None,
     ) -> Outcome_co: ...
 
 
@@ -271,12 +277,8 @@ class PrefetchingRetriever[Outcome]:
                 return key
             self._evict_locked(now_ms)
             submit: Callable[..., Outcome] = self._inner.retrieve
-            future: Future[Outcome] = self._executor.submit(
-                submit, project_id, query_text, cfg=cfg
-            )
-            self._pending[key] = _Entry(
-                project_id=project_id, future=future, issued_at_ms=now_ms
-            )
+            future: Future[Outcome] = self._executor.submit(submit, project_id, query_text, cfg=cfg)
+            self._pending[key] = _Entry(project_id=project_id, future=future, issued_at_ms=now_ms)
         return key
 
     def is_ready(self, key: bytes) -> bool:
@@ -342,7 +344,14 @@ class PrefetchingRetriever[Outcome]:
         with self._lock:
             return len(self._pending)
 
-    def retrieve(self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig) -> Outcome:
+    def retrieve(
+        self,
+        project_id: ProjectId,
+        query_text: str,
+        *,
+        cfg: RetrievalConfig,
+        deadline: Deadline | None = None,
+    ) -> Outcome:
         """The drop-in `RetrieverPort.retrieve`. Exact-fingerprint, same-project,
         within-freshness-window cache hit, or a synchronous fall-through to the wrapped
         retriever — property (b)."""
@@ -350,7 +359,7 @@ class PrefetchingRetriever[Outcome]:
         cached = self._take(key, project_id)
         if cached is not _MISS:
             return cast(Outcome, cached)
-        return self._inner.retrieve(project_id, query_text, cfg=cfg)
+        return self._inner.retrieve(project_id, query_text, cfg=cfg, deadline=deadline)
 
     # ----------------------------------------------------------------- #
     # Internals.
@@ -458,6 +467,7 @@ def combined_project_flush(
     reports as a total failure is recoverable by a retry; a partial flush that silently
     skipped a tier is not.
     """
+
     def _flush(project_id: ProjectId) -> int:
         removed = 0
         first_error: BaseException | None = None

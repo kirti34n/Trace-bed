@@ -84,10 +84,11 @@ from __future__ import annotations
 
 import logging
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Final, Protocol, cast, runtime_checkable
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -95,16 +96,24 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from tracebed.core.scans import ScanContext, scan
 from tracebed.domain.canonical import content_hash
 from tracebed.domain.enums import Lane, MemType, ProvenanceClass, ScopeType, TrustTier
-from tracebed.domain.errors import ScanRejected, TracebedError
+from tracebed.domain.errors import (
+    ActivityBusy,
+    ErasureFenced,
+    ErasureSnapshotStale,
+    ScanRejected,
+    TracebedError,
+)
 from tracebed.domain.events import MemoryProposal
 from tracebed.domain.ids import AgentTypeId, MemoryId, PrincipalId, ProjectId, RunId
 from tracebed.domain.memory import NewMemoryItem, Provenance, validate_provenance
 from tracebed.domain.state_machine import Status, TransitionEvidence, TransitionLimits, apply
+from tracebed.stores.pg.activity import ActivityGate
+from tracebed.stores.pg.erasure import ErasureSnapshotGuard
 from tracebed.stores.pg.queue import TOPIC_MEMORY_PROPOSAL, compute_backoff
 from tracebed.stores.pg.repo import ProposalCapOutcome, ProposalInsertResult
 
 if TYPE_CHECKING:
-    from tracebed.adapters.ports import QueueConsumerPort
+    from tracebed.adapters.ports import QueueConsumerPort, WorkerQueueConsumerPort
     from tracebed.domain.clock import Clock
     from tracebed.domain.config import EffectiveConfig
     from tracebed.domain.scan import ScanVerdict
@@ -278,6 +287,7 @@ class DurableProposalCapPort(Protocol):
         per_run_cap: int,
         per_project_daily_cap: int,
         day: date,
+        subject_digests: tuple[bytes, ...] | None = None,
     ) -> ProposalInsertResult: ...
 
 
@@ -364,6 +374,8 @@ class AgentControl:
         proposal: MemoryProposal,
         *,
         cfg: EffectiveConfig,
+        authoritative_agent_type_id: AgentTypeId | None = None,
+        authoritative_subject_digests: tuple[bytes, ...] | None = None,
     ) -> ProposalOutcome:
         """PLAN.md §3 `POST /v1/propose_memory` / §5 row 2 (`None -> quarantined`), the
         `ProvenanceClass.PROPOSAL` half.
@@ -382,12 +394,32 @@ class AgentControl:
         Steps 4-7 are one critical section because 4, 5 and 6 all read state that step 7
         writes (points 3 and 4 of the module docstring).
         """
-        scope = self._repo.resolve_project(principal_id)
-        if scope.project_id != project_id:
-            raise TracebedError(
-                f"resolve_project({principal_id}) resolved to project {scope.project_id}, "
-                f"not the requested {project_id} (invariant 4)"
+        if authoritative_agent_type_id is None:
+            # Legacy/direct call compatibility only.  WorkerQueue consumers
+            # pass the durable queue envelope's owner agent type below and do
+            # not turn a registration lookup into a second authority source.
+            scope = self._repo.resolve_project(principal_id)
+            if scope.project_id != project_id:
+                raise TracebedError(
+                    f"resolve_project({principal_id}) resolved to project {scope.project_id}, "
+                    f"not the requested {project_id} (invariant 4)"
+                )
+            agent_type_id = scope.agent_type_id
+        else:
+            if type(authoritative_agent_type_id) is not AgentTypeId:
+                raise TypeError("authoritative_agent_type_id must be an AgentTypeId")
+            agent_type_id = authoritative_agent_type_id
+
+        if authoritative_subject_digests is not None and (
+            len(authoritative_subject_digests) > 64
+            or any(
+                type(digest) is not bytes or len(digest) != 32
+                for digest in authoritative_subject_digests
             )
+            or tuple(sorted(authoritative_subject_digests)) != authoritative_subject_digests
+            or len(set(authoritative_subject_digests)) != len(authoritative_subject_digests)
+        ):
+            raise ValueError("authoritative subject digests are not canonical")
 
         mem_type = _admitted(MemType, proposal.mem_type, PROPOSABLE_MEM_TYPES, field="mem_type")
         scope_type = _admitted(
@@ -396,7 +428,7 @@ class AgentControl:
         # Server-derived, never caller-named: `MemoryProposal` has no agent_type field, and
         # this is the registry's own answer for the authenticated principal (invariant 4).
         scope_id: UUID | None = (
-            scope.agent_type_id.value if scope_type is ScopeType.AGENT_TYPE else None
+            agent_type_id.value if scope_type is ScopeType.AGENT_TYPE else None
         )
 
         provenance = Provenance(cls=ProvenanceClass.PROPOSAL, run_id=run_id)
@@ -463,7 +495,10 @@ class AgentControl:
                 content=proposal.content,
                 token_count=_estimate_token_count(proposal.content),
                 provenance=provenance,
-                subject_tag=proposal.subject_tag,
+                # The queue admission boundary already validated/hashed this
+                # optional direct tag and bound the run union.  Never persist
+                # raw tags on a new E2 memory row.
+                subject_tag=None,
             )
 
             if isinstance(self._repo, DurableProposalCapPort):
@@ -472,8 +507,8 @@ class AgentControl:
                 # proposal that was already over cap. This re-does all three checks inside
                 # one transaction under a project-scoped advisory lock, so a second process
                 # counting concurrently cannot also land a row.
-                return _from_insert_result(
-                    self._repo.insert_proposal_within_caps(
+                if authoritative_subject_digests is not None:
+                    insert_result = self._repo.insert_proposal_within_caps(
                         project_id,
                         run_id,
                         item,
@@ -481,7 +516,20 @@ class AgentControl:
                         per_run_cap=cfg.proposals.per_run_cap,
                         per_project_daily_cap=cfg.proposals.per_project_daily_cap,
                         day=today,
-                    ),
+                        subject_digests=authoritative_subject_digests,
+                    )
+                else:
+                    insert_result = self._repo.insert_proposal_within_caps(
+                        project_id,
+                        run_id,
+                        item,
+                        verdict,
+                        per_run_cap=cfg.proposals.per_run_cap,
+                        per_project_daily_cap=cfg.proposals.per_project_daily_cap,
+                        day=today,
+                    )
+                return _from_insert_result(
+                    insert_result,
                     status=new_status,
                     run_id=run_id,
                     day=today,
@@ -514,6 +562,14 @@ class ProposalQueueEnvelope(BaseModel):
     proposal: MemoryProposal
 
 
+class _ProposalBusinessPayload(BaseModel):
+    """Version-one proposal body; no project/run/principal authority fields."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    proposal: MemoryProposal
+
+
 class ProposalIntake:
     """Consumes `TOPIC_MEMORY_PROPOSAL` (stores.pg.queue: "enqueued Phase 0, consumed Phase
     4"). Claim, validate, resolve per-(project, agent_type) config, hand off to
@@ -540,18 +596,22 @@ class ProposalIntake:
 
     def __init__(
         self,
-        queue: QueueConsumerPort,
+        queue: WorkerQueueConsumerPort,
         control: AgentControl,
         repo: AgentControlRepoPort,
         config_provider: ConfigProvider,
         *,
         batch_size: int = 100,
+        activity: ActivityGate | None = None,
+        erasure_guard: ErasureSnapshotGuard | None = None,
     ) -> None:
         self._queue = queue
         self._control = control
         self._repo = repo
         self._config_provider = config_provider
         self._batch_size = batch_size
+        self._activity = activity
+        self._erasure_guard = erasure_guard
 
     def run_once(self, max_batch: int | None = None) -> int:
         n = max_batch if max_batch is not None else self._batch_size
@@ -590,34 +650,98 @@ class ProposalIntake:
                 stop.wait(poll_interval_s)
 
     def _process_one(self, item: QueueItem) -> bool:
+        gate = self._activity.shared(item.project_id) if self._activity is not None else nullcontext()
+        try:
+            with gate:
+                try:
+                    return self._process_one_guarded(item)
+                except (ErasureFenced, ErasureSnapshotStale):
+                    # The queue disposition is a side effect too; keep it
+                    # inside the same shared lifetime as the stale/fenced
+                    # snapshot and any scanner/model work it guarded.
+                    self._nack(item)
+                    return False
+        except ActivityBusy:
+            self._nack(item)
+            return False
+
+    def _process_one_guarded(self, item: QueueItem) -> bool:
         """Returns True iff the item was acked (successful terminal handling, including a
         deterministic refusal); False iff it was nacked for a retry."""
         try:
-            envelope = ProposalQueueEnvelope.model_validate(dict(item.payload))
+            if item.authority_version == 1:
+                if (
+                    item.run_id is None
+                    or item.source_principal_id is None
+                    or item.source_agent_type_id is None
+                    or item.run_owner_principal_id is None
+                    or item.run_owner_agent_type_id is None
+                    or set(item.payload) != {"proposal"}
+                ):
+                    raise ValueError("v1 proposal authority or business shape is invalid")
+                business = _ProposalBusinessPayload.model_validate(dict(item.payload))
+                envelope = ProposalQueueEnvelope(
+                    project_id=item.project_id.value,
+                    principal_id=item.source_principal_id.value,
+                    run_id=item.run_id.value,
+                    proposal=business.proposal,
+                )
+            else:
+                envelope = ProposalQueueEnvelope.model_validate(dict(item.payload))
         except ValidationError:
             logger.warning("agent_control: refusing malformed proposal item %s", item.id)
-            self._queue.nack(item.id, compute_backoff(item.attempts))
+            self._reject(item, "malformed_business_payload")
+            return False
+        except ValueError:
+            logger.warning("agent_control: refusing invalid v1 proposal item %s", item.id)
+            self._reject(item, "malformed_business_payload")
             return False
 
-        if ProjectId(envelope.project_id) != item.project_id:
+        if item.authority_version == 0 and ProjectId(envelope.project_id) != item.project_id:
             # A payload-derived project_id must never decide which tenant's partition a row
             # lands in (invariant 4) -- mirrors outcome_intake's identical check.
             logger.warning(
                 "agent_control: item %s envelope project_id disagrees with the queue row",
                 item.id,
             )
-            self._queue.nack(item.id, compute_backoff(item.attempts))
+            self._nack(item)
             return False
 
         principal_id = PrincipalId(envelope.principal_id)
-        try:
-            scope = self._repo.resolve_project(principal_id)
-        except Exception:
-            logger.exception("agent_control: cannot resolve scope for proposal item %s", item.id)
-            self._queue.nack(item.id, compute_backoff(item.attempts))
+        if item.authority_version == 1 and (
+            item.run_id is None
+            or item.run_owner_principal_id is None
+            or item.run_owner_agent_type_id is None
+            or item.source_principal_id is None
+            or item.source_agent_type_id is None
+            or item.run_id.value != envelope.run_id
+            or item.source_principal_id != item.run_owner_principal_id
+            or item.source_agent_type_id != item.run_owner_agent_type_id
+        ):
+            logger.warning("agent_control: proposal item %s has conflicting authority", item.id)
+            self._reject(item, "proposal_authority_conflict")
             return False
 
-        if scope.project_id != item.project_id:
+        if item.authority_version == 1 and self._erasure_guard is not None:
+            assert item.run_id is not None  # validated in the v1 envelope branch above
+            actual = self._erasure_guard.assert_snapshot(
+                item.project_id, item.run_id, item.subject_digests
+            )
+            if actual != item.subject_digests:
+                raise ErasureSnapshotStale()
+
+        scope_agent_type_id: AgentTypeId | None = None
+        legacy_scope: ProjectScope | None = None
+        if item.authority_version == 0:
+            try:
+                legacy_scope = self._repo.resolve_project(principal_id)
+            except Exception:
+                logger.exception("agent_control: cannot resolve scope for proposal item %s", item.id)
+                self._nack(item)
+                return False
+            scope_agent_type_id = legacy_scope.agent_type_id
+
+        if item.authority_version == 0 and legacy_scope is not None and legacy_scope.project_id != item.project_id:
             # The principal's registration no longer agrees with the tenant this row was
             # enqueued under. Landing the row in either project would be a scope decision
             # made by a disagreement (invariant 4) -- refuse, do not choose.
@@ -625,34 +749,55 @@ class ProposalIntake:
                 "agent_control: item %s principal resolves to project %s, not the queue "
                 "row's %s",
                 item.id,
-                scope.project_id,
+                legacy_scope.project_id,
                 item.project_id,
             )
-            self._queue.nack(item.id, compute_backoff(item.attempts))
+            self._nack(item)
             return False
 
         try:
-            cfg = self._config_provider.effective(item.project_id, scope.agent_type_id)
-            outcome = self._control.submit_proposal(
-                item.project_id,
-                RunId(envelope.run_id),
-                principal_id,
-                envelope.proposal,
-                cfg=cfg,
+            agent_type_id = (
+                item.run_owner_agent_type_id
+                if item.authority_version == 1
+                else scope_agent_type_id
             )
+            if agent_type_id is None:  # defensive, all v1 fields are checked above
+                raise ValueError("proposal item lacks an authoritative agent type")
+            cfg = self._config_provider.effective(item.project_id, agent_type_id)
+            run_id = item.run_id if item.authority_version == 1 else RunId(envelope.run_id)
+            if run_id is None:  # defensive: v1 field absence was handled above
+                raise ValueError("proposal item lacks an authoritative run")
+            if item.authority_version == 1:
+                outcome = self._control.submit_proposal(
+                    item.project_id,
+                    run_id,
+                    principal_id,
+                    envelope.proposal,
+                    cfg=cfg,
+                    authoritative_agent_type_id=item.run_owner_agent_type_id,
+                    authoritative_subject_digests=item.subject_digests,
+                )
+            else:
+                outcome = self._control.submit_proposal(
+                    item.project_id,
+                    run_id,
+                    principal_id,
+                    envelope.proposal,
+                    cfg=cfg,
+                )
         except ScanRejected:
             logger.info("agent_control: proposal in item %s failed the scan suite", item.id)
-            self._queue.ack(item.id)  # deterministic on this content -- not retryable
+            self._ack(item)  # deterministic on this content -- not retryable
             return True
         except NotProposable:
             logger.warning(
                 "agent_control: proposal in item %s is outside the wire vocabulary", item.id
             )
-            self._queue.ack(item.id)  # deterministic on this content -- not retryable
+            self._ack(item)  # deterministic on this content -- not retryable
             return True
         except Exception:
             logger.exception("agent_control: failed processing proposal item %s", item.id)
-            self._queue.nack(item.id, compute_backoff(item.attempts))
+            self._nack(item)
             return False
 
         if isinstance(outcome, ProposalRefused):
@@ -665,5 +810,23 @@ class ProposalIntake:
                 item.id,
                 outcome.memory_id,
             )
-        self._queue.ack(item.id)
+        self._ack(item)
         return True
+
+    def _ack(self, item: QueueItem) -> None:
+        if item.authority_version == 1:
+            self._queue.ack(item)
+        else:
+            cast("QueueConsumerPort", self._queue).ack(item.id)
+
+    def _nack(self, item: QueueItem) -> None:
+        if item.authority_version == 1:
+            self._queue.nack(item, compute_backoff(item.attempts))
+        else:
+            cast("QueueConsumerPort", self._queue).nack(item.id, compute_backoff(item.attempts))
+
+    def _reject(self, item: QueueItem, reason: str) -> None:
+        if item.authority_version == 1:
+            self._queue.reject(item, reason)
+            return
+        self._nack(item)

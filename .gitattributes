@@ -25,4 +25,4 @@
 
 # Generated; keep them out of diffs and language stats.
 package-lock.json  linguist-generated=true -diff
-docs/MEMORY-FLOW.html  linguist-documentation=true
+docs/CAPABILITIES.md  linguist-generated=true

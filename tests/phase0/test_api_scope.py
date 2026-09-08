@@ -17,31 +17,42 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
 from tracebed.adapters.identity import Principal
-from tracebed.api.deps import AppDeps
+from tracebed.api.deps import AppDeps, authenticate_data_access
 from tracebed.api.main import create_app
 from tracebed.api.models import MAX_QUERY_TEXT_CHARS, MAX_SEQ
+from tracebed.domain.authority import AccessContext, GrantBinding
 from tracebed.domain.canonical import content_hash
 from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import EmbeddingConfig, StorageConfig, TracebedSettings
+from tracebed.domain.deadline import RemainingBudget
 from tracebed.domain.enums import (
     Arm,
+    FeedbackSource,
     Lane,
     MemType,
     OutcomeCode,
+    ProjectRole,
     ProvenanceClass,
     ScopeType,
     TrustTier,
 )
-from tracebed.domain.errors import AuthenticationFailed, NotFound
+from tracebed.domain.errors import (
+    AuthenticationFailed,
+    AuthorizationDenied,
+    NotFound,
+    RequestDeadlineExceeded,
+)
 from tracebed.domain.events import MEMORY_HEADER, PLACEMENT_APPEND_LAST
 from tracebed.domain.ids import (
     AgentTypeId,
@@ -54,6 +65,7 @@ from tracebed.domain.ids import (
 from tracebed.domain.memory import Provenance
 from tracebed.domain.scope import ProjectScope
 from tracebed.domain.state_machine import Status
+from tracebed.hotpath.budget import Deadline
 from tracebed.stores.pg.rows import MemoryItemRow
 
 pytestmark = pytest.mark.phase0
@@ -67,19 +79,15 @@ pytestmark = pytest.mark.phase0
 
 @dataclass
 class FakeQueue:
-    items: list[tuple[str, ProjectId, Mapping[str, Any]]] = field(default_factory=list)
+    calls: list[tuple[AccessContext, tuple[object, ...]]] = field(default_factory=list)
 
-    def enqueue(
+    def enqueue_many_authorized(
         self,
-        topic: str,
-        project_id: ProjectId,
-        payload: Mapping[str, object],
-        priority: int = 100,
-        available_at: datetime | None = None,
-    ) -> int:
-        del priority, available_at
-        self.items.append((topic, project_id, payload))
-        return len(self.items)
+        access: AccessContext,
+        writes: tuple[object, ...],
+    ) -> tuple[int, ...]:
+        self.calls.append((access, writes))
+        return tuple(range(1, len(writes) + 1))
 
 
 @dataclass
@@ -158,34 +166,22 @@ class FakeExporter:
 
 
 class FakeAdmin:
-    def create_project(
-        self, name: str, retention_policy: Mapping[str, object] | None = None
-    ) -> ProjectId:
-        del name, retention_policy
-        return ProjectId(uuid4())
-
-    def create_agent_type(self, project_id: ProjectId, name: str) -> AgentTypeId:
-        del project_id, name
-        return AgentTypeId(uuid4())
-
-    def register_agent(
-        self, project_id: ProjectId, principal_id: PrincipalId, agent_type_id: AgentTypeId
-    ) -> None:
-        del project_id, principal_id, agent_type_id
-
-    def create_principal(self, kind: str, external_ref: str, key_hash: str | None) -> PrincipalId:
-        del kind, external_ref, key_hash
-        return PrincipalId(uuid4())
+    def create_agent_registration(
+        self,
+        project_id: ProjectId,
+        agent_type_name: str,
+        principal_kind: str,
+        external_ref: str,
+        key_hash: str | None,
+    ) -> tuple[PrincipalId, AgentTypeId]:
+        del project_id, agent_type_name, principal_kind, external_ref, key_hash
+        return PrincipalId(uuid4()), AgentTypeId(uuid4())
 
 
-class FakePartitions:
-    def create_project_partitions(self, project_id: ProjectId) -> None:
-        del project_id
-
-
-class FakeKeys:
-    def ensure_project_kek(self, project_id: ProjectId) -> None:
-        del project_id
+class FakeProjectProvisioner:
+    def provision_project(self, **kwargs: object) -> ProjectId:
+        del kwargs
+        raise AssertionError("project provisioning is not exercised by scoped routes")
 
 
 @dataclass
@@ -196,8 +192,14 @@ class FakeVerifier:
 
     principal_id: PrincipalId
 
-    def authenticate(self, *, authorization: str | None, api_key: str | None) -> Principal:
-        del authorization
+    def authenticate(
+        self,
+        *,
+        authorization: str | None,
+        api_key: str | None,
+        deadline: RemainingBudget | None = None,
+    ) -> Principal:
+        del authorization, deadline
         if api_key == "good":
             return Principal(principal_id=self.principal_id, kind="api_key", external_ref="k1")
         raise AuthenticationFailed("bad credential")
@@ -210,6 +212,77 @@ class FakeResolver:
     def resolve_project(self, principal_id: PrincipalId) -> ProjectScope:
         del principal_id
         return self.scope
+
+
+@dataclass
+class FakeAccessResolver:
+    scope: ProjectScope
+
+    def resolve_access(
+        self, principal_id: PrincipalId, *, deadline: RemainingBudget | None = None
+    ) -> AccessContext:
+        del deadline
+        assert principal_id == self.scope.principal_id
+        return AccessContext(
+            project_id=self.scope.project_id,
+            agent_type_id=self.scope.agent_type_id,
+            principal_id=self.scope.principal_id,
+            grants=(
+                GrantBinding(uuid4(), ProjectRole.DATA),
+                GrantBinding(uuid4(), ProjectRole.FEEDBACK, FeedbackSource.VERDICT),
+                GrantBinding(uuid4(), ProjectRole.ADMIN),
+                GrantBinding(uuid4(), ProjectRole.EXPORT),
+            ),
+        )
+
+
+class FakeRetrievalOpener:
+    def __init__(self, telemetry: FakeTelemetry, project_id: ProjectId) -> None:
+        self._telemetry = telemetry
+        self._project_id = project_id
+
+    def open(self, access: AccessContext, run_id: RunId) -> object:
+        assert access.grant_for(ProjectRole.DATA) is not None
+        assert type(run_id) is RunId
+        return object()
+
+    @contextmanager
+    def hold(
+        self,
+        access: AccessContext,
+        run_id: RunId,
+        *,
+        subject_tags: tuple[str, ...] = (),
+        deadline: RemainingBudget | None = None,
+    ) -> Iterator[object]:
+        del subject_tags, deadline
+        assert access.grant_for(ProjectRole.DATA) is not None
+        assert type(run_id) is RunId
+        yield type("Scope", (), {"audit": _Audit(self._telemetry, self._project_id)})()
+
+
+class _Audit:
+    def __init__(self, telemetry: FakeTelemetry, project_id: ProjectId) -> None:
+        self._telemetry, self._project_id = telemetry, project_id
+
+    def record_terminal(self, **kwargs: object) -> None:
+        row = kwargs["row"]
+        self._telemetry.record_retrieval(
+            self._project_id,
+            row.run_id,
+            outcome_code=row.outcome_code,
+            latency_ms=row.latency_ms,
+            embed_latency_ms=row.embed_latency_ms,
+            candidates_considered=row.candidates_considered,
+            top_score=row.top_score,
+            arm=row.arm,
+        )
+
+
+class ExpiredPipeline:
+    def retrieve(self, *args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RequestDeadlineExceeded()
 
 
 def _settings() -> TracebedSettings:
@@ -228,13 +301,13 @@ class FakeInvalidations:
 
     rows: list[tuple[ProjectId, str, Mapping[str, Any] | None]] = field(default_factory=list)
 
-    def insert_invalidation_event(
+    def insert(
         self,
-        project_id: ProjectId,
+        access: AccessContext,
         event_type: str,
         selector: Mapping[str, Any] | None = None,
     ) -> UUID:
-        self.rows.append((project_id, event_type, selector))
+        self.rows.append((access.project_id, event_type, selector))
         return uuid4()
 
 
@@ -248,7 +321,11 @@ class Harness:
 
 
 def _client(
-    *, scope: ProjectScope, queue: FakeQueue | None = None, telemetry: FakeTelemetry | None = None
+    *,
+    scope: ProjectScope,
+    queue: FakeQueue | None = None,
+    telemetry: FakeTelemetry | None = None,
+    pipeline: object | None = None,
 ) -> Harness:
     queue = queue if queue is not None else FakeQueue()
     telemetry = telemetry if telemetry is not None else FakeTelemetry()
@@ -262,10 +339,10 @@ def _client(
         memory_reader=memory,
         exporter=FakeExporter(scope.project_id),
         invalidations=invalidations,
-        admin=FakeAdmin(),
-        partitions=FakePartitions(),
-        keys=FakeKeys(),
+        retrieval_opener=FakeRetrievalOpener(telemetry, scope.project_id),
+        access_resolver=FakeAccessResolver(scope),
         clock=FakeClock(datetime(2026, 1, 1, tzinfo=UTC)),
+        pipeline=pipeline,  # type: ignore[arg-type]
     )
     app = create_app(_settings(), deps)
     return Harness(
@@ -280,7 +357,9 @@ def _client(
 @pytest.fixture
 def scope() -> ProjectScope:
     return ProjectScope(
-        project_id=ProjectId(uuid4()), agent_type_id=AgentTypeId(uuid4()), principal_id=PrincipalId(uuid4())
+        project_id=ProjectId(uuid4()),
+        agent_type_id=AgentTypeId(uuid4()),
+        principal_id=PrincipalId(uuid4()),
     )
 
 
@@ -307,6 +386,147 @@ class TestAuthAndScope:
             json={"agent_type": "a", "run_ctx": _RUN_CTX},
         )
         assert r.status_code == 401
+
+    def test_late_successful_auth_does_not_begin_grant_resolution(
+        self, scope: ProjectScope
+    ) -> None:
+        clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+        deadline = Deadline(clock=clock, total_budget_ms=10, embed_timeout_ms=10)
+
+        class LateVerifier:
+            def authenticate(
+                self,
+                *,
+                authorization: str | None,
+                api_key: str | None,
+                deadline: RemainingBudget | None = None,
+            ) -> Principal:
+                del authorization, api_key
+                assert deadline is not None
+                clock.advance(ms=10)
+                return Principal(scope.principal_id, "api_key", "key")
+
+        class NoGrantResolver:
+            def resolve_access(self, principal_id: PrincipalId) -> AccessContext:
+                del principal_id
+                raise AssertionError("expired auth must not begin grant resolution")
+
+        deps = SimpleNamespace(verifier=LateVerifier(), access_resolver=NoGrantResolver())
+        with pytest.raises(RequestDeadlineExceeded):
+            authenticate_data_access(
+                cast(AppDeps, deps), authorization=None, api_key="good", deadline=deadline
+            )
+
+    def test_preexpired_budget_does_not_invoke_the_verifier(self, scope: ProjectScope) -> None:
+        clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+        deadline = Deadline(clock=clock, total_budget_ms=10, embed_timeout_ms=10)
+        clock.advance(ms=10)
+
+        class NeverVerifier:
+            calls = 0
+
+            def authenticate(
+                self,
+                *,
+                authorization: str | None,
+                api_key: str | None,
+                deadline: RemainingBudget | None = None,
+            ) -> Principal:
+                del authorization, api_key, deadline
+                self.calls += 1
+                raise AssertionError("preexpired request must not authenticate")
+
+        verifier = NeverVerifier()
+        deps = SimpleNamespace(verifier=verifier, access_resolver=object())
+        with pytest.raises(RequestDeadlineExceeded):
+            authenticate_data_access(
+                cast(AppDeps, deps), authorization=None, api_key="good", deadline=deadline
+            )
+        assert verifier.calls == 0
+
+    def test_grant_resolver_receives_the_exact_request_budget(self, scope: ProjectScope) -> None:
+        clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+        deadline = Deadline(clock=clock, total_budget_ms=100, embed_timeout_ms=100)
+
+        class Verifier:
+            def authenticate(
+                self,
+                *,
+                authorization: str | None,
+                api_key: str | None,
+                deadline: RemainingBudget | None = None,
+            ) -> Principal:
+                del authorization, api_key
+                assert deadline is not None
+                return Principal(scope.principal_id, "api_key", "key")
+
+        class Resolver:
+            seen: RemainingBudget | None = None
+
+            def resolve_access(
+                self, principal_id: PrincipalId, *, deadline: RemainingBudget | None = None
+            ) -> AccessContext:
+                assert principal_id == scope.principal_id
+                self.seen = deadline
+                return AccessContext(
+                    project_id=scope.project_id,
+                    agent_type_id=scope.agent_type_id,
+                    principal_id=scope.principal_id,
+                    grants=(GrantBinding(uuid4(), ProjectRole.DATA),),
+                )
+
+        resolver = Resolver()
+        deps = SimpleNamespace(verifier=Verifier(), access_resolver=resolver)
+
+        access = authenticate_data_access(
+            cast(AppDeps, deps), authorization=None, api_key="good", deadline=deadline
+        )
+
+        assert access.principal_id == scope.principal_id
+        assert resolver.seen is deadline
+
+    @pytest.mark.parametrize(
+        ("grant", "expected"), [(False, AuthorizationDenied), (True, RequestDeadlineExceeded)]
+    )
+    def test_evaluated_denial_wins_but_late_valid_grant_is_503(
+        self, scope: ProjectScope, grant: bool, expected: type[Exception]
+    ) -> None:
+        clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+        deadline = Deadline(clock=clock, total_budget_ms=10, embed_timeout_ms=10)
+
+        class Verifier:
+            def authenticate(
+                self,
+                *,
+                authorization: str | None,
+                api_key: str | None,
+                deadline: RemainingBudget | None = None,
+            ) -> Principal:
+                del authorization, api_key
+                assert deadline is not None
+                return Principal(scope.principal_id, "api_key", "key")
+
+        class Resolver:
+            def resolve_access(
+                self, principal_id: PrincipalId, *, deadline: RemainingBudget | None = None
+            ) -> AccessContext:
+                del principal_id
+                assert deadline is not None
+                clock.advance(ms=10)
+                return AccessContext(
+                    project_id=scope.project_id,
+                    agent_type_id=scope.agent_type_id,
+                    principal_id=scope.principal_id,
+                    grants=(GrantBinding(uuid4(), ProjectRole.DATA),)
+                    if grant
+                    else (GrantBinding(uuid4(), ProjectRole.FEEDBACK, FeedbackSource.VERDICT),),
+                )
+
+        deps = SimpleNamespace(verifier=Verifier(), access_resolver=Resolver())
+        with pytest.raises(expected):
+            authenticate_data_access(
+                cast(AppDeps, deps), authorization=None, api_key="good", deadline=deadline
+            )
 
     def test_valid_key_resolves_scope_from_the_registry(self, scope: ProjectScope) -> None:
         """Not directly observable from the response body (the stub never
@@ -373,6 +593,55 @@ class TestNoSmuggledFields:
         )
         assert r.status_code == 422
 
+    def test_retrieve_validation_is_json_safe_and_body_located(self, scope: ProjectScope) -> None:
+        client = _client(scope=scope).client
+        malformed = client.post(
+            "/v1/retrieve",
+            headers={"x-api-key": "good", "content-type": "application/json"},
+            content=b"{",
+        )
+        assert malformed.status_code == 422
+        unsupported = client.post("/v1/retrieve", headers={"x-api-key": "good"}, json=[])
+        assert unsupported.status_code == 422
+        invalid_user = client.post(
+            "/v1/retrieve",
+            headers={"x-api-key": "good"},
+            json={"agent_type": "a", "run_ctx": {**_RUN_CTX, "user_ref": " "}},
+        )
+        assert invalid_user.status_code == 422
+        error = invalid_user.json()["detail"][0]
+        assert error["loc"][:3] == ["body", "run_ctx", "user_ref"]
+
+    def test_retrieve_openapi_retains_the_public_request_schema(self, scope: ProjectScope) -> None:
+        schema = _client(scope=scope).client.get("/openapi.json").json()
+        request_schema = schema["paths"]["/v1/retrieve"]["post"]["requestBody"]["content"][
+            "application/json"
+        ]["schema"]
+        assert request_schema == {"$ref": "#/components/schemas/RetrieveIn"}
+        components = schema["components"]["schemas"]
+
+        seen_refs: set[str] = set()
+
+        def assert_local_refs_resolve(node: object) -> None:
+            if isinstance(node, dict):
+                ref = node.get("$ref")
+                if isinstance(ref, str) and ref.startswith("#/components/schemas/"):
+                    name = ref.rsplit("/", maxsplit=1)[1]
+                    assert name in components
+                    if name not in seen_refs:
+                        seen_refs.add(name)
+                        assert_local_refs_resolve(components[name])
+                for value in node.values():
+                    assert_local_refs_resolve(value)
+            elif isinstance(node, list):
+                for value in node:
+                    assert_local_refs_resolve(value)
+
+        assert_local_refs_resolve(components["RetrieveIn"])
+        retrieve = components["RetrieveIn"]
+        assert set(retrieve["properties"]) >= {"agent_type", "run_ctx"}
+        assert_local_refs_resolve(request_schema)
+
 
 # --------------------------------------------------------------------------- #
 # /v1/retrieve stub shape (contract §9.3, Task 16).
@@ -411,6 +680,22 @@ class TestRetrieveStub:
         assert telemetry.calls[0]["outcome_code"] == OutcomeCode.EMPTY_RESULT
         assert telemetry.calls[0]["arm"] == Arm.MEMORY_ON
 
+    def test_request_deadline_abort_is_opaque_503_without_result_or_telemetry(
+        self, scope: ProjectScope
+    ) -> None:
+        h = _client(scope=scope, pipeline=ExpiredPipeline())
+        r = h.client.post(
+            "/v1/retrieve",
+            headers={"x-api-key": "good"},
+            json={"agent_type": "a", "run_ctx": _RUN_CTX},
+        )
+
+        assert r.status_code == 503
+        assert r.json() == {"detail": "unavailable"}
+        assert "run_id" not in r.json()
+        assert "context_block" not in r.json()
+        assert h.telemetry.calls == []
+
     def test_two_calls_mint_distinct_run_ids(self, scope: ProjectScope) -> None:
         client = _client(scope=scope).client
         body = {"agent_type": "a", "run_ctx": _RUN_CTX}
@@ -440,16 +725,17 @@ class TestEnqueueRoutes:
         )
         assert r.status_code == 202
         assert r.json() == {"status": "accepted"}
-        assert len(queue.items) == 1
-        topic, project_id, payload = queue.items[0]
-        assert topic == "trace_event"
-        assert project_id == scope.project_id
-        assert payload["project_id"] == str(scope.project_id)
-        assert payload["principal_id"] == str(scope.principal_id)
-        assert payload["agent_type_id"] == str(scope.agent_type_id)
-        assert payload["run_id"] == str(run_id)
-        assert payload["seq"] == 3
-        assert payload["event"]["type"] == "run_start"
+        assert len(queue.calls) == 1
+        access, writes = queue.calls[0]
+        assert access.project_id == scope.project_id
+        assert len(writes) == 1
+        write = writes[0]
+        assert write.topic == "trace_event"
+        assert write.run_id.value == run_id
+        assert write.to_json_payload() == {
+            "seq": 3,
+            "event": {"type": "run_start", "ts": "2026-01-01T00:00:00Z", "payload": {}},
+        }
 
     def test_trace_batch_enqueues_one_item_per_event_and_caps_at_500(
         self, scope: ProjectScope
@@ -464,11 +750,10 @@ class TestEnqueueRoutes:
             }
             for i in range(3)
         ]
-        r = client.post(
-            "/v1/trace/batch", headers={"x-api-key": "good"}, json={"events": events}
-        )
+        r = client.post("/v1/trace/batch", headers={"x-api-key": "good"}, json={"events": events})
         assert r.status_code == 202
-        assert len(queue.items) == 3
+        assert len(queue.calls) == 1
+        assert len(queue.calls[0][1]) == 3
 
         oversized = [
             {
@@ -499,11 +784,11 @@ class TestEnqueueRoutes:
             },
         )
         assert r.status_code == 202
-        topic, project_id, payload = queue.items[0]
-        assert topic == "outcome_event"
-        assert project_id == scope.project_id
-        assert payload["event"]["adapter"] == "verdict"
-        assert "weight" not in payload["event"]
+        access, writes = queue.calls[0]
+        assert access.project_id == scope.project_id
+        assert writes[0].topic == "outcome_event"
+        assert writes[0].to_json_payload()["outcome"] == "positive"
+        assert "adapter" not in writes[0].to_json_payload()
 
     def test_propose_memory_enqueues_proposal(self, scope: ProjectScope) -> None:
         h = _client(scope=scope)
@@ -521,14 +806,12 @@ class TestEnqueueRoutes:
             },
         )
         assert r.status_code == 202
-        topic, project_id, payload = queue.items[0]
-        assert topic == "memory_proposal"
-        assert project_id == scope.project_id
-        assert payload["proposal"]["mem_type"] == "lesson"
+        access, writes = queue.calls[0]
+        assert access.project_id == scope.project_id
+        assert writes[0].topic == "memory_proposal"
+        assert writes[0].to_json_payload()["proposal"]["mem_type"] == "lesson"
 
-    def test_invalidation_persists_under_the_callers_own_project(
-        self, scope: ProjectScope
-    ) -> None:
+    def test_invalidation_persists_under_the_callers_own_project(self, scope: ProjectScope) -> None:
         """C-31. As merged this route authenticated, resolved scope, returned
         202 "accepted" — and dropped the body on the floor. That is the one
         failure mode a 202 must never have: every future integration test
@@ -550,7 +833,7 @@ class TestEnqueueRoutes:
         ]
         # Not a queue write: §14 forbids a fourth topic, so this route is the
         # one /v1/* path that writes synchronously.
-        assert harness.queue.items == []
+        assert harness.queue.calls == []
 
     def test_invalidation_body_cannot_name_a_project(self, scope: ProjectScope) -> None:
         """`InvalidationIn` is `extra="forbid"` and declares no `project_id`
@@ -687,9 +970,7 @@ class TestExport:
         lines = [json.loads(line) for line in r.text.splitlines() if line]
         # FakeExporter yields nothing for any project but the scoped one, so a
         # route that stopped passing scope.project_id yields zero lines.
-        assert lines == [
-            {"table": "memory_item", "row": {"project_id": str(scope.project_id)}}
-        ]
+        assert lines == [{"table": "memory_item", "row": {"project_id": str(scope.project_id)}}]
 
     def test_requires_authentication(self, scope: ProjectScope) -> None:
         client = _client(scope=scope).client
@@ -697,13 +978,14 @@ class TestExport:
 
 
 class TestNoUnauthenticatedRoutes:
-    """§14 api-auth DO-NOT list: `/healthz` is the ONLY unauthenticated route,
+    """§14 api-auth DO-NOT list: liveness/readiness are unauthenticated,
     and an unauthenticated caller must never be able to tell a well-formed
     body from a malformed one (that would be a free schema oracle)."""
 
     def test_healthz_is_the_only_open_route(self, scope: ProjectScope) -> None:
         client = _client(scope=scope).client
         assert client.get("/healthz").json() == {"status": "ok"}
+        assert client.get("/readyz").status_code == 503
 
         unauthenticated = [
             client.post("/v1/retrieve", json={"agent_type": "a", "run_ctx": _RUN_CTX}),
@@ -714,15 +996,6 @@ class TestNoUnauthenticatedRoutes:
             client.post("/v1/invalidation", json={"kind": "x"}),
             client.get(f"/admin/memory/{uuid4()}"),
             client.get("/export/project"),
-            client.post("/admin/projects", json={"name": "p"}),
-            client.post(
-                "/admin/agents/register",
-                json={
-                    "project_id": str(uuid4()),
-                    "agent_type": "a",
-                    "principal": {"kind": "api_key"},
-                },
-            ),
         ]
         assert [r.status_code for r in unauthenticated] == [401] * len(unauthenticated)
 

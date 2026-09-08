@@ -24,7 +24,9 @@ import os
 from typing import TYPE_CHECKING
 
 from tracebed.adapters.embedding.gemini import GeminiEmbeddingClient
+from tracebed.adapters.embedding.hash_local import HashLocalEmbeddingClient
 from tracebed.adapters.embedding.pinning import ModelPin
+from tracebed.domain.config import HASH_LOCAL_MODEL_ID, HASH_LOCAL_MODEL_VERSION
 from tracebed.domain.errors import ConfigError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -56,6 +58,28 @@ def build_embedding_driver(settings: TracebedSettings, clock: Clock) -> Embeddin
     outbound model call on the read path, under its own `embed_timeout_ms` sub-budget.
     """
     pin = model_pin_from_settings(settings)
+    if settings.embedding.driver == "hash-local":
+        # Never let the local fallback inherit the Gemini defaults.  The
+        # settings validator derives this identity when omitted and rejects an
+        # explicit mismatch; repeat the guard here for callers that bypass
+        # pydantic validation with ``model_construct``.
+        if (
+            pin.model_id != HASH_LOCAL_MODEL_ID
+            or pin.model_version != HASH_LOCAL_MODEL_VERSION
+        ):
+            raise ConfigError(
+                "embedding.driver='hash-local' requires fixed "
+                f"{HASH_LOCAL_MODEL_ID!r}/{HASH_LOCAL_MODEL_VERSION!r}, got "
+                f"{pin.model_id!r}/{pin.model_version!r}"
+            )
+        return HashLocalEmbeddingClient(
+            pin=ModelPin(
+                model_id=HASH_LOCAL_MODEL_ID,
+                model_version=HASH_LOCAL_MODEL_VERSION,
+                dim=pin.dim,
+            ),
+            clock=clock,
+        )
     if settings.embedding.driver == "onnx-local":
         if settings.embedding.onnx_model_path is None or settings.embedding.onnx_model_hash is None:
             raise ConfigError(

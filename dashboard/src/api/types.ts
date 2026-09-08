@@ -466,13 +466,37 @@ export interface ScopeOut {
   principal_id: string;
 }
 
+/** `GET /auth/session` — the BFF exposes only session state and a
+ * synchronizer token. Browser JavaScript never receives an upstream token,
+ * cookie value, or session id. */
+export interface SessionStatusOut {
+  authenticated: boolean;
+  csrf_token: string | null;
+}
+
+/** Public, non-secret evidence labels served only by the explicit local-demo
+ * edge. Production edge returns 404 for this optional route. The IDs are
+ * joined with authoritative `trace_index` export rows in Validation Runs. */
+export interface DemoValidationRun {
+  run_id: string;
+  label: string;
+  status: "passed" | "failed" | "pending";
+  facts: string;
+}
+
+export interface DemoManifestOut {
+  schema_version: number;
+  mode: "local_demo";
+  title: string;
+  provenance: string;
+  runs: DemoValidationRun[];
+}
+
 export interface MemoryListOut {
   items: MemoryItemOut[];
-  /** The bound the server applied. `returned === limit` is the ONLY signal a
-   * view has that more rows exist — rendering `returned` as a total without
-   * checking this is how a page count becomes a vault count. */
-  limit: number;
-  returned: number;
+  /** Opaque, stable cursor for the next page; never construct or inspect it
+   * in browser code. `null` means this page is terminal. */
+  next_cursor: string | null;
 }
 
 export interface ReviewItemOut {
@@ -545,4 +569,137 @@ export interface ConfigOut {
    * so a view must not present these as the resolved effective config. */
   project: Record<string, unknown>;
   agent_type: Record<string, unknown>;
+}
+
+// GET /admin/injections (api/models_reports.py). This is deliberately a
+// paginated feed rather than a browser-derived project export.
+export interface InjectionEntryOut {
+  run_id: string;
+  memory_id: string;
+  slot: Slot;
+  score: number;
+  tokens: number;
+  injected_at: string;
+}
+
+export interface InjectionsOut {
+  items: InjectionEntryOut[];
+  limit: number;
+  offset: number;
+  returned: number;
+}
+
+export interface LiftWindowOut {
+  since: string;
+  days: number;
+  observations_considered: number;
+  observations_truncated: boolean;
+  observations_cap: number;
+}
+
+export interface LiftMethodologyOut {
+  min_cell_n: number;
+  killswitch_window_days: number;
+  correction: string;
+  confidence: number;
+  bh_alpha: number;
+  bh_hypotheses: number;
+  source: string;
+}
+
+export interface LiftCellOut {
+  agent_type_id: string;
+  mem_type: MemType;
+  n_treatment: number;
+  n_control: number;
+  min_cell_n: number;
+  insufficient: boolean;
+  point_estimate: number | null;
+  lower_bound: number | null;
+  upper_bound: number | null;
+  confidence: number | null;
+  p_value: number | null;
+  bh_adjusted_p: number | null;
+}
+
+export interface QTrajectoryPointOut {
+  agent_type_id: string;
+  mem_type: MemType;
+  memory_id: string;
+  q_value: number;
+  confidence: number;
+  scored_use_count: number;
+  observed_at: string;
+  scoring_epoch_id: number | null;
+}
+
+export interface QTrajectoryOut {
+  items: QTrajectoryPointOut[];
+  limit: number;
+  offset: number;
+  returned: number;
+}
+
+export interface LiftReportOut {
+  window: LiftWindowOut;
+  methodology: LiftMethodologyOut;
+  cells: LiftCellOut[];
+  q_trajectory: QTrajectoryOut;
+}
+
+export interface InvalidationMatchOut {
+  memory_id: string;
+  mem_type: MemType;
+  strike_count: number;
+  status_changed_at: string | null;
+}
+
+export interface InvalidationReportEntryOut {
+  event_id: string;
+  event_type: string;
+  selector: Record<string, unknown> | null;
+  fired_at: string;
+  matched_memories: InvalidationMatchOut[];
+  matched_memories_total: number;
+  matched_memories_truncated: boolean;
+}
+
+export interface RevalidationCandidateOut {
+  memory_id: string;
+  mem_type: MemType;
+  reference_at: string;
+  age_days: number;
+  r_days: number;
+  last_revalidated_at: string | null;
+}
+
+export interface StalenessReportOut {
+  invalidation_events: InvalidationReportEntryOut[];
+  event_limit: number;
+  event_offset: number;
+  event_returned: number;
+  approaching_revalidation: RevalidationCandidateOut[];
+  approaching_limit: number;
+  approaching_offset: number;
+  approaching_returned: number;
+  r_days: number;
+}
+
+export interface ConsolidationDiffOut {
+  agent_type_id: string;
+  key: string;
+  version: number;
+  value: Record<string, unknown>;
+  delta_pct: number | null;
+  clamped: boolean;
+  value_retained_fraction: number | null;
+  computed_at: string;
+}
+
+export interface ConsolidationDiffsOut {
+  items: ConsolidationDiffOut[];
+  limit: number;
+  offset: number;
+  returned: number;
+  sweep_deltas_available: boolean;
 }

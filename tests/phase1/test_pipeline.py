@@ -7,19 +7,25 @@ contract.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import threading
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from psycopg.errors import QueryCanceled
 
 from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import (
     AbstentionConfig,
     BudgetConfig,
     CacheConfig,
+    ConfigResolver,
     DerivedConfig,
     EffectiveConfig,
+    EmbeddingConfig,
     KillswitchConfig,
     LifecycleConfig,
     PromotionConfig,
@@ -31,14 +37,20 @@ from tracebed.domain.config import (
     ScoringConfig,
     SessionConfig,
     SpendConfig,
+    StorageConfig,
     TierAConfig,
+    TracebedSettings,
 )
 from tracebed.domain.enums import Arm, OutcomeCode, Slot
+from tracebed.domain.errors import RequestDeadlineExceeded
 from tracebed.domain.events import ContextSlot, RunContext
 from tracebed.domain.ids import AgentTypeId, PrincipalId, ProjectId, RunId, uuid7_timestamp_ms
 from tracebed.domain.scope import ProjectScope
+from tracebed.hotpath.budget import Deadline
 from tracebed.hotpath.fusion import FusedCandidate
 from tracebed.hotpath.pipeline import CandidateSetResult, Pipeline
+from tracebed.stores.pg import pool as pool_module
+from tracebed.stores.pg.repo import Repo
 
 pytestmark = pytest.mark.phase1
 
@@ -83,9 +95,118 @@ class _ConfigProvider:
         self._cfg = cfg
 
     def effective(
-        self, project_id: ProjectId, agent_type_id: AgentTypeId | None = None
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId | None = None,
+        *,
+        deadline: Deadline | None = None,
     ) -> EffectiveConfig:
+        del project_id, agent_type_id, deadline
         return self._cfg
+
+
+class _DeadlineRecordingConfigProvider(_ConfigProvider):
+    def __init__(self, cfg: EffectiveConfig) -> None:
+        super().__init__(cfg)
+        self.deadlines: list[Deadline | None] = []
+
+    def effective(
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId | None = None,
+        *,
+        deadline: Deadline | None = None,
+    ) -> EffectiveConfig:
+        self.deadlines.append(deadline)
+        return super().effective(project_id, agent_type_id, deadline=deadline)
+
+
+class _ExpiredConfigProvider:
+    def effective(
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId | None = None,
+        *,
+        deadline: Deadline | None = None,
+    ) -> EffectiveConfig:
+        del project_id, agent_type_id, deadline
+        raise RequestDeadlineExceeded()
+
+
+class _ConfigCursor:
+    def __init__(self, pool: _ConfigReadPool) -> None:
+        self._pool = pool
+
+    def execute(self, sql: str, params: object | None = None) -> None:
+        self._pool.log.append((sql, params))
+        if "SELECT key, value FROM project_config" in sql:
+            if self._pool.mode == "late_cancel":
+                self._pool.clock.advance(ms=100)
+                raise QueryCanceled("statement timeout")
+            if self._pool.mode == "early_cancel":
+                raise QueryCanceled("manual cancellation")
+
+    def fetchall(self) -> list[Any]:
+        return []
+
+    def __enter__(self) -> _ConfigCursor:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class _ConfigConnection:
+    def __init__(self, pool: _ConfigReadPool) -> None:
+        self._pool = pool
+        self._statement_timeout_sets = 0
+
+    def execute(self, sql: str, params: object | None = None) -> None:
+        self._pool.log.append((sql, params))
+        if sql == pool_module._SET_STATEMENT_TIMEOUT:
+            self._statement_timeout_sets += 1
+            if self._pool.mode == "refresh_expiry" and self._statement_timeout_sets == 2:
+                self._pool.clock.advance(ms=100)
+
+    def cursor(self) -> _ConfigCursor:
+        return _ConfigCursor(self._pool)
+
+    @contextmanager
+    def transaction(self) -> Iterator[_ConfigConnection]:
+        yield self
+
+
+class _ConfigReadPool:
+    def __init__(self, clock: FakeClock, mode: str) -> None:
+        self.clock = clock
+        self.mode = mode
+        self.log: list[tuple[str, object | None]] = []
+        self.timeouts: list[float] = []
+
+    @contextmanager
+    def connection(self, *, timeout: float | None = None) -> Iterator[_ConfigConnection]:
+        if timeout is not None:
+            self.timeouts.append(timeout)
+        if self.mode == "checkout_expiry":
+            self.clock.advance(ms=100)
+        yield _ConfigConnection(self)
+
+
+class _CountingStaticPrefix:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get(self, scope: ProjectScope) -> object:
+        del scope
+        self.calls += 1
+        return object()
+
+
+def _repo_config_settings() -> TracebedSettings:
+    return TracebedSettings(
+        storage=StorageConfig(pg_dsn="postgresql://unused@unused/unused"),
+        embedding=EmbeddingConfig(model_version="test"),
+    )
 
 
 class _Telemetry:
@@ -124,9 +245,11 @@ class _Retriever:
         self.received: list[dict[str, object]] = []
 
     def retrieve(
-        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig
+        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig, deadline: object
     ) -> _Outcome:
-        self.received.append({"project_id": project_id, "query_text": query_text})
+        self.received.append(
+            {"project_id": project_id, "query_text": query_text, "deadline": deadline}
+        )
         return _Outcome()
 
 
@@ -151,6 +274,7 @@ class _Assembly:
         query_text: str,
         candidates: Sequence[FusedCandidate],
         cfg: EffectiveConfig,
+        deadline: object,
     ) -> CandidateSetResult:
         self.received.append(
             {
@@ -170,13 +294,18 @@ class _Assembly:
 
 
 def _pipeline(
-    clock: FakeClock, cfg: EffectiveConfig, assembly: _Assembly, telemetry: _Telemetry
+    clock: FakeClock,
+    cfg: EffectiveConfig,
+    assembly: _Assembly,
+    telemetry: _Telemetry,
+    *,
+    retriever: _Retriever | None = None,
 ) -> Pipeline:
     return Pipeline(
         clock=clock,
         config=_ConfigProvider(cfg),
         telemetry=telemetry,
-        retriever=_Retriever(),
+        retriever=_Retriever() if retriever is None else retriever,
         assembly=assembly,
         holdout_salt="pipeline-test-salt",
     )
@@ -239,9 +368,7 @@ def test_arm_is_always_memory_on_at_zero_holdout_pct() -> None:
     clock = FakeClock()
     pipeline = _pipeline(clock, _cfg(holdout_pct=0.0), _Assembly(), _Telemetry())
 
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="q"), session_id="always-on"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="always-on")
 
     assert result.arm is Arm.MEMORY_ON
 
@@ -250,9 +377,7 @@ def test_arm_is_always_holdout_at_hundred_holdout_pct() -> None:
     clock = FakeClock()
     pipeline = _pipeline(clock, _cfg(holdout_pct=100.0), _Assembly(), _Telemetry())
 
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="q"), session_id="always-holdout"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="always-holdout")
 
     assert result.arm is Arm.HOLDOUT
 
@@ -315,7 +440,12 @@ def test_holdout_arm_is_session_stable_across_two_pipeline_calls() -> None:
 
 @pytest.mark.parametrize(
     "outcome_code",
-    [OutcomeCode.INJECTED, OutcomeCode.ABSTAINED_THRESHOLD, OutcomeCode.ABSTAINED_RARITY, OutcomeCode.EMPTY_RESULT],
+    [
+        OutcomeCode.INJECTED,
+        OutcomeCode.ABSTAINED_THRESHOLD,
+        OutcomeCode.ABSTAINED_RARITY,
+        OutcomeCode.EMPTY_RESULT,
+    ],
 )
 def test_non_degraded_outcome_codes_pass_through(outcome_code: OutcomeCode) -> None:
     clock = FakeClock()
@@ -326,6 +456,129 @@ def test_non_degraded_outcome_codes_pass_through(outcome_code: OutcomeCode) -> N
 
     assert result.outcome_code is outcome_code
     assert telemetry.calls[0]["outcome_code"] is outcome_code
+
+
+def test_concurrent_pipeline_calls_receive_distinct_request_deadlines() -> None:
+    clock = FakeClock()
+    retriever = _Retriever()
+    pipeline = _pipeline(clock, _cfg(), _Assembly(), _Telemetry(), retriever=retriever)
+    barrier = threading.Barrier(2)
+
+    def call(query: str) -> None:
+        barrier.wait()
+        pipeline.retrieve(_scope(), RunContext(query_text=query), session_id=query)
+
+    first = threading.Thread(target=call, args=("one",))
+    second = threading.Thread(target=call, args=("two",))
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+
+    assert len(retriever.received) == 2
+    assert retriever.received[0]["deadline"] is not retriever.received[1]["deadline"]
+
+
+def test_pipeline_forwards_its_existing_deadline_to_config_resolution() -> None:
+    clock = FakeClock()
+    cfg = _cfg()
+    config = _DeadlineRecordingConfigProvider(cfg)
+    pipeline = Pipeline(
+        clock=clock,
+        config=config,
+        telemetry=_Telemetry(),
+        retriever=_Retriever(),
+        assembly=_Assembly(),
+        holdout_salt="pipeline-test-salt",
+    )
+    deadline = Deadline(clock=clock, total_budget_ms=300, embed_timeout_ms=50)
+
+    pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s", deadline=deadline)
+
+    assert config.deadlines == [deadline]
+
+
+def test_request_deadline_config_expiry_propagates_without_prefix_or_telemetry() -> None:
+    clock = FakeClock()
+    telemetry = _Telemetry()
+    prefix = _CountingStaticPrefix()
+    pipeline = Pipeline(
+        clock=clock,
+        config=_ExpiredConfigProvider(),
+        telemetry=telemetry,
+        retriever=_Retriever(),
+        assembly=_Assembly(),
+        static_prefix=prefix,
+        holdout_salt="pipeline-test-salt",
+    )
+    deadline = Deadline(clock=clock, total_budget_ms=300, embed_timeout_ms=50)
+
+    with pytest.raises(RequestDeadlineExceeded):
+        pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s", deadline=deadline)
+
+    assert prefix.calls == 0
+    assert telemetry.calls == []
+
+
+def test_no_deadline_config_expiry_returns_empty_timeout_without_prefix_work() -> None:
+    clock = FakeClock()
+    prefix = _CountingStaticPrefix()
+    pipeline = Pipeline(
+        clock=clock,
+        config=_ExpiredConfigProvider(),
+        telemetry=_Telemetry(),
+        retriever=_Retriever(),
+        assembly=_Assembly(),
+        static_prefix=prefix,
+        holdout_salt="pipeline-test-salt",
+    )
+
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s")
+
+    assert result.outcome_code is OutcomeCode.TIMEOUT_PREFIX_ONLY
+    assert result.context_block.rendered == ""
+    assert prefix.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("mode", "raises_request_expiry"),
+    [
+        ("checkout_expiry", True),
+        ("refresh_expiry", True),
+        ("late_cancel", True),
+        ("early_cancel", False),
+    ],
+)
+def test_repo_config_deadline_boundaries_reach_pipeline_without_prefix_work(
+    mode: str, raises_request_expiry: bool
+) -> None:
+    """Exercise the concrete Repo -> resolver -> Pipeline config path, not a fake provider."""
+    clock = FakeClock()
+    pool = _ConfigReadPool(clock, mode)
+    prefix = _CountingStaticPrefix()
+    pipeline = Pipeline(
+        clock=clock,
+        config=ConfigResolver(_repo_config_settings(), Repo(pool, clock)),  # type: ignore[arg-type]
+        telemetry=_Telemetry(),
+        retriever=_Retriever(),
+        assembly=_Assembly(),
+        static_prefix=prefix,
+        holdout_salt="pipeline-test-salt",
+    )
+    deadline = Deadline(clock=clock, total_budget_ms=100, embed_timeout_ms=50)
+
+    if raises_request_expiry:
+        with pytest.raises(RequestDeadlineExceeded):
+            pipeline.retrieve(
+                _scope(), RunContext(query_text="q"), session_id="s", deadline=deadline
+            )
+    else:
+        result = pipeline.retrieve(
+            _scope(), RunContext(query_text="q"), session_id="s", deadline=deadline
+        )
+        assert result.outcome_code is OutcomeCode.STORE_ERROR
+
+    assert prefix.calls == 0
 
 
 def test_context_block_header_is_the_exact_memory_header_when_injected() -> None:

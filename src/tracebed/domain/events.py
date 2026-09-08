@@ -20,10 +20,12 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from tracebed.domain.enums import AdapterClass, Arm, OutcomeCode, Slot
+from tracebed.domain.subject_tags import validate_subject_tag
 
 __all__ = [
     "MAX_SUBJECT_TAGS",
     "MAX_SUBJECT_TAG_CHARS",
+    "MAX_TRACE_SEQ",
     "MEMORY_HEADER",
     "PLACEMENT_APPEND_LAST",
     "RUN_END_STATUSES",
@@ -60,6 +62,10 @@ SUBJECT_TAGS_KEY: Final = "subject_tags"
 # constraint violation inside the ingest consumer (which would dead-letter the
 # whole run and lose an otherwise complete trace).
 RUN_END_STATUSES: Final = frozenset({"ok", "error", "cancelled"})
+# The envelope sequence ceiling is shared by API validation, ingest and the
+# future authorized queue payload carrier.  Keeping it in the pure event
+# contract avoids making those boundaries import the ingest/store layer.
+MAX_TRACE_SEQ: Final = 1_000_000
 # Each distinct subject_tag provisions a subject KEK (Task 10) and a
 # trace_subject row, so an unbounded `subject_tags` list on a single event is
 # an unbounded write amplification driven by caller input. Bound it at the wire.
@@ -111,13 +117,15 @@ def _validated_subject_tags(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"payload[{SUBJECT_TAGS_KEY!r}] must be a list of strings")
     if len(tags) > MAX_SUBJECT_TAGS:
         raise ValueError(f"payload[{SUBJECT_TAGS_KEY!r}] exceeds {MAX_SUBJECT_TAGS} tags")
+    if len(set(tags)) != len(tags):
+        raise ValueError(f"payload[{SUBJECT_TAGS_KEY!r}] entries must be distinct")
     for tag in tags:
-        if not isinstance(tag, str) or not tag.strip():
-            raise ValueError(f"payload[{SUBJECT_TAGS_KEY!r}] entries must be non-empty strings")
-        if len(tag) > MAX_SUBJECT_TAG_CHARS:
-            raise ValueError(
-                f"payload[{SUBJECT_TAGS_KEY!r}] entry exceeds {MAX_SUBJECT_TAG_CHARS} characters"
-            )
+        if not isinstance(tag, str):
+            raise ValueError(f"payload[{SUBJECT_TAGS_KEY!r}] entries must be strings")
+        try:
+            validate_subject_tag(tag)
+        except (TypeError, ValueError):
+            raise ValueError(f"payload[{SUBJECT_TAGS_KEY!r}] entry is invalid") from None
     return payload
 
 
@@ -221,6 +229,11 @@ class MemoryProposal(BaseModel):
     subject_tag: str | None = None
     claimed_scope: Literal["agent_type", "project_shared"]
 
+    @field_validator("subject_tag")
+    @classmethod
+    def _subject_tag_is_canonical(cls, value: str | None) -> str | None:
+        return None if value is None else validate_subject_tag(value)
+
 
 class RunContext(BaseModel):
     """SDK-side run context (PHASE-0 Task 13); `api` maps this onto the wire
@@ -234,6 +247,11 @@ class RunContext(BaseModel):
     workflow_template: str | None = None
     user_ref: str | None = None
     tool_manifest: list[str] | None = None
+
+    @field_validator("user_ref")
+    @classmethod
+    def _user_ref_is_canonical(cls, value: str | None) -> str | None:
+        return None if value is None else validate_subject_tag(value)
 
 
 class ContextSlot(BaseModel):

@@ -18,9 +18,12 @@ THE DEGRADATION LADDER, exactly (PLAN.md §2 invariant 2):
     store error (anything else unexpected)    -> nothing
                                                -> outcome_code = store_error
 
-A run never blocks and never fails because of Tracebed: `retrieve()` does not
-propagate any exception, including one raised by the code that records the
-degradation (the telemetry write itself is individually guarded).
+A run never blocks and never fails because of Tracebed: `retrieve()` degrades
+ordinary collaborator exceptions, including one raised by the code that records
+degradation (the telemetry write itself is individually guarded). The explicit
+exception is `RequestDeadlineExceeded` with a caller-provided request deadline:
+that named abort propagates to the API's opaque 503 boundary rather than
+manufacturing a result after the request budget has ended.
 
 `CandidateAssemblyPort` is the seam between "which memories" and "which of them fit":
 it receives the fused candidates this module retrieved and returns a decided outcome
@@ -49,7 +52,9 @@ from typing import Protocol, runtime_checkable
 
 from tracebed.domain.clock import Clock
 from tracebed.domain.config import EffectiveConfig, RetrievalConfig
+from tracebed.domain.deadline import RemainingBudget
 from tracebed.domain.enums import Arm, OutcomeCode
+from tracebed.domain.errors import RequestDeadlineExceeded
 from tracebed.domain.events import (
     ContextBlock,
     ContextSlot,
@@ -59,11 +64,12 @@ from tracebed.domain.events import (
 )
 from tracebed.domain.ids import AgentTypeId, ProjectId, RunId, mint_run_id
 from tracebed.domain.scope import ProjectScope
+from tracebed.hotpath.assembly import AssemblyDeadlineExceeded
 from tracebed.hotpath.budget import Deadline
 from tracebed.hotpath.fusion import FusedCandidate
 from tracebed.hotpath.holdout import assign_arm
 from tracebed.hotpath.renderer import render
-from tracebed.stores.pg.rows import InjectionRow
+from tracebed.stores.pg.rows import InjectionRow, RetrievalEventInsert
 
 __all__ = [
     "CandidateAssemblyPort",
@@ -73,6 +79,7 @@ __all__ = [
     "HybridRetrieverPort",
     "InjectionRecorderPort",
     "Pipeline",
+    "RetrievalAuditPort",
     "RetrievalOutcomeLike",
     "StaticPrefixPort",
     "TelemetryRecorderPort",
@@ -91,7 +98,11 @@ class ConfigProvider(Protocol):
     """
 
     def effective(
-        self, project_id: ProjectId, agent_type_id: AgentTypeId | None = None
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId | None = None,
+        *,
+        deadline: RemainingBudget | None = None,
     ) -> EffectiveConfig: ...
 
 
@@ -141,7 +152,7 @@ class HybridRetrieverPort(Protocol):
     """
 
     def retrieve(
-        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig
+        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig, deadline: Deadline
     ) -> RetrievalOutcomeLike: ...
 
 
@@ -213,6 +224,7 @@ class CandidateAssemblyPort(Protocol):
         query_text: str,
         candidates: Sequence[FusedCandidate],
         cfg: EffectiveConfig,
+        deadline: Deadline,
     ) -> CandidateSetResultLike: ...
 
 
@@ -268,6 +280,13 @@ class InjectionRecorderPort(Protocol):
 
     def record_injections(
         self, project_id: ProjectId, run_id: RunId, rows: Sequence[InjectionRow]
+    ) -> None: ...
+
+
+@runtime_checkable
+class RetrievalAuditPort(Protocol):
+    def record_terminal(
+        self, *, injections: Sequence[InjectionRow], row: RetrievalEventInsert
     ) -> None: ...
 
 
@@ -344,8 +363,11 @@ class Pipeline:
         run_ctx: RunContext,
         *,
         session_id: str | None = None,
+        run_id: RunId | None = None,
+        deadline: Deadline | None = None,
+        audit: RetrievalAuditPort | None = None,
     ) -> RetrieveResult:
-        """Mint the run id server-side (D-018) and run the full ladder.
+        """Use a pre-authorized run id when supplied and run the full ladder.
 
         Defaults — `arm=memory_on`, `outcome_code=store_error`,
         `context_block=empty_context_block()` — are the answer returned when
@@ -353,7 +375,14 @@ class Pipeline:
         itself failed); every guarded step below only ever narrows from there
         toward a more specific, successfully-computed outcome.
         """
-        run_id = self._mint_run_id()
+        # API production opens and persists a retrieval run before entering the
+        # pipeline.  Keeping the minting fallback preserves the pure/offline
+        # pipeline surface without permitting the production route to replace a
+        # durable run owner with a second random id.
+        if run_id is None:
+            run_id = self._mint_run_id()
+        elif type(run_id) is not RunId:
+            raise TypeError("run_id must be a RunId or None")
         mono_start = self._monotonic_ms()
 
         arm = Arm.MEMORY_ON
@@ -366,7 +395,31 @@ class Pipeline:
 
         cfg: EffectiveConfig | None = None
         try:
-            cfg = self._config.effective(scope.project_id, scope.agent_type_id)
+            if deadline is None:
+                cfg = self._config.effective(scope.project_id, scope.agent_type_id)
+            else:
+                cfg = self._config.effective(
+                    scope.project_id, scope.agent_type_id, deadline=deadline
+                )
+        except RequestDeadlineExceeded:
+            if deadline is not None:
+                # A request-budget caller must reach the API's opaque 503 boundary.  Do not
+                # publish a result, telemetry event, or cached/static context after this abort.
+                raise
+            timeout = self._config_deadline_timeout()
+            return self._finish(
+                scope,
+                run_id,
+                arm=arm,
+                outcome_code=timeout.outcome_code,
+                block=timeout.context_block,
+                mono_start=mono_start,
+                embed_latency_ms=None,
+                candidates_considered=0,
+                top_score=None,
+                injections=(),
+                audit=audit,
+            )
         except Exception:
             cfg = None  # no budgets to read; nothing else this call can attempt
 
@@ -391,7 +444,11 @@ class Pipeline:
                 arm = Arm.MEMORY_ON
 
             try:
-                ladder = self._run_ladder(scope, run_ctx, cfg, started_at_ms=mono_start)
+                if deadline is not None:
+                    deadline.narrow_total_budget_ms(cfg.retrieval.total_budget_ms)
+                ladder = self._run_ladder(
+                    scope, run_ctx, cfg, started_at_ms=mono_start, deadline=deadline
+                )
                 outcome_code = ladder.outcome_code
                 context_block = ladder.context_block
                 embed_latency_ms = ladder.embed_latency_ms
@@ -448,6 +505,7 @@ class Pipeline:
             candidates_considered=candidates_considered,
             top_score=top_score,
             injections=injections,
+            audit=audit,
         )
 
     def _finish(
@@ -463,10 +521,33 @@ class Pipeline:
         candidates_considered: int,
         top_score: float | None,
         injections: Sequence[InjectionRow],
+        audit: RetrievalAuditPort | None = None,
     ) -> RetrieveResult:
         """The one exit. Invariant 2 says exactly one `retrieval_event` row per call on every
         path, including the holdout arm and every failure -- so there is exactly one place that
         writes it and builds the response."""
+        result = self._result(run_id, arm=arm, outcome_code=outcome_code, block=block)
+        if result.outcome_code is not outcome_code or result.arm is not arm:
+            # Validation fallback is the delivered result; it cannot audit
+            # selections that were not present in that result. HOLDOUT is a
+            # deliberate non-fallback shadow-selection path and is unchanged.
+            arm = result.arm
+            outcome_code = result.outcome_code
+            injections = ()
+        if audit is not None:
+            audit.record_terminal(
+                injections=injections,
+                row=RetrievalEventInsert(
+                    run_id=run_id,
+                    outcome_code=outcome_code,
+                    latency_ms=self._latency_ms(mono_start),
+                    embed_latency_ms=embed_latency_ms,
+                    candidates_considered=candidates_considered,
+                    top_score=top_score,
+                    arm=arm,
+                ),
+            )
+            return result
         self._record_injections(scope.project_id, run_id, injections)
         self._record_telemetry(
             scope.project_id,
@@ -478,7 +559,7 @@ class Pipeline:
             top_score=top_score,
             arm=arm,
         )
-        return self._result(run_id, arm=arm, outcome_code=outcome_code, block=block)
+        return result
 
     # ----------------------------------------------------------------- #
     # Boundary guards. Each exists because the thing it wraps is the last
@@ -572,6 +653,7 @@ class Pipeline:
         cfg: EffectiveConfig,
         *,
         started_at_ms: float,
+        deadline: Deadline | None = None,
     ) -> _LadderResult:
         """The degradation ladder proper. Every stage checks
         `deadline.remaining_ms()` / `total_exceeded()` BEFORE it starts
@@ -593,7 +675,7 @@ class Pipeline:
         exactly like every other rung: the recorded code describes *why*
         degradation happened, not what was found afterward.
         """
-        deadline = Deadline(
+        deadline = deadline or Deadline(
             clock=self._clock,
             total_budget_ms=cfg.retrieval.total_budget_ms,
             embed_timeout_ms=cfg.retrieval.embed_timeout_ms,
@@ -604,23 +686,28 @@ class Pipeline:
             return self._timeout_prefix_only(scope, embed_latency_ms=None)
 
         outcome: RetrievalOutcomeLike = self._retriever.retrieve(
-            scope.project_id, run_ctx.query_text, cfg=self._embed_bounded(cfg.retrieval, deadline)
+            scope.project_id,
+            run_ctx.query_text,
+            cfg=self._embed_bounded(cfg.retrieval, deadline),
+            deadline=deadline,
         )
 
         if deadline.total_exceeded():
             # Re-checked after the retriever call: total-budget exhaustion always
             # wins over a merely-degraded embed, because "nothing was retrieved
             # at all" is the worse degradation of the two.
-            return self._timeout_prefix_only(
-                scope, embed_latency_ms=outcome.embed_latency_ms
-            )
+            return self._timeout_prefix_only(scope, embed_latency_ms=outcome.embed_latency_ms)
 
-        assembled = self._assembly.run(
-            scope,
-            query_text=run_ctx.query_text,
-            candidates=outcome.candidates,
-            cfg=cfg,
-        )
+        try:
+            assembled = self._assembly.run(
+                scope,
+                query_text=run_ctx.query_text,
+                candidates=outcome.candidates,
+                cfg=cfg,
+                deadline=deadline,
+            )
+        except AssemblyDeadlineExceeded:
+            return self._timeout_prefix_only(scope, embed_latency_ms=outcome.embed_latency_ms)
 
         if deadline.total_exceeded():
             # Checked a THIRD time, after assembly. The assembly seam fetches candidate content,
@@ -632,9 +719,7 @@ class Pipeline:
             # is what invariant 2 means by degrading.
             return self._timeout_prefix_only(scope, embed_latency_ms=outcome.embed_latency_ms)
 
-        outcome_code = (
-            OutcomeCode.DEGRADED_LEXICAL if outcome.degraded else assembled.outcome_code
-        )
+        outcome_code = OutcomeCode.DEGRADED_LEXICAL if outcome.degraded else assembled.outcome_code
         context_block = render(assembled.slots)
         return _LadderResult(
             outcome_code=outcome_code,
@@ -691,6 +776,21 @@ class Pipeline:
             outcome_code=OutcomeCode.TIMEOUT_PREFIX_ONLY,
             context_block=context_block,
             embed_latency_ms=embed_latency_ms,
+            candidates_considered=0,
+            top_score=None,
+        )
+
+    @staticmethod
+    def _config_deadline_timeout() -> _LadderResult:
+        """Return the deadline rung without starting static-prefix work.
+
+        Config resolution did not safely produce an effective configuration, so a prefix/cache
+        lookup would be a new unbudgeted dependency after expiry rather than a safe fallback.
+        """
+        return _LadderResult(
+            outcome_code=OutcomeCode.TIMEOUT_PREFIX_ONLY,
+            context_block=empty_context_block(),
+            embed_latency_ms=None,
             candidates_considered=0,
             top_score=None,
         )

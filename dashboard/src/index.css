@@ -145,7 +145,7 @@
   --chart-axis: 212 12% 60%;
 }
 
-/* Fallback for a client that hasn't run index.html's inline script yet (e.g.
+/* Fallback for a client that hasn't run the same-origin theme bootstrap yet (e.g.
    this stylesheet loaded standalone) — mirrors .dark exactly, kept in sync by
    hand since CSS has no variable-block inheritance across at-rules. */
 @media (prefers-color-scheme: dark) {

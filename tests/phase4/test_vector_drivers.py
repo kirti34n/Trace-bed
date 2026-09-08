@@ -32,7 +32,7 @@ import threading
 import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -45,11 +45,11 @@ from tracebed.stores.vector.base import VectorStorePort
 from tracebed.stores.vector.pgvector import PgVectorStore, VectorStoreWriteUnavailable
 from tracebed.stores.vector.qdrant import (
     DEFAULT_ENABLED,
+    QdrantDeadlineUnsupported,
     QdrantPayloadInvalid,
     QdrantScopeViolation,
     QdrantUnavailable,
     QdrantVectorStore,
-    _erasure_filter,
     _point_id,
     _search_filter,
 )
@@ -63,7 +63,9 @@ MEM_2 = MemoryId(uuid.UUID(int=11))
 
 
 def _hit(memory_id: MemoryId, score: float) -> ArmHit:
-    return ArmHit(memory_id=memory_id, raw_score=score, trust_tier=TrustTier.A, status=Status.VALIDATED)
+    return ArmHit(
+        memory_id=memory_id, raw_score=score, trust_tier=TrustTier.A, status=Status.VALIDATED
+    )
 
 
 def _expected_search_filter(project_id: ProjectId) -> dict[str, Any]:
@@ -139,6 +141,7 @@ class _FakeSearchStore:
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         self.calls.append((project_id, embedding, top_n, hnsw_iterative_scan, hnsw_max_scan_tuples))
         self.statement_timeouts.append(statement_timeout_ms)
@@ -201,16 +204,11 @@ def test_pgvector_upsert_reports_the_missing_write_primitive_rather_than_a_place
         store.upsert(PROJECT_A, MEM_1, [0.1, 0.2], trust_tier=TrustTier.A, status=Status.VALIDATED)
 
 
-def test_pgvector_delete_by_project_delegates_to_drop_project() -> None:
-    fake_pool = MagicMock()
-    fake_conn = MagicMock()
-    fake_pool.connection.return_value.__enter__.return_value = fake_conn
-    store = PgVectorStore(search=MagicMock(), pool=fake_pool)
+def test_normal_vector_ports_expose_no_destructive_project_operation() -> None:
+    """E3 erasure uses its own port, never a hot read/write adapter."""
 
-    with patch("tracebed.stores.vector.pgvector.drop_project") as mock_drop:
-        store.delete_by_project(PROJECT_A)
-
-    mock_drop.assert_called_once_with(fake_conn, PROJECT_A)
+    for driver in (PgVectorStore, QdrantVectorStore, VectorStorePort):
+        assert not hasattr(driver, "delete_by_project")
 
 
 # --------------------------------------------------------------------------------------- #
@@ -353,23 +351,6 @@ def test_qdrant_search_filter_rejects_another_projects_payload() -> None:
     assert _filter_matches(_search_filter(PROJECT_A), payload) is False
 
 
-def test_qdrant_erasure_filter_is_project_scoped_but_never_retrievability_scoped() -> None:
-    """An erasure narrowed by retrievability would leave behind exactly the quarantined and
-    tombstoned vectors it exists to destroy."""
-    assert _erasure_filter(PROJECT_A) == {
-        "must": [{"key": "project_id", "match": {"value": str(PROJECT_A.value)}}]
-    }
-    for status in Status:
-        payload = {
-            "project_id": str(PROJECT_A.value),
-            "status": status.value,
-            "trust_tier": TrustTier.B.value,
-        }
-        assert _filter_matches(_erasure_filter(PROJECT_A), payload) is True, status
-        other = {**payload, "project_id": str(PROJECT_B.value)}
-        assert _filter_matches(_erasure_filter(PROJECT_A), other) is False, status
-
-
 # -- reads ------------------------------------------------------------------------------- #
 
 
@@ -385,6 +366,22 @@ def test_qdrant_ann_search_always_attaches_the_project_filter() -> None:
     assert fake.search_calls[0]["query_filter"] == _expected_search_filter(PROJECT_A)
     assert fake.search_calls[0]["limit"] == 10
     assert hits == [_hit(MEM_1, 0.75)]
+
+
+def test_qdrant_explicitly_rejects_an_unhonored_shared_deadline() -> None:
+    fake = _FakeQdrantClient()
+    store = QdrantVectorStore(client=fake)
+
+    with pytest.raises(QdrantDeadlineUnsupported, match="cannot honor"):
+        store.ann_search(
+            PROJECT_A,
+            [0.1],
+            10,
+            hnsw_iterative_scan=True,
+            hnsw_max_scan_tuples=1,
+            deadline=object(),  # type: ignore[arg-type]
+        )
+    assert fake.search_calls == []
 
 
 def test_qdrant_ann_search_bounds_a_pathological_top_n() -> None:
@@ -442,9 +439,7 @@ def test_qdrant_accepts_a_tier_a_candidate_hit() -> None:
     """The other side of the same rule -- the filter is not simply "validated only"."""
     fake = _FakeQdrantClient(
         search_results=[
-            _payload_result(
-                PROJECT_A, MEM_1, 0.4, status=Status.CANDIDATE, trust_tier=TrustTier.A
-            )
+            _payload_result(PROJECT_A, MEM_1, 0.4, status=Status.CANDIDATE, trust_tier=TrustTier.A)
         ]
     )
     store = QdrantVectorStore(client=fake)
@@ -515,7 +510,9 @@ def test_qdrant_malformed_payload_raises_a_typed_store_error(
 
 
 def test_qdrant_non_mapping_payload_is_refused() -> None:
-    store = QdrantVectorStore(client=_FakeQdrantClient(search_results=[{"score": 1.0, "payload": []}]))
+    store = QdrantVectorStore(
+        client=_FakeQdrantClient(search_results=[{"score": 1.0, "payload": []}])
+    )
     with pytest.raises(QdrantScopeViolation):
         store.ann_search(PROJECT_A, [0.1], 10, hnsw_iterative_scan=True, hnsw_max_scan_tuples=1)
 
@@ -524,8 +521,13 @@ def test_qdrant_ann_search_returns_empty_for_non_positive_top_n_or_empty_embeddi
     fake = _FakeQdrantClient(search_results=[_payload_result(PROJECT_A, MEM_1, 0.5)])
     store = QdrantVectorStore(client=fake)
 
-    assert store.ann_search(PROJECT_A, [0.1], 0, hnsw_iterative_scan=True, hnsw_max_scan_tuples=1) == []
-    assert store.ann_search(PROJECT_A, [], 10, hnsw_iterative_scan=True, hnsw_max_scan_tuples=1) == []
+    assert (
+        store.ann_search(PROJECT_A, [0.1], 0, hnsw_iterative_scan=True, hnsw_max_scan_tuples=1)
+        == []
+    )
+    assert (
+        store.ann_search(PROJECT_A, [], 10, hnsw_iterative_scan=True, hnsw_max_scan_tuples=1) == []
+    )
     assert fake.search_calls == []  # neither call reached the client
 
 
@@ -578,17 +580,6 @@ def test_qdrant_point_ids_cannot_collide_across_projects() -> None:
     store.upsert(PROJECT_B, MEM_1, [0.2], trust_tier=TrustTier.A, status=Status.VALIDATED)
     written_ids = [call["points"][0]["id"] for call in fake.upsert_calls]
     assert written_ids[0] != written_ids[1]
-
-
-def test_qdrant_delete_by_project_sends_a_filter_selector_scoped_to_the_project() -> None:
-    fake = _FakeQdrantClient()
-    store = QdrantVectorStore(client=fake)
-
-    store.delete_by_project(PROJECT_A)
-
-    assert fake.delete_calls[0]["points_selector"] == {
-        "filter": {"must": [{"key": "project_id", "match": {"value": str(PROJECT_A.value)}}]}
-    }
 
 
 def test_qdrant_upsert_rejects_empty_embedding() -> None:
@@ -686,7 +677,9 @@ def test_qdrant_concurrent_searches_never_cross_projects() -> None:
             with lock:
                 failures.append(exc)
 
-    threads = [threading.Thread(target=worker, args=(i,), name=f"qdrant-{i}") for i in range(_THREADS)]
+    threads = [
+        threading.Thread(target=worker, args=(i,), name=f"qdrant-{i}") for i in range(_THREADS)
+    ]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -746,12 +739,12 @@ def test_qdrant_concurrent_upserts_keep_their_own_project_stamp() -> None:
 
 
 @pytest.mark.integration
-def test_pgvector_ann_search_and_delete_by_project_against_a_real_database(pg: str) -> None:
-    """`PgVectorStore` end to end through the real `SearchStore` and `drop_project` it wraps —
-    proves the delegation proven offline above is not merely a shape match. Skips (does not
-    error) exactly like `tests/phase1/test_search_sql.py`'s own integration test whenever the
-    reachable Postgres lacks `pgvector`/`pg_textsearch`, per this repository's environment
-    constraint (no Docker/Postgres on this build machine)."""
+def test_pgvector_ann_search_against_a_real_database(pg: str) -> None:
+    """`PgVectorStore` reads end to end through the real `SearchStore`.
+
+    Project destruction belongs to the separate E3 SECDEF executor, so this
+    ordinary vector-driver test intentionally proves no delete path.
+    """
     import psycopg
 
     from tracebed.core.scans import ScanContext, scan
@@ -845,16 +838,5 @@ def test_pgvector_ann_search_and_delete_by_project_against_a_real_database(pg: s
         )
         assert {hit.memory_id for hit in hits} == {memory_id}
 
-        from tracebed.stores.pg.partitions import partition_name
-
-        store.delete_by_project(project_id)
-        with pool.connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT to_regclass(%s) IS NOT NULL",
-                (partition_name("memory_item", project_id),),
-            )
-            row = cur.fetchone()
-            assert row is not None
-            assert row[0] is False, "memory_item partition should be gone after delete_by_project"
     finally:
         pool.close()

@@ -11,7 +11,7 @@ This drill walks nine hops end to end and asserts each one with the PRODUCTION f
 a reimplementation:
 
   1. TRACE INGESTED      `ingest.trace_writer.TraceWriter.run_once`
-  2. TIER A EXTRACTED    `workers.tier_a_lane.TierALane.run_batch` (real extractors)
+  2. TIER A PLANNED      `workers.tier_a_lane.TierALane.plan` (real extractors)
   3. EMBEDDED            `workers.embedder.Embedder.run`
   4. CORROBORATED        `workers.corroboration.CorroborationWriter.run_once`
   5. SHADOW-VALIDATED    `workers.shadow_validator.ShadowValidator.run_once`
@@ -236,7 +236,7 @@ class _Row:
 class _Vault:
     """An in-memory `memory_item` table that structurally satisfies, all at once:
 
-      * `workers.extractors.base.MemoryWriterPort`
+      * this harness's local Tier-A plan persistence simulation
       * `workers.embedder.EmbeddingRepoPort`
       * `workers.corroboration.CorroborationRepoPort`
       * `workers.shadow_validator.ShadowValidatorRepoPort`
@@ -261,7 +261,7 @@ class _Vault:
         self.status_writes: list[tuple[MemoryId, Status, Status]] = []
         self.q_updates: list[QUpdate] = []
 
-    # -- MemoryWriterPort ---------------------------------------------------
+    # -- local Tier-A plan persistence simulation ---------------------------
     def insert_memory_item(
         self, project_id: ProjectId, item: NewMemoryItem, scan_verdict: ScanVerdict
     ) -> MemoryId:
@@ -757,17 +757,29 @@ def run_closed_loop() -> ClosedLoopReport:
         )
     )
 
-    # ---- HOP 2: an extractor emits a Tier A candidate ----------------------
+    # ---- HOP 2: pure extractors plan, harness simulates persistence --------
     parsed = _parse_events(events)
-    lane = TierALane(cfg=cfg, clock=clock, writer=vault)
-    lane_result = lane.run_batch(scope, {run_a: parsed})
-    tier_a_ids = [o.memory_id for o in lane_result.inserted if o.memory_id is not None]
+    lane = TierALane(cfg=cfg, clock=clock)
+    lane_plan = lane.plan(scope, {run_a: parsed})
+    # This is intentionally NOT the P2B fenced finalizer: the closed-loop
+    # drill has no trace-learning job/lease/archive double. It only keeps the
+    # legacy later-hop demonstration alive by simulating insertion into its
+    # explicitly in-memory vault. The production finalizer owns durable Tier-A
+    # writes and must be exercised by the P2A E2E tests instead.
+    tier_a_ids = [
+        vault.insert_memory_item(
+            project_id,
+            candidate.item,
+            candidate.scan_result.verdict(clock=clock),
+        )
+        for candidate in lane_plan.candidates
+    ]
     tier_a_id = tier_a_ids[0] if tier_a_ids else None
     hops.append(
         Hop(
             2,
-            "extractor emits a Tier A candidate",
-            "workers.tier_a_lane.TierALane.run_batch (real extractors)",
+            "extractor plans a Tier A candidate",
+            "workers.tier_a_lane.TierALane.plan + harness-local persistence simulation",
             checks={
                 "an extractor emitted a note from the seeded failure trace": tier_a_id
                 is not None,
@@ -777,13 +789,13 @@ def run_closed_loop() -> ClosedLoopReport:
                 is not None and vault.rows[tier_a_id].trust_tier is TrustTier.A,
             },
             detail=(
-                f"{len(lane_result.inserted)} note(s) inserted; first enters as "
+                f"{len(tier_a_ids)} note(s) inserted by the harness simulation; first enters as "
                 f"{vault.rows[tier_a_id].status.value}/tier "
                 f"{vault.rows[tier_a_id].trust_tier.value}"
                 if tier_a_id is not None
                 else "no Tier A note was emitted from the seeded failure trace"
             ),
-            proven_against="real in-memory memory_item vault",
+            proven_against="real pure TierALane plus explicit in-memory persistence simulation",
         )
     )
 

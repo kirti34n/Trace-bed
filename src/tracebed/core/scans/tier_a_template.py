@@ -42,6 +42,7 @@ __all__ = [
     "HexDigest",
     "TierANote",
     "ToolIdentifier",
+    "parse_note",
     "render_note",
 ]
 
@@ -85,11 +86,11 @@ class ErrorClassEnum(StrEnum):
 # registry/manifest rather than from an error body. The charset's real job is
 # narrower and it does do it: no whitespace, no newline, no quote, no angle
 # bracket — a note can never carry a verbatim run of tool-output text.
-_IDENTIFIER_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_IDENTIFIER_RE: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9_.:-]{1,128}\Z")
 
 # payload_class_hash is a sha256 hex digest of the payload's *schema class*
 # (never its content) — lowercase hex, fixed digest length.
-_HEX_DIGEST_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
+_HEX_DIGEST_RE: Final[re.Pattern[str]] = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +161,57 @@ if set(_ERROR_CLASS_CODE) != set(ErrorClassEnum):  # exhaustiveness, checked at 
 # text. Every substitution slot is bound to a validated, closed-vocabulary
 # field; there is no format-string interpolation of anything else.
 _TEMPLATE: Final[str] = "TAN1|ec={error_class}|ti={tool_id}|tv={tool_version}|n={count}|dur={duration_ms}|pch={payload_class_hash}"
+
+_ERROR_CLASS_BY_CODE: Final[dict[str, ErrorClassEnum]] = {
+    code: error_class for error_class, code in _ERROR_CLASS_CODE.items()
+}
+if len(_ERROR_CLASS_BY_CODE) != len(_ERROR_CLASS_CODE):
+    raise RuntimeError("_ERROR_CLASS_CODE has duplicate values")
+
+_CANONICAL_NONNEGATIVE_INT_RE: Final[re.Pattern[str]] = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+
+
+def parse_note(content: str) -> TierANote:
+    """Parse exactly one canonical ``render_note`` result.
+
+    The finalizer receives untrusted prepared items rather than a ``TierANote``
+    object, so it must reverse the renderer before trusting a claimed tool
+    identity.  Splitting by field labels alone would make the closed template
+    a free-text channel.  This parser accepts only a note which round-trips
+    byte-for-byte through ``render_note``.
+    """
+    parts = content.split("|")
+    labels = ("ec", "ti", "tv", "n", "dur", "pch")
+    if len(parts) != len(labels) + 1 or parts[0] != "TAN1":
+        raise ValueError("Tier-A note does not use the TAN1 template")
+    values: dict[str, str] = {}
+    for raw, label in zip(parts[1:], labels, strict=True):
+        prefix = f"{label}="
+        if not raw.startswith(prefix):
+            raise ValueError("Tier-A note has malformed TAN1 fields")
+        values[label] = raw.removeprefix(prefix)
+
+    try:
+        error_class = _ERROR_CLASS_BY_CODE[values["ec"]]
+    except KeyError as exc:
+        raise ValueError("Tier-A note has an unknown error-class code") from exc
+    for label in ("n", "dur"):
+        if _CANONICAL_NONNEGATIVE_INT_RE.fullmatch(values[label]) is None:
+            raise ValueError("Tier-A note has a non-canonical non-negative integer")
+    try:
+        note = TierANote(
+            error_class=error_class,
+            tool_id=ToolIdentifier(values["ti"]),
+            tool_version=ToolIdentifier(values["tv"]),
+            count=int(values["n"]),
+            duration_ms=int(values["dur"]),
+            payload_class_hash=HexDigest(values["pch"]),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Tier-A note has invalid canonical fields") from exc
+    if render_note(note) != content:
+        raise ValueError("Tier-A note is not a canonical rendering")
+    return note
 
 
 def render_note(note: TierANote) -> str:

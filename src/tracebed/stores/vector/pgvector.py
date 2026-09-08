@@ -5,10 +5,10 @@ A thin adapter over what `stores.pg` already does, never a parallel implementati
   * `ann_search` is a straight passthrough to `stores.pg.search.SearchStore.vector_arm` — same
     parameters, same return type (`ArmHit`), same retrievability guarantees. There is no
     branch here that could disagree with `SearchStore` about which rows are retrievable.
-  * `delete_by_project` is a straight passthrough to `stores.pg.partitions.drop_project` — the
-    ONE existing mechanism this codebase has for erasing a project's `memory_item` rows (and
-    therefore their embeddings). See the method's own docstring for why this is the faithful
-    mapping rather than a narrower one this module would have to invent.
+  * destructive erasure is intentionally *not* delegated here.  `memory_item`
+    is primary data, not an independent vector index; E3's separately
+    credentialed PostgreSQL routine owns its deletion and project partition
+    DDL.  This hot-path adapter cannot erase a project.
 
 `pgvector.py` sits OUTSIDE `stores/pg/`, so `scripts/raw_sql_lint.py` fails it on sight if it
 executes SQL directly — every read/delete here is a call into the one place SQL is allowed to
@@ -35,7 +35,7 @@ from tracebed.domain.enums import TrustTier
 from tracebed.domain.errors import TracebedError
 from tracebed.domain.ids import MemoryId, ProjectId
 from tracebed.domain.state_machine import Status
-from tracebed.stores.pg.partitions import drop_project
+from tracebed.stores.pg.pool import RemainingBudget
 from tracebed.stores.pg.search import ArmHit, SearchStore
 
 __all__ = ["PgVectorStore", "VectorStoreWriteUnavailable"]
@@ -51,11 +51,9 @@ class PgVectorStore:
     port structurally; construct with the same `SearchStore`/`ConnectionPool` the rest of the
     read/admin paths already use — this driver introduces no connection of its own.
 
-    `delete_by_project` runs DDL, so the pool it is given must be one whose role may
-    DETACH/DROP (contract §5.5) — the same requirement `api.main._PoolPartitionsAdapter`
-    already carries for `create_project_partitions`, and the same pattern
-    (`pool.connection()`, not `scoped()`, since DDL does not run under the RLS app role).
-    Reads (`ann_search`) go through `SearchStore`, which opens its own `scoped()` transaction.
+    Reads (`ann_search`) go through `SearchStore`, which opens its own scoped
+    transaction.  Project deletion is unavailable through this adapter; use
+    the E3 executor's dedicated destructive-store port instead.
     """
 
     def __init__(self, search: SearchStore, pool: ConnectionPool) -> None:
@@ -71,6 +69,7 @@ class PgVectorStore:
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
         statement_timeout_ms: int | None = None,
+        deadline: RemainingBudget | None = None,
     ) -> list[ArmHit]:
         return self._search.vector_arm(
             project_id,
@@ -79,6 +78,7 @@ class PgVectorStore:
             hnsw_iterative_scan=hnsw_iterative_scan,
             hnsw_max_scan_tuples=hnsw_max_scan_tuples,
             statement_timeout_ms=statement_timeout_ms,
+            deadline=deadline,
         )
 
     def upsert(
@@ -105,18 +105,3 @@ class PgVectorStore:
             "stores/vector/pgvector.py module docstring) -- a future chunk must add one to "
             "stores/pg/ before this driver can serve writes"
         )
-
-    def delete_by_project(self, project_id: ProjectId) -> None:
-        """`memory_item.embedding` has no independent lifecycle from the rest of that row —
-        the row IS the vector's storage, and `memory_item` is one of the 13 tables
-        `stores.pg.partitions.drop_project` already DETACHes+DROPs atomically for exactly
-        this project. A narrower op (an `UPDATE ... SET embedding = NULL`) would be a second,
-        untested path to the same end state and exactly the drift PLAN.md §7 warns against;
-        this driver's only faithful choice is the one deletion mechanism that already exists.
-
-        Consequence, stated rather than hidden: calling this through `PgVectorStore` erases
-        the WHOLE project (every partitioned table), not only its vectors — a pure vector
-        index has no narrower boundary to draw when its vectors live inside the primary store.
-        """
-        with self._pool.connection() as conn:
-            drop_project(conn, project_id)

@@ -5,35 +5,58 @@
 # every gate. Hard rule 9's three named AGPL hazards (pg_search, MinIO, Redis) are all
 # infrastructure, i.e. exactly the category the Python audit cannot reach.
 #
-# Rule: every `image:` in `docker/compose.yaml` and `.github/workflows/ci.yml` must appear here.
-# `scripts/image_check.py` fails the build otherwise. A floating tag (`latest`, or any tag ending
-# in `-latest`) must additionally set `floating_tag = true` — the check does not forbid one, it
-# forbids an UNDECLARED one, because the risk is being unaware of it rather than having it.
+# Rule: every `image:` in `docker/compose.yaml` and `.github/workflows/ci.yml`, and every
+# external Dockerfile `FROM`, must appear here with a digest. `scripts/image_check.py` fails the
+# build otherwise. Images are pinned to digests verified from Docker metadata on 2026-08-21.
 
 [[image]]
 repository = "tensorchord/vchord-suite"
-tag = "pg18-latest"
-floating_tag = true
+tag = "sha256:c6e5e77a1180199f91b040b6e85c6d10b0ded6d49fb614dfd2e7272ffb91af08"
+floating_tag = false
 licence = "Apache-2.0 (VectorChord); PostgreSQL License (server)"
 purpose = "Postgres 18 + pgvector/VectorChord + vchord_bm25/pg_tokenizer — the store, dev and CI"
-note = """Named in no PLAN.md or DECISIONS.md entry before D-109, on a floating tag. The tag is
-accepted for now because pinning by digest needs network access the build machine does not have,
-and a wrong digest fails CI in a way that reads as a code failure. Owner action: pin a digest
-from a machine with registry access, then set floating_tag = false."""
+note = "Compose and CI use the locally verified digest."
 
 [[image]]
 repository = "valkey/valkey"
-tag = "8-alpine"
+tag = "sha256:a038175878d66b9d274fbf8be73c0305e93798b83917647f167e18cef3c71eec"
+tags = ["sha256:a038175878d66b9d274fbf8be73c0305e93798b83917647f167e18cef3c71eec", "8-alpine"]
 floating_tag = false
 licence = "BSD-3-Clause"
 purpose = "Working memory and tool cache. Valkey, not Redis — D-005's denylist covers RSAL."
 
 [[image]]
 repository = "chrislusf/seaweedfs"
-tag = "latest"
-floating_tag = true
+tag = "sha256:52194fba4fecd0083c842158b3a902ba6e04a63619b2b0efcd08007bdb6a4602"
+floating_tag = false
 licence = "Apache-2.0"
 purpose = "S3-compatible trace archive (D-006: SeaweedFS, not MinIO)"
-note = """`latest` on an object store that holds encrypted trace payloads is the worst floating
-tag in this file: an unattended pull can change the storage engine under a live archive. Same
-owner action as above, and it should be done first."""
+note = "Digest was verified from local Docker metadata; operators must review and update it deliberately."
+
+[[image]]
+repository = "python"
+tag = "sha256:83ff1d245a3d57d04152252d3ef9cb361494d0b3395abd65a5ebe91c401c8e83"
+floating_tag = false
+licence = "PSF-2.0"
+purpose = "Pinned build-only CPython 3.14 base for the installed Tracebed wheel; no build-stage packages cross into the runtime image."
+
+[[image]]
+repository = "cgr.dev/chainguard/python"
+tag = "sha256:ee37f5e4fb445732409626797dccb6f2a6337872def2bab48729ee61b335fa77"
+floating_tag = false
+licence = "Apache-2.0"
+purpose = "Pinned nonroot minimal CPython 3.14 runtime selected after a real active-DB Grype scan found high/critical Debian packages in the former full slim runtime."
+
+[[image]]
+repository = "node"
+tag = "sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32"
+floating_tag = false
+licence = "MIT"
+purpose = "Pinned dashboard build stage."
+
+[[image]]
+repository = "nginx"
+tag = "sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10"
+floating_tag = false
+licence = "BSD-2-Clause"
+purpose = "Pinned static dashboard runtime."

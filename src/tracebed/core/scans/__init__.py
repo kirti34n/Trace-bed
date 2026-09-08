@@ -40,6 +40,7 @@ __all__ = [
     "ScanContext",
     "ScanResult",
     "persist_rejection",
+    "rejection_reason_codes",
     "scan",
     "verify_verdict",
 ]
@@ -133,6 +134,28 @@ def _dedupe(reasons: list[str]) -> tuple[str, ...]:
             seen.add(reason)
             out.append(reason)
     return tuple(out)
+
+
+def rejection_reason_codes() -> frozenset[str]:
+    """The closed, non-sensitive vocabulary a scan rejection may persist.
+
+    The finalizer receives a plaintext-free summary rather than the candidate
+    text, so it cannot safely re-run the scan to decide whether arbitrary text
+    belongs in ``review_queue.reason``.  Exporting the scanner's own rule IDs
+    keeps that downstream validation closed while avoiding a second hand-kept
+    list that could drift as a rule is added or removed.
+    """
+    pattern_rules = _patterns._STRONG_RULES + _patterns._WEAK_RULES
+    return frozenset(
+        {
+            *(f"injection:{rule.id}" for rule in pattern_rules),
+            *(f"secret:{rule.id}" for rule in _secrets._RULES),
+            "secret:high-entropy-token",
+            "schema:empty_content",
+            "schema:control_characters",
+            *( _schema_check.oversize_reason(mem_type) for mem_type in MemType ),
+        }
+    )
 
 
 def scan(content: str, *, context: ScanContext) -> ScanResult:

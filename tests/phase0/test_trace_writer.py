@@ -27,12 +27,12 @@ from __future__ import annotations
 import inspect
 import json
 import os
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -57,6 +57,7 @@ from tracebed.ingest.trace_writer import (
 from tracebed.stores.pg.queue import TOPIC_TRACE_EVENT, QueueItem
 from tracebed.stores.pg.rows import SubjectKeyRow, TraceIndexRow, TraceIndexUpsert
 from tracebed.stores.tracestore import PayloadRef
+from tracebed.workers.trace_learning import TIER_A_PIPELINE, TIER_A_PIPELINE_VERSION
 
 pytestmark = pytest.mark.phase0
 
@@ -99,9 +100,7 @@ class FakeQueue:
         row_id = self._next_id
         self._next_id += 1
         scoped = (
-            project_id
-            if project_id is not None
-            else ProjectId(UUID(str(payload["project_id"])))
+            project_id if project_id is not None else ProjectId(UUID(str(payload["project_id"])))
         )
         self._rows[row_id] = _QueueRow(
             id=row_id, topic=topic, project_id=scoped, payload=dict(payload)
@@ -180,6 +179,7 @@ class FakeSubjectKeyStore:
     def __init__(self, clock: Clock) -> None:
         self._clock = clock
         self._rows: dict[tuple[ProjectId, str], SubjectKeyRow] = {}
+        self._digest_rows: dict[tuple[ProjectId, bytes], SubjectKeyRow] = {}
 
     def get_subject_key(self, project_id: ProjectId, subject_tag: str) -> SubjectKeyRow | None:
         return self._rows.get((project_id, subject_tag))
@@ -195,14 +195,35 @@ class FakeSubjectKeyStore:
             destroyed_at=None,
         )
 
-    def destroy_subject_key(self, project_id: ProjectId, subject_tag: str) -> bool:
-        row = self._rows.get((project_id, subject_tag))
-        if row is None:
-            return False
-        self._rows[(project_id, subject_tag)] = replace(
-            row, wrapped_kek=b"", destroyed_at=self._clock.now()
+    def get_subject_key_by_digest(
+        self, project_id: ProjectId, subject_digest: bytes
+    ) -> SubjectKeyRow | None:
+        direct = self._digest_rows.get((project_id, subject_digest))
+        if direct is not None:
+            return direct
+        return next(
+            (
+                row
+                for (row_project_id, _tag), row in self._rows.items()
+                if row_project_id == project_id
+                and row.subject_digest is not None
+                and row.subject_digest == subject_digest
+            ),
+            None,
         )
-        return True
+
+    def insert_subject_key_v2(
+        self, project_id: ProjectId, subject_digest: bytes, key_id: UUID, wrapped_kek: bytes
+    ) -> None:
+        self._digest_rows[(project_id, subject_digest)] = SubjectKeyRow(
+            subject_tag=None,
+            subject_digest=subject_digest,
+            wrap_version=2,
+            key_id=key_id,
+            wrapped_kek=wrapped_kek,
+            created_at=self._clock.now(),
+            destroyed_at=None,
+        )
 
 
 class FakeMasterKeyProvider:
@@ -226,6 +247,9 @@ class FakeTraceRepo:
     def __init__(self) -> None:
         self.trace_index: dict[tuple[ProjectId, RunId], TraceIndexRow] = {}
         self.trace_subjects: dict[tuple[ProjectId, RunId], set[str]] = {}
+        self.trace_learning_jobs: set[tuple[ProjectId, RunId, str, int]] = set()
+        self.schedule_calls: list[tuple[ProjectId, RunId, str, int, int]] = []
+        self.fail_schedule = False
         self.projects: list[ProjectId] = []
         self.get_trace_index_for_update_flags: list[bool] = []
         """Every `for_update` value `_FakeScopedTraceRepo.get_trace_index` was called with —
@@ -255,7 +279,21 @@ class FakeTraceRepo:
 
     @contextmanager
     def tx(self, project_id: ProjectId) -> Iterator[_FakeScopedTraceRepo]:
-        yield _FakeScopedTraceRepo(self, project_id)
+        # The writer's schedule is deliberately inside the same PG
+        # transaction as index/subject writes.  Model rollback here too, so a
+        # fake cannot turn a failed outbox insert into a false green test.
+        prior_index = dict(self.trace_index)
+        prior_subjects = {key: set(tags) for key, tags in self.trace_subjects.items()}
+        prior_jobs = set(self.trace_learning_jobs)
+        prior_schedule_calls = list(self.schedule_calls)
+        try:
+            yield _FakeScopedTraceRepo(self, project_id)
+        except Exception:
+            self.trace_index = prior_index
+            self.trace_subjects = prior_subjects
+            self.trace_learning_jobs = prior_jobs
+            self.schedule_calls = prior_schedule_calls
+            raise
 
 
 class _FakeScopedTraceRepo:
@@ -309,21 +347,53 @@ class _FakeScopedTraceRepo:
             # otherwise reports the same non-holdout default the real COALESCE falls back to.
             arm=existing.arm if existing else Arm.MEMORY_ON,
             path=row.path if row.path is not None else (existing.path if existing else None),
-            started_at=(existing.started_at if existing and existing.started_at else row.started_at),
+            started_at=(
+                existing.started_at if existing and existing.started_at else row.started_at
+            ),
             ended_at=row.ended_at
             if row.ended_at is not None
             else (existing.ended_at if existing else None),
-            payload_ref=(existing.payload_ref if existing and existing.payload_ref else row.payload_ref),
+            payload_ref=(
+                existing.payload_ref if existing and existing.payload_ref else row.payload_ref
+            ),
             outcome_status=(
                 existing.outcome_status
                 if row.outcome_status == TraceOutcomeStatus.PENDING and existing is not None
                 else row.outcome_status
             ),
+            envelope_versions=tuple(
+                sorted(
+                    set(
+                        (
+                            existing.envelope_versions
+                            if existing and existing.envelope_versions
+                            else ()
+                        )
+                        + row.envelope_versions
+                    )
+                )
+            ),
         )
         self._repo.trace_index[key] = merged
 
-    def append_trace_subject(self, run_id: RunId, subject_tags: Sequence[str]) -> None:
-        self._repo.trace_subjects.setdefault((self._project_id, run_id), set()).update(subject_tags)
+    def schedule_trace_learning_job(
+        self,
+        run_id: RunId,
+        *,
+        pipeline: str,
+        pipeline_version: int,
+        max_attempts: int,
+    ) -> bool:
+        if self._repo.fail_schedule:
+            raise RuntimeError("outbox unavailable")
+        self._repo.schedule_calls.append(
+            (self._project_id, run_id, pipeline, pipeline_version, max_attempts)
+        )
+        identity = (self._project_id, run_id, pipeline, pipeline_version)
+        if identity in self._repo.trace_learning_jobs:
+            return False
+        self._repo.trace_learning_jobs.add(identity)
+        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -477,9 +547,20 @@ def test_full_run_produces_complete_queryable_trace(settings: TracebedSettings) 
     assert row.input_signature_hash != ABSENT_SIGNATURE
     assert len(row.input_signature_hash) == 40
     assert row.payload_ref is not None
+    assert h.repo.schedule_calls == [
+        (
+            project_id,
+            run_id,
+            TIER_A_PIPELINE,
+            TIER_A_PIPELINE_VERSION,
+            h.settings.queue.max_attempts,
+        )
+    ]
 
-    # trace_subject: the one state_note's tag landed, and only that one.
-    assert h.repo.trace_subjects[(project_id, run_id)] == {"user:alice"}
+    # E2 binds trace attribution at authorized queue admission. The writer
+    # must not re-persist a raw tag while emitting its digest-only v2 archive.
+    assert (project_id, run_id) not in h.repo.trace_subjects
+    assert row.envelope_versions == (2,)
 
     # The payload is actually stored and decrypts back to the 5 events.
     assert len(h.store.put_calls) == 1
@@ -565,7 +646,8 @@ def test_duplicate_seq_replay_causes_no_duplication(settings: TracebedSettings) 
     # No second object written, no state mutated by the replay.
     assert len(h.store.put_calls) == 1
     assert h.repo.trace_index[(project_id, run_id)] == row_after_first
-    assert h.repo.trace_subjects[(project_id, run_id)] == {"user:alice"}
+    assert (project_id, run_id) not in h.repo.trace_subjects
+    assert len(h.repo.schedule_calls) == 1
 
 
 def test_missing_sentinel_swept_to_incomplete_after_2x_idle_ttl(
@@ -683,6 +765,122 @@ def test_late_batch_filling_the_gap_promotes_run_out_of_incomplete(
     assert row.outcome_status == TraceOutcomeStatus.OK
     # ended_at was recorded when the sentinel landed and survived the later batch.
     assert row.ended_at == ts0 + timedelta(seconds=3)
+    assert h.repo.schedule_calls == [
+        (
+            project_id,
+            run_id,
+            TIER_A_PIPELINE,
+            TIER_A_PIPELINE_VERSION,
+            h.settings.queue.max_attempts,
+        )
+    ]
+
+
+@pytest.mark.parametrize("non_end_first", [True, False])
+def test_run_end_wins_over_a_same_seq_non_end_in_either_delivery_order(
+    settings: TracebedSettings, non_end_first: bool
+) -> None:
+    """Discover sentinels before first-seq-wins dedup.
+
+    A non-end at the sentinel's seq must never shadow the unique valid
+    run_end merely because it arrived first in the queue batch.
+    """
+    h = _harness(settings)
+    project_id = ProjectId(uuid7())
+    principal_id = PrincipalId(uuid7())
+    agent_type_id = AgentTypeId(uuid7())
+    run_id = RunId(uuid7())
+    ts0 = h.clock.now()
+    non_end = (2, _event("tool_result", ts0 + timedelta(seconds=2), {"ok": True}))
+    end = (2, _event("run_end", ts0 + timedelta(seconds=2), {"status": "ok"}))
+    same_seq = [non_end, end] if non_end_first else [end, non_end]
+    item_ids = _enqueue_run(
+        h,
+        project_id=project_id,
+        principal_id=principal_id,
+        agent_type_id=agent_type_id,
+        run_id=run_id,
+        events=[
+            (0, _event("run_start", ts0, {"query_text": "q"})),
+            (1, _event("tool_call", ts0 + timedelta(seconds=1), {})),
+            *same_seq,
+        ],
+    )
+
+    assert h.writer.run_once() == 3
+    row = h.repo.trace_index[(project_id, run_id)]
+    assert row.outcome_status == TraceOutcomeStatus.OK
+    assert h.repo.schedule_calls and len(h.repo.schedule_calls) == 1
+    assert len(h.queue.acked) == 3
+    assert [item_id for item_id, _delay in h.queue.nacked] == [item_ids[2 if non_end_first else 3]]
+
+
+def test_conflicting_same_seq_run_end_statuses_never_choose_an_arbitrary_sentinel(
+    settings: TracebedSettings,
+) -> None:
+    h = _harness(settings)
+    project_id = ProjectId(uuid7())
+    principal_id = PrincipalId(uuid7())
+    agent_type_id = AgentTypeId(uuid7())
+    run_id = RunId(uuid7())
+    ts0 = h.clock.now()
+    ids = _enqueue_run(
+        h,
+        project_id=project_id,
+        principal_id=principal_id,
+        agent_type_id=agent_type_id,
+        run_id=run_id,
+        events=[
+            (0, _event("run_start", ts0, {"query_text": "q"})),
+            (1, _event("tool_call", ts0 + timedelta(seconds=1), {})),
+            (2, _event("run_end", ts0 + timedelta(seconds=2), {"status": "ok"})),
+            (2, _event("run_end", ts0 + timedelta(seconds=2), {"status": "error"})),
+        ],
+    )
+
+    assert h.writer.run_once() == 2
+    row = h.repo.trace_index[(project_id, run_id)]
+    assert row.outcome_status == TraceOutcomeStatus.PENDING
+    assert h.repo.schedule_calls == []
+    assert sorted(item_id for item_id, _delay in h.queue.nacked) == sorted(ids[-2:])
+
+
+@pytest.mark.parametrize(
+    "other_end",
+    [
+        lambda ts: _event("run_end", ts + timedelta(seconds=3), {"status": "ok"}),
+        lambda ts: _event("run_end", ts + timedelta(seconds=2), {"status": "ok", "note": "x"}),
+    ],
+    ids=["different-timestamp", "different-payload"],
+)
+def test_same_seq_same_status_but_different_sentinels_are_refused(
+    settings: TracebedSettings,
+    other_end: Callable[[datetime], dict[str, object]],
+) -> None:
+    h = _harness(settings)
+    project_id = ProjectId(uuid7())
+    principal_id = PrincipalId(uuid7())
+    agent_type_id = AgentTypeId(uuid7())
+    run_id = RunId(uuid7())
+    ts0 = h.clock.now()
+    ids = _enqueue_run(
+        h,
+        project_id=project_id,
+        principal_id=principal_id,
+        agent_type_id=agent_type_id,
+        run_id=run_id,
+        events=[
+            (0, _event("run_start", ts0, {"query_text": "q"})),
+            (1, _event("tool_call", ts0 + timedelta(seconds=1), {})),
+            (2, _event("run_end", ts0 + timedelta(seconds=2), {"status": "ok"})),
+            (2, other_end(ts0)),
+        ],
+    )
+
+    assert h.writer.run_once() == 2
+    assert h.repo.trace_index[(project_id, run_id)].outcome_status == TraceOutcomeStatus.PENDING
+    assert h.repo.schedule_calls == []
+    assert sorted(item_id for item_id, _delay in h.queue.nacked) == sorted(ids[-2:])
 
 
 def test_input_signature_hash_stable_across_event_reordering(
@@ -1203,6 +1401,33 @@ def test_run_start_with_type_confused_signature_inputs_is_refused(
     assert sorted(i for i, _b in h.queue.nacked) == sorted(bad_ids)
 
 
+def test_terminal_schedule_failure_rolls_back_index_subjects_and_job_then_nacks(
+    settings: TracebedSettings,
+) -> None:
+    h = _harness(settings)
+    h.repo.fail_schedule = True
+    project_id = ProjectId(uuid7())
+    run_id = RunId(uuid7())
+    ids = _enqueue_run(
+        h,
+        project_id=project_id,
+        principal_id=PrincipalId(uuid7()),
+        agent_type_id=AgentTypeId(uuid7()),
+        run_id=run_id,
+        events=_full_run_events(h.clock.now()),
+    )
+
+    assert h.writer.run_once() == 0
+    assert (project_id, run_id) not in h.repo.trace_index
+    assert (project_id, run_id) not in h.repo.trace_subjects
+    assert h.repo.trace_learning_jobs == set()
+    assert h.repo.schedule_calls == []
+    assert sorted(item_id for item_id, _delay in h.queue.nacked) == sorted(ids)
+    # Object-store-first can leave an encrypted orphan; it must contain no
+    # committed index pointer when the relational transaction aborts.
+    assert len(h.store.put_calls) == 1
+
+
 def test_one_bad_run_does_not_block_another_runs_events(settings: TracebedSettings) -> None:
     """Groups are isolated: a run whose write raises must not take the rest of
     the claimed batch down with it."""
@@ -1233,14 +1458,12 @@ def test_one_bad_run_does_not_block_another_runs_events(settings: TracebedSettin
 
     real_put = h.store.put
 
-    def exploding_put(
-        project: ProjectId, run: RunId, first_seq: int, payload: bytes
-    ) -> PayloadRef:
+    def exploding_put(project: ProjectId, run: RunId, first_seq: int, payload: bytes) -> PayloadRef:
         if run == bad_run:
             raise OSError("trace store unavailable")
         return real_put(project, run, first_seq, payload)
 
-    h.store.put = exploding_put  # type: ignore[method-assign]
+    h.store.put = exploding_put  # type: ignore[assignment]
 
     processed = h.writer.run_once()
 
@@ -1273,6 +1496,7 @@ def test_real_repo_satisfies_the_ports_trace_writer_declares() -> None:
         ended_at=None,
         payload_ref=None,
         outcome_status=TraceOutcomeStatus.PENDING,
+        envelope_versions=(1,),
     )
 
     inspect.signature(Repo.tx).bind(self_, project_id)
@@ -1286,7 +1510,73 @@ def test_real_repo_satisfies_the_ports_trace_writer_declares() -> None:
     # first real trace while every fake-backed test above stayed green.
     inspect.signature(ScopedRepo.get_trace_index).bind(self_, run_id, for_update=True)
     inspect.signature(ScopedRepo.upsert_trace_index).bind(self_, row)
-    inspect.signature(ScopedRepo.append_trace_subject).bind(self_, run_id, ["user:alice"])
+    inspect.signature(ScopedRepo.schedule_trace_learning_job).bind(
+        self_,
+        run_id,
+        pipeline=TIER_A_PIPELINE,
+        pipeline_version=TIER_A_PIPELINE_VERSION,
+        max_attempts=5,
+    )
+
+
+def test_scoped_schedule_conflict_requires_an_exact_existing_terminal_binding() -> None:
+    """A same four-key backfill/nonterminal row is not an idempotent live write.
+
+    The writer deliberately ignores only an exact duplicate's ``False``.
+    Every other conflict must raise inside the trace transaction so the new
+    terminal index/subjects roll back rather than pointing at the wrong job.
+    """
+    from tracebed.stores.pg.repo import Repo
+
+    class _Result:
+        def __init__(self, row: object) -> None:
+            self._row = row
+
+        def fetchone(self) -> object:
+            return self._row
+
+    class _Connection:
+        def __init__(self, rows: list[object]) -> None:
+            self.rows = rows
+            self.statements: list[tuple[str, object]] = []
+
+        def execute(self, sql: str, params: object = None) -> _Result:
+            self.statements.append((sql, params))
+            return _Result(self.rows.pop(0))
+
+    project_id = ProjectId(uuid7())
+    run_id = RunId(uuid7())
+    ended_at = datetime(2026, 1, 1, tzinfo=UTC)
+    exact = _Connection([None, (ended_at, "live", 5, ended_at)])
+    result = Repo._impl_schedule_trace_learning_job(
+        cast(Repo, object()),
+        cast(Any, exact),
+        project_id,
+        run_id,
+        pipeline=TIER_A_PIPELINE,
+        pipeline_version=TIER_A_PIPELINE_VERSION,
+        max_attempts=5,
+    )
+    assert result is False
+    assert len(exact.statements) == 2
+    assert (
+        "ON CONFLICT (project_id, run_id, pipeline, pipeline_version) DO NOTHING"
+        in (exact.statements[0][0])
+    )
+    assert "FOR UPDATE OF job" in exact.statements[1][0]
+
+    mismatched = _Connection([None, (ended_at, "backfill", 5, ended_at)])
+    with pytest.raises(RuntimeError, match="non-idempotent"):
+        Repo._impl_schedule_trace_learning_job(
+            cast(Repo, object()),
+            cast(Any, mismatched),
+            project_id,
+            run_id,
+            pipeline=TIER_A_PIPELINE,
+            pipeline_version=TIER_A_PIPELINE_VERSION,
+            max_attempts=5,
+        )
+    assert not hasattr(Repo, "schedule_trace_learning_job")
 
 
 def test_the_writer_takes_the_run_lock_before_reading_trace_index(

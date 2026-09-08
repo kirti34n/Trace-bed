@@ -37,6 +37,7 @@ __all__ = [
     "PARTITIONED_TABLES",
     "create_partition_sql",
     "partition_grant_statements",
+    "partition_index_expectations",
     "partition_index_name",
     "partition_index_statements",
     "partition_name",
@@ -44,7 +45,10 @@ __all__ = [
     "partition_rls_statements",
 ]
 
-# The 15 LIST-partitioned learning-plane tables (PLAN.md §5), one place.
+# The 22 project-keyed LIST parents, one place.  ``run_owner`` is an
+# authority registry rather than learning-plane content, but it shares the
+# same project lifecycle: every new active project needs its child and project
+# erasure must detach/drop that child with the rest of its state.
 # Order matters only for readability — none of these tables has a foreign
 # key to another partitioned table, so partition creation order is free.
 PARTITIONED_TABLES: tuple[str, ...] = (
@@ -73,6 +77,23 @@ PARTITIONED_TABLES: tuple[str, ...] = (
     # per-project partition every ledger INSERT fails with "no partition of relation
     # found for row" and takes the scorer's status write down with it.
     "memory_q_update",
+    # 16th, added with migrations/0008_trace_learning_job.sql. This durable
+    # project-scoped lease substrate must be dropped with the project's other
+    # learning-plane state during partition lifecycle operations.
+    "trace_learning_job",
+    # 17th, added with 0010_authority_foundation.sql.  Its child grants are
+    # deliberately narrower and include the new NOLOGIN group roles; no other
+    # historical partition gets group privileges until the 0011 cutover.
+    "run_owner",
+    # E2 fencing foundations share project lifecycle, but runtime roles
+    # receive no direct DML on their ledgers/fences.
+    "subject_fence",
+    "run_fence",
+    "erase_run_set",
+    "erase_mem_set",
+    # Normalized, monotone run-to-memory provenance.  It has no direct
+    # runtime DML grant: E2's profiled bind routine is the only writer.
+    "run_memory_binding",
 )
 
 # Grantee for every per-partition GRANT below. Must match the role created in
@@ -80,6 +101,36 @@ PARTITIONED_TABLES: tuple[str, ...] = (
 # .sql file, there is nothing to import from) rather than left as a bare
 # string at each call site, so a rename is a one-line change.
 _APP_ROLE = "tracebed_app"
+_API_GROUP = "tracebed_api_group"
+_WORKER_GROUP = "tracebed_worker_group"
+_ERASURE_GROUP = "tracebed_erasure_group"
+_API_ROLE = "tracebed_api"
+_WORKER_ROLE = "tracebed_worker"
+
+_CUTOVER_CHILD_GRANTS: dict[str, tuple[str | None, str | None]] = {
+    "memory_item": ("SELECT", "SELECT, INSERT, UPDATE"),
+    "memory_link": ("SELECT", "SELECT"),
+    "derived_state": ("SELECT", "SELECT, INSERT, DELETE"),
+    "trace_index": ("SELECT", "SELECT, INSERT, UPDATE"),
+    "trace_subject": (None, "SELECT, INSERT"),
+    "subject_key": (None, "SELECT, INSERT"),
+    "outcome_event": ("SELECT", "SELECT, INSERT"),
+    "injection_log": ("SELECT, INSERT", "SELECT"),
+    "retrieval_event": ("SELECT, INSERT", "SELECT"),
+    "blackboard_entry": (None, None),
+    "invalidation_event": ("SELECT, INSERT", "SELECT"),
+    "spend_ledger": ("SELECT", "SELECT, INSERT, UPDATE"),
+    "review_queue": ("SELECT", "SELECT, INSERT"),
+    "memory_status_log": (None, "SELECT, INSERT"),
+    "memory_q_update": (None, "SELECT, INSERT"),
+    "trace_learning_job": (None, "SELECT, INSERT, UPDATE"),
+    "run_owner": ("SELECT, INSERT", "SELECT"),
+    "subject_fence": (None, None),
+    "run_fence": (None, None),
+    "erase_run_set": (None, None),
+    "erase_mem_set": (None, None),
+    "run_memory_binding": (None, None),
+}
 
 # PostgreSQL's NAMEDATALEN - 1. Over this the server truncates with a NOTICE.
 _IDENT_MAX = 63
@@ -101,6 +152,18 @@ _TABLE_NAME_MAX = _IDENT_MAX - len("_p_") - 32 - len("_isolation")
 # load-bearing, not defensive noise: see that migration's header comment.
 _ISOLATION_PREDICATE = (
     "project_id = NULLIF(current_setting('tracebed.project_id', true), '')::uuid"
+)
+
+# E2 keeps the established one-policy-per-leaf catalog shape.  At c12 the
+# existing isolation policy gains a read-side project fence, while its explicit
+# WITH CHECK remains the plain project predicate so the BEFORE write guard can
+# return the typed durable refusal for a raw INSERT.  The five owner-only E2
+# ledger/fence families have no runtime SELECT grant and deliberately retain
+# their narrower original policy shape.
+_E2_RUNTIME_READ_GUARDED_TABLES = frozenset(PARTITIONED_TABLES[:17])
+_ERASURE_READ_FENCE_PREDICATE = (
+    f"({_ISOLATION_PREDICATE}) "
+    "AND public.tracebed_runtime_erasure_read_allowed(project_id)"
 )
 
 _UUID_TEXT = re.compile(r"\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
@@ -187,12 +250,14 @@ def create_partition_sql(table: str, project_id: ProjectId) -> str:
     """
     name = partition_name(table, project_id)
     return (
-        f"CREATE TABLE IF NOT EXISTS {name} "
-        f"PARTITION OF {table} FOR VALUES IN ({_bound_literal(project_id)})"
+        f"CREATE TABLE IF NOT EXISTS public.{name} "
+        f"PARTITION OF public.{table} FOR VALUES IN ({_bound_literal(project_id)})"
     )
 
 
-def partition_rls_statements(table: str, project_id: ProjectId) -> list[str]:
+def partition_rls_statements(
+    table: str, project_id: ProjectId, *, erasure_foundation: bool = False
+) -> list[str]:
     """ENABLE + FORCE RLS and the isolation policy on one partition.
 
     migrations/0003_rls.sql sets this up on the *parent* partitioned table.
@@ -207,15 +272,38 @@ def partition_rls_statements(table: str, project_id: ProjectId) -> list[str]:
     """
     name = partition_name(table, project_id)
     policy = partition_policy_name(table, project_id)
+    # E2's owner-only erasure/binding families use an explicit WITH CHECK on the
+    # parent policy. Match that exact c12 catalog shape on late-created
+    # leaves; historical c11 parents intentionally retain their original
+    # USING-only policies, so applying this indiscriminately would fabricate
+    # profile drift for an otherwise valid c11 project.
+    runtime_read_guarded = erasure_foundation and table in _E2_RUNTIME_READ_GUARDED_TABLES
+    predicate = _ERASURE_READ_FENCE_PREDICATE if runtime_read_guarded else _ISOLATION_PREDICATE
+    # c12 makes the ordinary data-table WITH CHECK explicit so raw INSERTs
+    # reach ``tracebed_runtime_erasure_write_guard`` and fail with P0002,
+    # rather than being hidden by the read-side RLS predicate first.
+    with_check = (
+        f" WITH CHECK ({_ISOLATION_PREDICATE})"
+        if runtime_read_guarded
+        or table
+        in {"subject_fence", "run_fence", "erase_run_set", "erase_mem_set", "run_memory_binding"}
+        else ""
+    )
     return [
-        f"ALTER TABLE {name} ENABLE ROW LEVEL SECURITY",
-        f"ALTER TABLE {name} FORCE ROW LEVEL SECURITY",
-        f"DROP POLICY IF EXISTS {policy} ON {name}",
-        f"CREATE POLICY {policy} ON {name} USING ({_ISOLATION_PREDICATE})",
+        f"ALTER TABLE public.{name} ENABLE ROW LEVEL SECURITY",
+        f"ALTER TABLE public.{name} FORCE ROW LEVEL SECURITY",
+        f"DROP POLICY IF EXISTS {policy} ON public.{name}",
+        f"CREATE POLICY {policy} ON public.{name} USING ({predicate}){with_check}",
     ]
 
 
-def partition_grant_statements(table: str, project_id: ProjectId) -> list[str]:
+def partition_grant_statements(
+    table: str,
+    project_id: ProjectId,
+    *,
+    authority_cutover: bool = False,
+    erasure_foundation: bool = False,
+) -> list[str]:
     """DML grants for the app role on one partition.
 
     `migrations/0003_rls.sql`'s `ALTER DEFAULT PRIVILEGES` only covers
@@ -226,7 +314,45 @@ def partition_grant_statements(table: str, project_id: ProjectId) -> list[str]:
     TRUNCATE and no DDL: TRUNCATE has no row-level filter for RLS to apply.
     """
     name = partition_name(table, project_id)
-    return [f"GRANT SELECT, INSERT, UPDATE, DELETE ON {name} TO {_APP_ROLE}"]
+    if not authority_cutover:
+        if table == "run_owner":
+            return [
+                f"REVOKE ALL PRIVILEGES ON public.{name} FROM PUBLIC",
+                "REVOKE ALL PRIVILEGES ON "
+                f"public.{name} FROM {_APP_ROLE}, {_API_GROUP}, {_WORKER_GROUP}, {_ERASURE_GROUP}",
+                f"GRANT SELECT, INSERT ON public.{name} TO {_APP_ROLE}, {_API_GROUP}",
+                f"GRANT SELECT ON public.{name} TO {_WORKER_GROUP}",
+            ]
+        if table in {"trace_index", "trace_learning_job"}:
+            return [
+                f"REVOKE DELETE ON public.{name} FROM {_APP_ROLE}",
+                f"GRANT SELECT, INSERT, UPDATE ON public.{name} TO {_APP_ROLE}",
+            ]
+        return [f"GRANT SELECT, INSERT, UPDATE, DELETE ON public.{name} TO {_APP_ROLE}"]
+
+    api_privileges, worker_privileges = _CUTOVER_CHILD_GRANTS[table]
+    # c12 has profiled admission/binding/key routines.  Late-created leaves
+    # must not quietly restore the raw DML that 0012 revoked on existing
+    # partitions; otherwise a newly provisioned project becomes a bypass.
+    if erasure_foundation and table == "run_owner":
+        api_privileges, worker_privileges = "SELECT", "SELECT"
+    elif erasure_foundation and table in {"trace_subject", "subject_key"}:
+        api_privileges, worker_privileges = None, "SELECT"
+    elif erasure_foundation and table == "invalidation_event":
+        # E2 admits invalidation writes only through its profiled API SECDEF
+        # routine; c11 retains its historical direct API producer surface.
+        api_privileges, worker_privileges = "SELECT", "SELECT"
+    statements = [
+        f"REVOKE ALL PRIVILEGES ON public.{name} FROM PUBLIC",
+        "REVOKE ALL PRIVILEGES ON "
+        f"public.{name} FROM {_APP_ROLE}, {_API_ROLE}, {_WORKER_ROLE}, {_API_GROUP}, "
+        f"{_WORKER_GROUP}, {_ERASURE_GROUP}",
+    ]
+    if api_privileges is not None:
+        statements.append(f"GRANT {api_privileges} ON public.{name} TO {_API_GROUP}")
+    if worker_privileges is not None:
+        statements.append(f"GRANT {worker_privileges} ON public.{name} TO {_WORKER_GROUP}")
+    return statements
 
 
 # The pg_tokenizer tokenizer migrations/0005_bm25.sql creates; the single source of truth for
@@ -257,31 +383,104 @@ _INDEX_SPECS: dict[str, tuple[tuple[str, str], ...]] = {
         (MEMORY_ITEM_BM25_INDEX_SUFFIX, "USING bm25 (content_bm25 bm25_catalog.bm25_ops)"),
         ("status", "(status)"),
         ("subject", "(subject_tag)"),
+        ("subjects", "USING gin (subject_digests)"),
         ("verdict", "(scan_verdict_id)"),
     ),
     "trace_index": (
         ("submitter", "(submitter_principal)"),
         ("outstatus", "(outcome_status)"),
+        ("subjects", "USING gin (subject_digests)"),
     ),
-    "outcome_event": (("run", "(run_id)"),),
-    "injection_log": (("mem", "(memory_id)"),),
-    "review_queue": (("mem", "(memory_id)"),),
-    "trace_subject": (("subject", "(subject_tag)"),),
+    "outcome_event": (("run", "(run_id)"), ("subjects", "USING gin (subject_digests)")),
+    "injection_log": (("mem", "(memory_id)"), ("subjects", "USING gin (subject_digests)")),
+    "retrieval_event": (("subjects", "USING gin (subject_digests)"),),
+    "blackboard_entry": (("subjects", "USING gin (subject_digests)"),),
+    "memory_link": (("subjects", "USING gin (subject_digests)"),),
+    "derived_state": (("subjects", "USING gin (subject_digests)"),),
+    "spend_ledger": (("subjects", "USING gin (subject_digests)"),),
+    "review_queue": (("mem", "(memory_id)"), ("subjects", "USING gin (subject_digests)")),
+    "trace_subject": (("subject", "(subject_digest, run_id)"),),
     # The dashboard's MemoryDetail transition-log panel and every "why is this
     # memory in this state" query read one memory's history newest-first; without
     # this the read is a partition scan whose cost grows with every transition the
     # project has ever made, not with the one memory being inspected.
-    "memory_status_log": (("mem", "(memory_id, changed_at DESC)"),),
+    "memory_status_log": (
+        ("mem", "(memory_id, changed_at DESC)"),
+        ("subjects", "USING gin (subject_digests)"),
+    ),
     # The per-day cap counter `ScorerRepo.scored_updates_today` buckets a memory's
     # Q updates by (project_id, memory_id) over a half-open UTC-day range on
     # scored_at; without this the count is a partition scan whose cost grows with
     # every Q update the project has ever made, not with the one memory and day
     # being capped.
-    "memory_q_update": (("scored", "(project_id, memory_id, scored_at)"),),
+    "memory_q_update": (
+        ("scored", "(project_id, memory_id, scored_at)"),
+        ("subjects", "USING gin (subject_digests)"),
+    ),
+    "trace_learning_job": (
+        (
+            "ready",
+            "(pipeline, pipeline_version, available_at, scheduled_at, run_id) "
+            "WHERE state IN ('pending', 'retry')",
+        ),
+        (
+            "lease",
+            "(pipeline, pipeline_version, lease_expires_at, scheduled_at, run_id) "
+            "WHERE state = 'running'",
+        ),
+        ("subjects", "USING gin (subject_digests)"),
+    ),
+    "run_owner": (
+        ("owner", "(principal_id, agent_type_id, run_id)"),
+        ("subjects", "USING gin (subject_digests)"),
+    ),
+    "invalidation_event": (("subjects", "USING gin (subject_digests)"),),
+    "subject_fence": (("state", "(state, subject_digest)"),),
+    "run_fence": (("state", "(state, run_id)"),),
+    "run_memory_binding": (("run", "(run_id, memory_id)"),),
 }
 
 
-def partition_index_statements(table: str, project_id: ProjectId) -> list[str]:
+def _index_specs_for_schema(
+    table: str, *, erasure_foundation: bool
+) -> tuple[tuple[str, str], ...]:
+    """Return the exact index vocabulary supported by the live catalog.
+
+    The unreleased 0012 migration adds digest attribution and five parents atomically.
+    Before that receipt exists, project provisioning must retain the exact c11
+    index shape; after it exists, a missing E1 parent is caller-visible drift.
+    This is a catalog probe, not a deploy-time feature flag.
+    """
+
+    specs = _INDEX_SPECS.get(table, ())
+    if erasure_foundation:
+        return specs
+    if table in {
+        "memory_item",
+        "outcome_event",
+        "invalidation_event",
+        "trace_learning_job",
+        "trace_index",
+        "injection_log",
+        "retrieval_event",
+        "blackboard_entry",
+        "memory_link",
+        "derived_state",
+        "spend_ledger",
+        "review_queue",
+        "memory_status_log",
+        "memory_q_update",
+        "run_owner",
+    }:
+        return tuple(spec for spec in specs if spec[0] != "subjects")
+    if table == "trace_subject":
+        return (("subject", "(subject_tag)"),)
+    return specs
+
+
+def partition_index_statements(
+    table: str, project_id: ProjectId, *, erasure_foundation: bool = True
+) -> list[str]:
     """Per-partition indexes for `table`'s partition of `project_id`.
 
     `memory_item` gets the HNSW `halfvec_cosine_ops` ANN index (pgvector) and
@@ -295,6 +494,44 @@ def partition_index_statements(table: str, project_id: ProjectId) -> list[str]:
     """
     name = partition_name(table, project_id)
     return [
-        f"CREATE INDEX IF NOT EXISTS {_checked_ident(f'{name}_{suffix}')} ON {name} {definition}"
-        for suffix, definition in _INDEX_SPECS.get(table, ())
+        # PostgreSQL does not permit a schema-qualified index name in CREATE
+        # INDEX.  The caller pins ``search_path`` to pg_catalog,public before
+        # executing this, while the target relation stays explicitly public.
+        f"CREATE INDEX IF NOT EXISTS {_checked_ident(f'{name}_{suffix}')} ON public.{name} {definition}"
+        for suffix, definition in _index_specs_for_schema(
+            table, erasure_foundation=erasure_foundation
+        )
     ]
+
+
+def partition_index_expectations(
+    table: str, project_id: ProjectId, *, erasure_foundation: bool = True
+) -> list[tuple[str, str, str, str | None]]:
+    """Canonical catalog shape for each index created for one partition.
+
+    ``CREATE INDEX IF NOT EXISTS`` only promises not to raise when an object
+    with the requested name already exists.  The partition manager uses this
+    companion shape to reject an index planted on the wrong relation, with a
+    different access method/opclass, key list, or predicate.
+    """
+
+    expectations: list[tuple[str, str, str, str | None]] = []
+    for suffix, definition in _index_specs_for_schema(
+        table, erasure_foundation=erasure_foundation
+    ):
+        before_predicate, separator, predicate = definition.partition(" WHERE ")
+        if before_predicate.startswith("USING "):
+            access_method, _, key_group = before_predicate.removeprefix("USING ").partition(" ")
+        else:
+            access_method, key_group = "btree", before_predicate
+        if not (key_group.startswith("(") and key_group.endswith(")")):
+            raise AssertionError("partition index specification has invalid key syntax")
+        expectations.append(
+            (
+                partition_index_name(table, project_id, suffix),
+                access_method,
+                key_group[1:-1],
+                predicate if separator else None,
+            )
+        )
+    return expectations

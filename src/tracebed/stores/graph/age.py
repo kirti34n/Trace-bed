@@ -283,10 +283,3 @@ class AgeGraphStore:
                 relation=relation,
             ),
         )
-
-    def delete_by_project(self, project_id: ProjectId) -> None:
-        # Scoped by project ONLY -- an erasure that also filtered on anything else would leave
-        # exactly the nodes it exists to destroy (same reasoning as the vector driver's
-        # erasure filter and `stores.pg.partitions.drop_project`'s whole-partition drop).
-        cypher = f"MATCH {_scoped_node('n')} DETACH DELETE n"
-        self._executor.run_cypher(project_id, self._graph_name, cypher, _params(project_id))

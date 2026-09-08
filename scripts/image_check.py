@@ -9,11 +9,12 @@ the Python audit cannot see.
 
 What this checks, and deliberately only this:
 
-  1. every `image:` in `docker/compose.yaml` and `.github/workflows/ci.yml` is declared in
-     `scripts/image_policy.toml`, with a licence and a purpose;
-  2. every declared image's tag matches what the file actually uses (a policy that has drifted
-     from the compose file is worse than none);
-  3. a floating tag (`latest` / `*-latest`) is declared as such.
+  1. every `image:` in `docker/compose.yaml` and `.github/workflows/ci.yml`, and every
+     external Dockerfile ``FROM`` stage, is declared in `scripts/image_policy.toml`, with a
+     licence and a purpose;
+  2. every image is an explicit SHA-256 digest, never a tag, build ARG, or dynamic reference;
+  3. every declared image's digest matches the policy (a policy that has drifted from what runs
+     is worse than none).
 
 What it does NOT check: whether the declared licence is true. Verifying an image's licence needs
 a registry pull and a filesystem walk; claiming otherwise would be exactly the kind of
@@ -44,10 +45,14 @@ SCANNED_FILES = (
     REPO_ROOT / "docker" / "compose.yaml",
     REPO_ROOT / ".github" / "workflows" / "ci.yml",
 )
+DOCKERFILE_PATHS = tuple(sorted((REPO_ROOT / "docker").rglob("*Dockerfile*")))
 
 # `image: repo/name:tag` in YAML. Quotes optional; a digest pin (`@sha256:...`) is captured as
 # part of the tag so a digest-pinned image is never mistaken for a floating one.
 _IMAGE_RE = re.compile(r"^\s*image:\s*[\"']?([^\s\"'#]+)[\"']?", re.MULTILINE)
+_FROM_RE = re.compile(
+    r"^\s*FROM\s+(?:--platform=[^\s]+\s+)?([^\s]+)", re.MULTILINE | re.IGNORECASE
+)
 
 
 def is_floating(tag: str) -> bool:
@@ -62,6 +67,7 @@ class ImageRef:
     repository: str
     tag: str
     source: str
+    dynamic: bool = False
 
     @property
     def full(self) -> str:
@@ -72,11 +78,11 @@ def parse_image(raw: str, source: str) -> ImageRef:
     """Split `repo[:tag]`, tolerating a registry host with its own port (`host:5000/img:tag`)."""
     if "@" in raw:
         repository, _, digest = raw.partition("@")
-        return ImageRef(repository, digest, source)
+        return ImageRef(repository, digest, source, dynamic="$" in raw)
     head, sep, tail = raw.rpartition(":")
     if sep and "/" not in tail:
-        return ImageRef(head, tail, source)
-    return ImageRef(raw, "", source)
+        return ImageRef(head, tail, source, dynamic="$" in raw)
+    return ImageRef(raw, "", source, dynamic="$" in raw)
 
 
 def scan_files(paths: tuple[Path, ...] = SCANNED_FILES) -> list[ImageRef]:
@@ -90,6 +96,20 @@ def scan_files(paths: tuple[Path, ...] = SCANNED_FILES) -> list[ImageRef]:
     return found
 
 
+def scan_dockerfiles(paths: tuple[Path, ...] = DOCKERFILE_PATHS) -> list[ImageRef]:
+    """Return every Dockerfile base image, including every named build stage."""
+
+    found: list[ImageRef] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        source = str(path.relative_to(REPO_ROOT)).replace("\\", "/")
+        for raw in _FROM_RE.findall(text):
+            found.append(parse_image(raw, source))
+    return found
+
+
 def load_policy(path: Path = POLICY_PATH) -> dict[str, dict[str, object]]:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     entries = data.get("image", [])
@@ -99,17 +119,26 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, dict[str, object]]:
 def check(images: list[ImageRef], policy: dict[str, dict[str, object]]) -> list[str]:
     problems: list[str] = []
     for ref in images:
+        if ref.dynamic:
+            problems.append(f"{ref.source}: dynamic image reference {ref.full} is forbidden")
+            continue
+        if not ref.tag.startswith("sha256:"):
+            problems.append(f"{ref.source}: image {ref.full} is not digest-pinned")
+            continue
         entry = policy.get(ref.repository)
         if entry is None:
             problems.append(
                 f"{ref.source}: image {ref.full} is not declared in scripts/image_policy.toml"
             )
             continue
-        declared_tag = str(entry.get("tag", ""))
-        if declared_tag != ref.tag:
+        declared_tags = {str(entry.get("tag", ""))}
+        raw_extra_tags = entry.get("tags", [])
+        if isinstance(raw_extra_tags, list):
+            declared_tags.update(str(tag) for tag in raw_extra_tags)
+        if ref.tag not in declared_tags:
             problems.append(
                 f"{ref.source}: image {ref.full} does not match the policy's declared tag "
-                f"{declared_tag!r} — the policy has drifted from what actually runs"
+                f"set {sorted(declared_tags)!r} — the policy has drifted from what actually runs"
             )
         if not str(entry.get("licence", "")).strip():
             problems.append(f"policy entry for {ref.repository} declares no licence")
@@ -125,23 +154,39 @@ def check(images: list[ImageRef], policy: dict[str, dict[str, object]]) -> list[
 
 def self_test() -> int:
     policy = {
-        "acme/db": {"tag": "1.2", "licence": "Apache-2.0", "purpose": "x", "floating_tag": False},
+        "acme/db": {
+            "tag": "sha256:abc",
+            "licence": "Apache-2.0",
+            "purpose": "x",
+            "floating_tag": False,
+        },
         "acme/store": {
-            "tag": "latest",
+            "tag": "sha256:def",
             "licence": "Apache-2.0",
             "purpose": "x",
             "floating_tag": True,
         },
     }
     clean = check(
-        [ImageRef("acme/db", "1.2", "t"), ImageRef("acme/store", "latest", "t")], policy
+        [ImageRef("acme/db", "sha256:abc", "t"), ImageRef("acme/store", "sha256:def", "t")],
+        policy,
     )
-    undeclared = check([ImageRef("acme/other", "1.0", "t")], policy)
-    drifted = check([ImageRef("acme/db", "9.9", "t")], policy)
-    unacknowledged = check(
-        [ImageRef("acme/db", "latest", "t")],
-        {"acme/db": {"tag": "latest", "licence": "L", "purpose": "p", "floating_tag": False}},
+    undeclared = check([ImageRef("acme/other", "sha256:abc", "t")], policy)
+    drifted = check([ImageRef("acme/db", "sha256:bad", "t")], policy)
+    declared_alternate_tag = check(
+        [ImageRef("acme/db", "sha256:def", "t")],
+        {
+            "acme/db": {
+                "tag": "sha256:abc",
+                "tags": ["sha256:abc", "sha256:def"],
+                "licence": "Apache-2.0",
+                "purpose": "x",
+                "floating_tag": False,
+            }
+        },
     )
+    unpinned = check([ImageRef("acme/db", "latest", "t")], policy)
+    dynamic = check([ImageRef("acme/db", "sha256:abc", "t", dynamic=True)], policy)
     parsed = parse_image("registry.example.com:5000/team/img:2.1", "t")
     parse_ok = parsed.repository == "registry.example.com:5000/team/img" and parsed.tag == "2.1"
     floating_ok = (
@@ -155,7 +200,9 @@ def self_test() -> int:
         ("clean policy -> 0 problems", not clean),
         ("undeclared image rejected", len(undeclared) == 1),
         ("tag drift rejected", len(drifted) == 1),
-        ("unacknowledged floating tag rejected", len(unacknowledged) == 1),
+        ("declared alternate tag accepted", not declared_alternate_tag),
+        ("unpinned tag rejected", len(unpinned) == 1),
+        ("dynamic reference rejected", len(dynamic) == 1),
         ("registry host with a port parses", parse_ok),
         ("floating-tag detection", floating_ok),
     )
@@ -171,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return self_test()
 
-    images = scan_files()
+    images = [*scan_files(), *scan_dockerfiles()]
     policy = load_policy()
     problems = check(images, policy)
     for ref in images:

@@ -14,9 +14,8 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from uuid import UUID, uuid4
 
@@ -27,18 +26,18 @@ from tracebed.crypto import (
     PROJECT_SUBJECT_TAG,
     EncryptedPayload,
     EnvMasterKeyProvider,
+    KeyBindingMismatch,
+    KeyMaterialUnavailable,
     PlainSection,
     SubjectKeyManager,
-    TombstonedSection,
 )
 from tracebed.crypto import envelope as envelope_mod
 from tracebed.crypto.shred import SubjectKeyStore
-from tracebed.domain.canonical import sha256_hex
+from tracebed.crypto.subject_digest import subject_digest
+from tracebed.domain.canonical import canonical_json
 from tracebed.domain.clock import Clock, FakeClock
-from tracebed.domain.errors import MasterKeyMissing, NotFound, Tombstoned
+from tracebed.domain.errors import MasterKeyMissing, NotFound
 from tracebed.domain.ids import ProjectId, mint_run_id
-from tracebed.stores.tracestore import PayloadRef
-from tracebed.stores.tracestore.fs import FsTraceStore
 
 # Without this the whole crypto-shred proving suite is invisible to
 # `pytest -m phase0`, which IS the Phase 0 gate (PLAN.md §7) — 20 green
@@ -60,11 +59,13 @@ class _FakeSubjectKeyRow:
     see the `TYPE_CHECKING` note above for why this chunk does not import
     the real class at runtime."""
 
-    subject_tag: str
+    subject_tag: str | None
     key_id: UUID
     wrapped_kek: bytes
     created_at: datetime
     destroyed_at: datetime | None
+    subject_digest: bytes | None = None
+    wrap_version: int = 1
 
 
 # --------------------------------------------------------------------------- #
@@ -78,9 +79,21 @@ class FakeSubjectKeyStore:
     def __init__(self, clock: Clock) -> None:
         self._clock = clock
         self._rows: dict[tuple[ProjectId, str], _FakeSubjectKeyRow] = {}
+        self._v2_rows: dict[tuple[ProjectId, bytes], _FakeSubjectKeyRow] = {}
 
     def get_subject_key(self, project_id: ProjectId, subject_tag: str) -> SubjectKeyRow | None:
         return self._rows.get((project_id, subject_tag))  # type: ignore[return-value]
+
+    def get_subject_key_by_digest(
+        self, project_id: ProjectId, digest: bytes
+    ) -> SubjectKeyRow | None:
+        v2 = self._v2_rows.get((project_id, digest))
+        if v2 is not None:
+            return v2  # type: ignore[return-value]
+        for (row_project_id, tag), row in self._rows.items():
+            if row_project_id == project_id and subject_digest(project_id, tag) == digest:
+                return row  # type: ignore[return-value]
+        return None
 
     def insert_subject_key(
         self, project_id: ProjectId, subject_tag: str, key_id: UUID, wrapped_kek: bytes
@@ -93,18 +106,18 @@ class FakeSubjectKeyStore:
             destroyed_at=None,
         )
 
-    def destroy_subject_key(self, project_id: ProjectId, subject_tag: str) -> bool:
-        row = self._rows.get((project_id, subject_tag))
-        if row is None:
-            return False
-        self._rows[(project_id, subject_tag)] = _FakeSubjectKeyRow(
-            subject_tag=row.subject_tag,
-            key_id=row.key_id,
-            wrapped_kek=b"",
-            created_at=row.created_at,
-            destroyed_at=self._clock.now(),
+    def insert_subject_key_v2(
+        self, project_id: ProjectId, digest: bytes, key_id: UUID, wrapped_kek: bytes
+    ) -> None:
+        self._v2_rows[(project_id, digest)] = _FakeSubjectKeyRow(
+            subject_tag=None,
+            subject_digest=digest,
+            wrap_version=2,
+            key_id=key_id,
+            wrapped_kek=wrapped_kek,
+            created_at=self._clock.now(),
+            destroyed_at=None,
         )
-        return True
 
 
 class FakeMasterKeyProvider:
@@ -166,6 +179,66 @@ def test_envelope_round_trip_tagged_section() -> None:
     assert isinstance(results[0], PlainSection)
     assert results[0].subject_tags == ("user:alice",)
     assert results[0].lines == sections[0].lines
+
+
+def test_destroyed_key_does_not_hide_later_live_v2_share_authentication_failure() -> None:
+    """The opaque v2 path has the same corruption-before-privacy order."""
+
+    manager, store, _clock = _manager()
+    project_id = ProjectId(uuid4())
+    run_id = mint_run_id()
+    line = canonical_json({"event": {"payload": {}, "type": "state_note"}, "seq": 0})
+    payload = manager.encrypt_v2(
+        project_id,
+        run_id,
+        [PlainSection(0, 0, ("alice", "bob"), (line,))],
+    )
+    alice_digest = subject_digest(project_id, "alice")
+    alice = store._v2_rows[(project_id, alice_digest)]
+    store._v2_rows[(project_id, alice_digest)] = replace(
+        alice, wrapped_kek=b"", destroyed_at=_clock.now()
+    )
+    section = dict(payload.sections[0])
+    raw_wraps = section["wraps"]
+    assert isinstance(raw_wraps, list)
+    assert all(isinstance(wrap, Mapping) for wrap in raw_wraps)
+    wraps = [dict(wrap) for wrap in raw_wraps]
+    live_index = next(
+        index
+        for index, wrap in enumerate(wraps)
+        if envelope_mod.b64d(str(wrap["digest"])) != alice_digest
+    )
+    wraps[live_index]["share"] = envelope_mod.b64e(b"\x00" * 48)
+    section["wraps"] = wraps
+
+    with pytest.raises(KeyBindingMismatch):
+        manager.decrypt(project_id, EncryptedPayload(payload.header, (section,)))
+
+
+@pytest.mark.parametrize("version", (1, 2))
+def test_wrong_master_key_is_retryable_for_v1_and_v2_wrapped_keks(version: int) -> None:
+    """Master-wrapped KEK auth is an operator dependency, unlike a DEK wrap."""
+
+    clock = FakeClock()
+    store = FakeSubjectKeyStore(clock)
+    writer = SubjectKeyManager(store, FakeMasterKeyProvider(b"a" * 32), clock)
+    project_id = ProjectId(uuid4())
+    run_id = mint_run_id()
+    line = (
+        _line(0)
+        if version == 1
+        else canonical_json({"event": {"payload": {}, "type": "state_note"}, "seq": 0})
+    )
+    section = PlainSection(0, 0, ("alice",), (line,))
+    payload = (
+        writer.encrypt(project_id, run_id, [section])
+        if version == 1
+        else writer.encrypt_v2(project_id, run_id, [section])
+    )
+    reader = SubjectKeyManager(store, FakeMasterKeyProvider(b"b" * 32), clock)
+
+    with pytest.raises(KeyMaterialUnavailable):
+        reader.decrypt(project_id, payload)
 
 
 def test_header_shape_matches_the_wire_spec() -> None:
@@ -257,78 +330,6 @@ def test_nonce_never_reused_across_many_sections() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Crypto-shred: destroy(A) tombstones A-only AND shared A+B sections;
-# B-only stays readable; stored object bytes are unchanged; ref still resolves.
-# --------------------------------------------------------------------------- #
-
-
-def test_destroy_subject_tombstones_referencing_sections_object_bytes_unchanged(
-    tmp_path: Path,
-) -> None:
-    manager, _store, _clock = _manager()
-    project_id = ProjectId(uuid4())
-    run_id = mint_run_id()
-
-    sections = [
-        PlainSection(seq_from=0, seq_to=0, subject_tags=("user:alice",), lines=(_line(0),)),
-        PlainSection(seq_from=1, seq_to=1, subject_tags=("third_party:acme",), lines=(_line(1),)),
-        PlainSection(
-            seq_from=2, seq_to=2, subject_tags=("user:alice", "third_party:acme"), lines=(_line(2),)
-        ),
-    ]
-    payload = manager.encrypt(project_id, run_id, sections)
-    wire = payload.to_bytes()
-
-    tracestore = FsTraceStore(tmp_path)
-    ref = tracestore.put(project_id, run_id, 0, wire)
-
-    before = tracestore.get(project_id, ref)
-    before_hash = sha256_hex(before)
-
-    destroyed = manager.destroy_subject(project_id, "user:alice")
-    assert destroyed is True
-
-    after = tracestore.get(project_id, ref)
-    after_hash = sha256_hex(after)
-    assert after == before, "the object's bytes must never change on erasure"
-    assert after_hash == before_hash
-
-    restored = EncryptedPayload.from_bytes(after)
-    results = manager.decrypt(project_id, restored)
-
-    alice_only, acme_only, shared = results
-    assert isinstance(alice_only, TombstonedSection)
-    assert alice_only.subject_tags == ("user:alice",)
-
-    assert isinstance(acme_only, PlainSection)
-    assert acme_only.lines == sections[1].lines
-
-    assert isinstance(shared, TombstonedSection), "ANY referenced subject destroyed -> tombstoned"
-    assert shared.subject_tags == ("user:alice", "third_party:acme")
-
-    # provenance pointer round-trip: what trace_index.payload_ref stores and
-    # what a later reader parses back must be the identical ref.
-    assert PayloadRef.parse(str(ref)) == ref
-    assert tracestore.exists(project_id, ref) is True
-
-
-def test_destroy_absent_subject_returns_false() -> None:
-    manager, _store, _clock = _manager()
-    project_id = ProjectId(uuid4())
-    assert manager.destroy_subject(project_id, "user:never-existed") is False
-
-
-def test_get_or_create_after_destroy_raises_tombstoned() -> None:
-    manager, _store, _clock = _manager()
-    project_id = ProjectId(uuid4())
-    manager.get_or_create_subject_kek(project_id, "user:alice")
-    manager.destroy_subject(project_id, "user:alice")
-
-    with pytest.raises(Tombstoned):
-        manager.get_or_create_subject_kek(project_id, "user:alice")
-
-
-# --------------------------------------------------------------------------- #
 # KEK lifecycle
 # --------------------------------------------------------------------------- #
 
@@ -349,19 +350,6 @@ def test_ensure_project_kek_provisions_reserved_tag() -> None:
     row = store.get_subject_key(project_id, PROJECT_SUBJECT_TAG)
     assert row is not None
     assert row.destroyed_at is None
-
-
-def test_untagged_section_is_shredded_by_destroying_the_project_kek() -> None:
-    manager, _store, _clock = _manager()
-    project_id = ProjectId(uuid4())
-    run_id = mint_run_id()
-    manager.ensure_project_kek(project_id)
-
-    payload = manager.encrypt(project_id, run_id, [PlainSection(0, 0, (), (_line(0),))])
-    manager.destroy_subject(project_id, PROJECT_SUBJECT_TAG)
-
-    results = manager.decrypt(project_id, payload)
-    assert isinstance(results[0], TombstonedSection)
 
 
 def test_different_projects_get_different_keks_for_the_same_tag() -> None:
@@ -491,50 +479,6 @@ def test_split_dek_rejects_zero_shares() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Erasure is a property of stored key material, not of process lifetime:
-# the SAME manager instance must stop decrypting after destroy_subject().
-# --------------------------------------------------------------------------- #
-
-
-def test_same_manager_instance_cannot_decrypt_after_destroy_no_kek_cache() -> None:
-    manager, _store, _clock = _manager()
-    project_id = ProjectId(uuid4())
-    run_id = mint_run_id()
-    payload = manager.encrypt(
-        project_id, run_id, [PlainSection(0, 0, ("user:alice",), (_line(0),))]
-    )
-
-    first = manager.decrypt(project_id, payload)
-    assert isinstance(first[0], PlainSection), "readable before erasure"
-
-    manager.destroy_subject(project_id, "user:alice")
-
-    second = manager.decrypt(project_id, payload)
-    assert isinstance(second[0], TombstonedSection), "a cached KEK would keep it readable"
-
-
-def test_re_provisioning_the_same_tag_does_not_resurrect_shredded_sections() -> None:
-    """A new KEK for `user:alice` gets a new `key_id`; the old sections name
-    the OLD key_id, so they stay tombstoned. Without the key_id check they
-    would decrypt to garbage-or-InvalidTag instead of a clean tombstone."""
-    manager, store, _clock = _manager()
-    project_id = ProjectId(uuid4())
-    run_id = mint_run_id()
-    payload = manager.encrypt(
-        project_id, run_id, [PlainSection(0, 0, ("user:alice",), (_line(0),))]
-    )
-    manager.destroy_subject(project_id, "user:alice")
-
-    # Operator provisions a brand-new KEK under the same tag (a re-registered
-    # subject in a later run); done through the store because the manager
-    # deliberately refuses (Tombstoned).
-    store.insert_subject_key(project_id, "user:alice", uuid4(), b"\x00" * 60)
-
-    results = manager.decrypt(project_id, payload)
-    assert isinstance(results[0], TombstonedSection)
-
-
-# --------------------------------------------------------------------------- #
 # Invariant 4 reaches the crypto layer: a payload belonging to another project
 # is NotFound, never a partial read and never a silent tombstone.
 # --------------------------------------------------------------------------- #
@@ -638,7 +582,11 @@ def test_from_bytes_rejects_a_foreign_envelope_version() -> None:
     future = dict(payload.header)
     future["v"] = 2
     future["fmt"] = "tb-env/2"
-    raw = EncryptedPayload(future, payload.sections).to_bytes()
+    # Construct an intentionally incomplete v2-looking legacy object without
+    # using the strict v2 serializer, which correctly refuses to emit it.
+    raw = envelope_mod.dumps_line(future) + b"".join(
+        envelope_mod.dumps_line(section) for section in payload.sections
+    )
 
     with pytest.raises(ValueError, match="unsupported envelope"):
         EncryptedPayload.from_bytes(raw)

@@ -10,6 +10,7 @@ not an arbitrary one — while counting every drop (D-033).
 from __future__ import annotations
 
 import threading
+from typing import cast
 
 import pytest
 
@@ -105,6 +106,54 @@ class TestDrain:
         assert len(buf.drain(2)) == 2
         assert len(buf.drain(2)) == 1
         assert buf.drain(1) == []
+
+    def test_leased_items_count_against_capacity_and_requeue_fifo(self) -> None:
+        buf = RingBuffer(capacity=3)
+        run = _run_id()
+        for i in range(3):
+            buf.append(run, "trace", {"i": i})
+        leased = buf.lease(2)
+        # One queued item remains, so appending drops that queued oldest item;
+        # it must never evict either in-flight item needed for retry.
+        buf.append(run, "trace", {"i": 3})
+        buf.settle(leased, ["retry", "retry"], {})
+        assert [item.body["i"] for item in buf.drain(10)] == [0, 1, 3]
+        assert buf.dropped_total == 1
+
+    def test_append_while_every_slot_is_leased_rejects_new_item(self) -> None:
+        buf = RingBuffer(capacity=2)
+        run = _run_id()
+        buf.append(run, "trace", {"i": 0})
+        buf.append(run, "trace", {"i": 1})
+        leased = buf.lease(2)
+        # This is the unavoidable in-flight case: capacity is retained by the
+        # lease, so reject the new event rather than destroy retry safety.
+        assert buf.append(run, "trace", {"i": 2}) == 2
+        assert buf.pending_count == 2
+        assert buf.dropped_total == 1
+        buf.settle(leased, ["retry", "retry"], {})
+        assert [item.body["i"] for item in buf.drain(10)] == [0, 1]
+
+    def test_concurrent_buffer_only_drains_remain_atomic(self) -> None:
+        buf = RingBuffer(capacity=20)
+        run = _run_id()
+        for i in range(20):
+            buf.append(run, "trace", {"i": i})
+        barrier = threading.Barrier(2)
+        drained: list[list[BufferedItem]] = []
+
+        def worker() -> None:
+            barrier.wait()
+            drained.append(buf.drain(10))
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert sorted(cast(int, item.body["i"]) for batch in drained for item in batch) == list(
+            range(20)
+        )
 
 
 class TestThreadSafety:

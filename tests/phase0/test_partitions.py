@@ -5,7 +5,7 @@ the pure string builder it is, and `stores.pg.partitions` is exercised
 against a recording fake connection. That second half matters more than it
 looks: every property Task 6 actually cares about — RLS enabled AND forced
 AND policied on *every* one of the 13 partitions, grants issued, the whole
-per-project unit in one transaction, `drop_project` reaching all 13 tables,
+per-project unit in one transaction, `drop_project` reaching all 17 tables,
 `ensure_schema_current` not resurrecting deleted projects — is otherwise
 only observable from an integration test that never runs on this machine.
 A fake connection cannot prove Postgres accepts the SQL; it can prove the
@@ -39,6 +39,8 @@ from tracebed.stores.pg.ddl import (
     PARTITIONED_TABLES,
     create_partition_sql,
     partition_grant_statements,
+    partition_index_expectations,
+    partition_index_name,
     partition_index_statements,
     partition_name,
     partition_policy_name,
@@ -56,9 +58,9 @@ PID_B = ProjectId("87654321-4321-8765-4321-876543214321")
 # which breaks every catalog lookup done by the constructed name.
 PG_IDENT_MAX = 63
 
-# `tracebed_app`'s credential belongs to deployment, not to a migration
-# (docker/initdb/01-roles.sql for compose/CI). Overridable so the probe can
-# run against a real stack instead of skipping.
+# `tracebed_app`'s credential belongs to deployment, not to a migration. The
+# owner bootstrap / Compose ``db-bootstrap`` one-shot owns it. This override
+# lets the probe run against a real stack instead of skipping.
 _APP_ROLE_PASSWORD = os.environ.get("TB_APP_ROLE_PASSWORD", "tracebed_app_dev")
 
 
@@ -81,13 +83,20 @@ def test_ddl_partitioned_tables_match_migration() -> None:
     for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
         if path.name.endswith(".rollback.sql"):
             continue
-        declared |= set(
-            re.findall(
-                r"CREATE TABLE\s+(\w+)\s*\([\s\S]*?PARTITION BY LIST\s*\(\s*project_id\s*\)",
-                path.read_text(encoding="utf-8"),
-                re.IGNORECASE,
-            )
-        )
+        sql = path.read_text(encoding="utf-8")
+        for match in re.finditer(r"CREATE TABLE\s+(\w+)\s*\(", sql, re.IGNORECASE):
+            depth = 0
+            close = match.end() - 1
+            for index in range(close, len(sql)):
+                if sql[index] == "(":
+                    depth += 1
+                elif sql[index] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        close = index
+                        break
+            if re.match(r"\s*PARTITION BY LIST\s*\(\s*project_id\s*\)", sql[close + 1 :], re.I):
+                declared.add(match.group(1))
     assert declared, "no LIST-partitioned parent found in any migration -- the scan broke"
     assert declared == set(PARTITIONED_TABLES), (
         "ddl.py's PARTITIONED_TABLES drifted from the migrations: "
@@ -96,9 +105,9 @@ def test_ddl_partitioned_tables_match_migration() -> None:
     )
 
 
-def test_fourteen_tables_exactly() -> None:
-    assert len(PARTITIONED_TABLES) == 15
-    assert len(set(PARTITIONED_TABLES)) == 15  # no duplicate would be silently tolerated
+def test_twenty_two_tables_exactly() -> None:
+    assert len(PARTITIONED_TABLES) == 22
+    assert len(set(PARTITIONED_TABLES)) == 22  # no duplicate would be silently tolerated
 
 
 def test_partition_name_is_deterministic_and_stable() -> None:
@@ -141,7 +150,7 @@ def test_create_partition_sql_carries_no_bind_parameter() -> None:
 
 def test_create_partition_sql_embeds_the_project_uuid_literal() -> None:
     sql = create_partition_sql("memory_item", PID_A)
-    assert f"PARTITION OF memory_item FOR VALUES IN ('{PID_A.value}')" in sql
+    assert f"PARTITION OF public.memory_item FOR VALUES IN ('{PID_A.value}')" in sql
     # A cast is also a syntax error in a partition bound: partbound_datum is
     # Sconst, not a general expression.
     assert "::uuid" not in sql
@@ -160,7 +169,7 @@ def test_generated_identifiers_fit_postgres_limit(table: str) -> None:
     for stmt in partition_index_statements(table, PID_A):
         match = re.search(r"CREATE INDEX IF NOT EXISTS (\S+)", stmt)
         assert match, stmt
-        names.append(match.group(1))
+        names.append(match.group(1).removeprefix("public."))
     for name in names:
         assert len(name.encode("utf-8")) <= PG_IDENT_MAX, f"{name} ({len(name)} bytes)"
 
@@ -170,13 +179,13 @@ def test_rls_statements_enable_force_and_policy(table: str) -> None:
     stmts = partition_rls_statements(table, PID_A)
     name = partition_name(table, PID_A)
     policy = partition_policy_name(table, PID_A)
-    assert f"ALTER TABLE {name} ENABLE ROW LEVEL SECURITY" in stmts
-    assert f"ALTER TABLE {name} FORCE ROW LEVEL SECURITY" in stmts
-    assert f"DROP POLICY IF EXISTS {policy} ON {name}" in stmts
+    assert f"ALTER TABLE public.{name} ENABLE ROW LEVEL SECURITY" in stmts
+    assert f"ALTER TABLE public.{name} FORCE ROW LEVEL SECURITY" in stmts
+    assert f"DROP POLICY IF EXISTS {policy} ON public.{name}" in stmts
     create = [s for s in stmts if s.startswith("CREATE POLICY")]
     assert len(create) == 1
     # DROP must precede CREATE or the re-issue from ensure_schema_current fails.
-    assert stmts.index(f"DROP POLICY IF EXISTS {policy} ON {name}") < stmts.index(create[0])
+    assert stmts.index(f"DROP POLICY IF EXISTS {policy} ON public.{name}") < stmts.index(create[0])
 
 
 def test_partition_policy_predicate_is_byte_identical_to_the_migration() -> None:
@@ -195,13 +204,25 @@ def test_partition_policy_predicate_is_byte_identical_to_the_migration() -> None
         create = next(
             s for s in partition_rls_statements(table, PID_A) if s.startswith("CREATE POLICY")
         )
-        child = " ".join(create.split("USING (", 1)[1].rstrip(")").split())
+        using, separator, with_check = create.split("USING (", 1)[1].partition(") WITH CHECK (")
+        child = " ".join((using if separator else using.rstrip(")")).split())
         assert child == parent, f"{table}: partition predicate {child!r} != parent {parent!r}"
+        if table in {
+            "subject_fence",
+            "run_fence",
+            "erase_run_set",
+            "erase_mem_set",
+            "run_memory_binding",
+        }:
+            assert separator == ") WITH CHECK ("
+            assert " ".join(with_check.rstrip(")").split()) == parent
+        else:
+            assert separator == ""
 
 
 def test_policy_predicate_is_fail_closed_on_unset_and_empty_guc() -> None:
     """C-09 requires zero rows, never an error, when the GUC is missing —
-    and docker/initdb/01-roles.sql ships the GUC preset to the empty string,
+    and the owner bootstrap sets the GUC preset to the empty string,
     where a bare `''::uuid` raises instead of returning nothing."""
     create = next(
         s for s in partition_rls_statements("memory_item", PID_A) if s.startswith("CREATE POLICY")
@@ -210,15 +231,56 @@ def test_policy_predicate_is_fail_closed_on_unset_and_empty_guc() -> None:
     assert "NULLIF(" in create  # empty-string_ok
 
 
+def test_c12_partition_policy_adds_the_runtime_erasure_read_fence() -> None:
+    """Late provisioned c12 leaves cannot restore raw runtime disclosure."""
+
+    for table in PARTITIONED_TABLES[:17]:
+        create = next(
+            statement
+            for statement in partition_rls_statements(
+                table, PID_A, erasure_foundation=True
+            )
+            if statement.startswith("CREATE POLICY")
+        )
+        assert "tracebed_runtime_erasure_read_allowed(project_id)" in create
+        assert ") WITH CHECK (project_id = " in create
+    for table in PARTITIONED_TABLES[17:]:
+        create = next(
+            statement
+            for statement in partition_rls_statements(
+                table, PID_A, erasure_foundation=True
+            )
+            if statement.startswith("CREATE POLICY")
+        )
+        assert "tracebed_runtime_erasure_read_allowed" not in create
+
+
 @pytest.mark.parametrize("table", PARTITIONED_TABLES)
 def test_grants_are_dml_only(table: str) -> None:
     stmts = partition_grant_statements(table, PID_A)
-    assert stmts == [
-        f"GRANT SELECT, INSERT, UPDATE, DELETE ON {partition_name(table, PID_A)} TO tracebed_app"
-    ]
+    name = f"public.{partition_name(table, PID_A)}"
+    if table == "run_owner":
+        assert stmts == [
+            f"REVOKE ALL PRIVILEGES ON {name} FROM PUBLIC",
+            "REVOKE ALL PRIVILEGES ON "
+            f"{name} FROM tracebed_app, tracebed_api_group, tracebed_worker_group, "
+            "tracebed_erasure_group",
+            f"GRANT SELECT, INSERT ON {name} TO tracebed_app, tracebed_api_group",
+            f"GRANT SELECT ON {name} TO tracebed_worker_group",
+        ]
+    elif table in {"trace_index", "trace_learning_job"}:
+        assert stmts == [
+            f"REVOKE DELETE ON {name} FROM tracebed_app",
+            f"GRANT SELECT, INSERT, UPDATE ON {name} TO tracebed_app",
+        ]
+    else:
+        assert stmts == [f"GRANT SELECT, INSERT, UPDATE, DELETE ON {name} TO tracebed_app"]
     joined = " ".join(stmts).upper()
-    for forbidden in ("ALL PRIVILEGES", "TRUNCATE", "REFERENCES", "TRIGGER", "CREATE"):
-        assert forbidden not in joined
+    forbidden: tuple[str, ...] = ("TRUNCATE", "REFERENCES", "TRIGGER", "CREATE")
+    if table != "run_owner":
+        forbidden = ("ALL PRIVILEGES", *forbidden)
+    for token in forbidden:
+        assert token not in joined
 
 
 def test_memory_item_gets_both_retrieval_indexes() -> None:
@@ -234,7 +296,7 @@ def test_index_statements_are_idempotent_and_scoped_to_the_partition() -> None:
             assert stmt.startswith("CREATE INDEX IF NOT EXISTS ")
             # Never build an index on the parent: that takes an ACCESS
             # EXCLUSIVE lock across every project at once.
-            assert f" ON {name} " in stmt
+            assert f" ON public.{name} " in stmt
 
 
 # --------------------------------------------------------------------------- #
@@ -258,14 +320,81 @@ class _FakeCursor:
 
     def execute(self, sql: str, params: dict[str, Any] | None = None) -> None:
         self._conn.executed.append((sql, params))
-        if sql.startswith("SELECT project_id FROM project"):
+        if sql.startswith("CREATE INDEX IF NOT EXISTS "):
+            self._conn.index_names.add(sql.split(" ON public.", 1)[0].removeprefix("CREATE INDEX IF NOT EXISTS "))
+        if sql.startswith("SELECT project_id FROM public.project"):
             self._result = [(pid,) for pid in self._conn.live_project_ids]
-        elif "to_regclass" in sql and "pg_inherits" in sql:
-            name = (params or {})["name"]
-            self._result = [(name in self._conn.attached_partitions,)]
+        elif "erasure_cutover_state" in sql:
+            self._result = [(self._conn.erasure_foundation,)]
+        elif "authority_cutover_state" in sql:
+            self._result = [(self._conn.authority_cutover,)]
+        elif "index_data.indisvalid" in sql and "pg_opclass AS opclass" in sql:
+            partition = str((params or {})["partition"]).removeprefix("public.")
+            index_name = str((params or {})["index"]).removeprefix("public.")
+            table = next(table for table in PARTITIONED_TABLES if partition.startswith(f"{table}_p_"))
+            project_id = ProjectId(UUID(partition.removeprefix(f"{table}_p_")))
+            expected = next(
+                shape
+                for shape in partition_index_expectations(
+                    table, project_id, erasure_foundation=self._conn.erasure_foundation
+                )
+                if shape[0] == index_name
+            )
+            predicate = expected[3]
+            if predicate is not None:
+                predicate = {
+                    "state IN ('pending', 'retry')": "(state = ANY (ARRAY['pending'::text, 'retry'::text]))",
+                    "state = 'running'": "(state = 'running'::text)",
+                }.get(predicate, predicate)
+            expected_terms = [part.split() for part in expected[2].split(", ")]
+            expected_options = [3 if terms[-1:] == ["DESC"] else 0 for terms in expected_terms]
+            expected_opclasses = [
+                (
+                    None
+                    if len(terms) == 1 or (terms[-1:] == ["DESC"] and len(terms) == 2)
+                    else next(term for term in terms[1:] if term != "DESC")
+                )
+                for terms in expected_terms
+            ]
+            shape = (
+                True,
+                expected[1],
+                True,
+                True,
+                True,
+                list(range(1, len(expected_terms) + 1)),
+                expected_options,
+                [
+                    opclass if opclass is not None and "." in opclass else f"public.{opclass}"
+                    for opclass in expected_opclasses
+                ],
+                [opclass is None for opclass in expected_opclasses],
+                [part.split(" ", 1)[0] for part in expected[2].split(", ")],
+                True,
+                predicate,
+            )
+            self._result = [self._conn.index_shapes.get(index_name, shape)] if index_name in self._conn.index_names else []
+        elif "ORDER BY child.relname" in sql and "pg_get_expr(child.relpartbound" in sql:
+            parent = (params or {})["parent"]
+            project_uuid = UUID((params or {})["project_id"])
+            name = f"{str(parent).removeprefix('public.')}_p_{project_uuid.hex}"
+            attached = self._conn.attached_partitions
+            self._result = [("public", name)] if attached is None or name in attached else []
+        elif "pg_get_expr(child.relpartbound" in sql:
+            qualified = (params or {})["qualified"]
+            name = str(qualified).removeprefix("public.")
+            attached = self._conn.attached_partitions
+            self._result = [(attached is None or name in attached,)]
         elif "to_regclass" in sql:
-            name = (params or {})["name"]
-            self._result = [(name in self._conn.existing_partitions,)]
+            if params is not None and "parent" in params:
+                parent = str(params["parent"]).removeprefix("public.")
+                existing = self._conn.existing_parents
+                self._result = [(parent if existing is None or parent in existing else None,)]
+                return
+            qualified = (params or {})["qualified"]
+            name = str(qualified).removeprefix("public.")
+            existing = self._conn.existing_partitions
+            self._result = [(existing is None or name in existing,)]
         else:
             self._result = []
 
@@ -302,11 +431,21 @@ class _FakeConn:
         live_project_ids: list[UUID] | None = None,
         existing_partitions: set[str] | None = None,
         attached_partitions: set[str] | None = None,
+        authority_cutover: bool = False,
+        erasure_foundation: bool = True,
+        existing_parents: set[str] | None = None,
+        index_shapes: dict[str, tuple[Any, ...]] | None = None,
+        existing_indexes: set[str] | None = None,
     ) -> None:
         self.executed: list[tuple[str, dict[str, Any] | None]] = []
         self.live_project_ids = live_project_ids or []
         self.existing_partitions = existing_partitions
         self.attached_partitions = attached_partitions
+        self.authority_cutover = authority_cutover
+        self.erasure_foundation = erasure_foundation
+        self.existing_parents = existing_parents
+        self.index_shapes = index_shapes or {}
+        self.index_names = existing_indexes or set()
         self.open_transactions = 0
 
     def cursor(self) -> _FakeCursor:
@@ -337,7 +476,7 @@ def test_create_project_partitions_secures_every_table(table: str) -> None:
     stmts = conn.statements
     name = partition_name(table, PID_A)
     assert create_partition_sql(table, PID_A) in stmts
-    for stmt in partition_rls_statements(table, PID_A):
+    for stmt in partition_rls_statements(table, PID_A, erasure_foundation=True):
         assert stmt in stmts, f"{table}: missing {stmt!r}"
     for stmt in partition_grant_statements(table, PID_A):
         assert stmt in stmts, f"{table}: missing {stmt!r}"
@@ -345,7 +484,7 @@ def test_create_project_partitions_secures_every_table(table: str) -> None:
         assert stmt in stmts, f"{table}: missing {stmt!r}"
     # The partition must exist before RLS is applied to it.
     assert stmts.index(create_partition_sql(table, PID_A)) < stmts.index(
-        f"ALTER TABLE {name} ENABLE ROW LEVEL SECURITY"
+        f"ALTER TABLE public.{name} ENABLE ROW LEVEL SECURITY"
     )
 
 
@@ -368,18 +507,119 @@ def test_create_project_partitions_touches_only_this_projects_partitions() -> No
     assert not any(other in sql for sql in conn.statements)
 
 
+def test_create_project_partitions_refuses_a_same_name_unattached_relation() -> None:
+    name = partition_name("memory_item", PID_A)
+    conn = _FakeConn(existing_partitions={name}, attached_partitions=set())
+
+    with pytest.raises(RuntimeError, match="unexpected relation"):
+        partitions_mod.create_project_partitions(conn, PID_A)  # type: ignore[arg-type]
+
+    assert create_partition_sql("memory_item", PID_A) in conn.statements
+    assert f"ALTER TABLE public.{name} ENABLE ROW LEVEL SECURITY" not in conn.statements
+    assert conn.statements[-1] == "ROLLBACK"
+
+
+def test_create_project_partitions_refuses_a_canonical_index_collision_before_repair() -> None:
+    """An `IF NOT EXISTS` index name is never accepted without its exact shape."""
+
+    index_name = partition_index_name("memory_item", PID_A, "hnsw")
+    conn = _FakeConn(
+        existing_indexes={index_name},
+        index_shapes={
+            index_name: (
+                False,
+                "btree",
+                False,
+                False,
+                False,
+                [1],
+                [0],
+                ["pg_catalog.text_ops"],
+                [True],
+                ["status"],
+                False,
+                None,
+            )
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="partition index name"):
+        partitions_mod.create_project_partitions(conn, PID_A)  # type: ignore[arg-type]
+
+    assert create_partition_sql("memory_item", PID_A) in conn.statements
+    assert f"ALTER TABLE public.{partition_name('memory_item', PID_A)} ENABLE ROW LEVEL SECURITY" not in conn.statements
+    assert not any(statement.startswith("CREATE INDEX IF NOT EXISTS") for statement in conn.statements)
+    assert conn.statements[-1] == "ROLLBACK"
+
+
+@pytest.mark.parametrize(
+    ("table", "suffix", "shape"),
+    [
+        (
+            "memory_item",
+            "hnsw",
+            (
+                True,
+                "hnsw",
+                True,
+                True,
+                True,
+                [1],
+                [0],
+                ["public.vector_l2_ops"],
+                [False],
+                ["embedding"],
+                True,
+                None,
+            ),
+        ),
+        (
+            "memory_status_log",
+            "mem",
+            (
+                True,
+                "btree",
+                True,
+                True,
+                True,
+                [1, 2],
+                [0, 0],
+                ["pg_catalog.uuid_ops", "pg_catalog.timestamptz_ops"],
+                [True, True],
+                ["memory_id", "changed_at"],
+                True,
+                None,
+            ),
+        ),
+    ],
+)
+def test_create_project_partitions_rejects_wrong_opclass_or_ordering(
+    table: str, suffix: str, shape: tuple[Any, ...]
+) -> None:
+    """Catalog fields, not deparsed key text, bind extension/operator shape."""
+
+    index_name = partition_index_name(table, PID_A, suffix)
+    conn = _FakeConn(existing_indexes={index_name}, index_shapes={index_name: shape})
+
+    with pytest.raises(RuntimeError, match="partition index name"):
+        partitions_mod.create_project_partitions(conn, PID_A)  # type: ignore[arg-type]
+
+    assert conn.statements[-1] == "ROLLBACK"
+
+
 def test_drop_project_detaches_and_drops_all_thirteen_in_one_transaction() -> None:
     conn = _conn_with_all_partitions([PID_A])
-    partitions_mod.drop_project(conn, PID_A)  # type: ignore[arg-type]
+    partitions_mod._drop_project_for_pre_e3_test_only(conn, PID_A)  # type: ignore[arg-type]
     stmts = conn.statements
     assert stmts.count("BEGIN") == 1
     assert stmts[-1] == "COMMIT"
     for table in PARTITIONED_TABLES:
         name = partition_name(table, PID_A)
-        assert f"ALTER TABLE {table} DETACH PARTITION {name}" in stmts
-        assert f"DROP TABLE IF EXISTS {name}" in stmts
-        assert stmts.index(f"ALTER TABLE {table} DETACH PARTITION {name}") < stmts.index(
-            f"DROP TABLE IF EXISTS {name}"
+        qualified = f'"public"."{name}"'
+        assert f"ALTER TABLE public.{table} DETACH PARTITION {qualified}" in stmts
+        assert f"DROP TABLE {qualified}" in stmts
+        assert stmts.index(f"ALTER TABLE public.{table} DETACH PARTITION {qualified}") < stmts.index(
+            f"DROP TABLE {qualified}"
         )
     assert not any(PID_B.value.hex in sql for sql in stmts)
 
@@ -391,26 +631,24 @@ def test_drop_project_tolerates_a_missing_partition() -> None:
         partition_name(t, PID_A) for t in PARTITIONED_TABLES if t != "blackboard_entry"
     }
     conn = _FakeConn(existing_partitions=existing, attached_partitions=set(existing))
-    partitions_mod.drop_project(conn, PID_A)  # type: ignore[arg-type]
+    partitions_mod._drop_project_for_pre_e3_test_only(conn, PID_A)  # type: ignore[arg-type]
     stmts = conn.statements
     missing = partition_name("blackboard_entry", PID_A)
-    assert f"DROP TABLE IF EXISTS {missing}" not in stmts
-    assert f"DROP TABLE IF EXISTS {partition_name('memory_item', PID_A)}" in stmts
+    assert f'DROP TABLE "public"."{missing}"' not in stmts
+    assert f'DROP TABLE "public"."{partition_name("memory_item", PID_A)}"' in stmts
 
 
-def test_drop_project_skips_detach_for_an_orphaned_partition() -> None:
-    """A partition already detached by a half-finished earlier drop must
-    still be dropped — DETACHing it again would abort the transaction."""
+def test_drop_project_refuses_an_orphaned_same_name_relation() -> None:
+    """Erasure never drops an unattached lookalike relation by name alone."""
     existing = {partition_name(t, PID_A) for t in PARTITIONED_TABLES}
     attached = existing - {partition_name("memory_item", PID_A)}
     conn = _FakeConn(existing_partitions=existing, attached_partitions=attached)
-    partitions_mod.drop_project(conn, PID_A)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="unexpected relation"):
+        partitions_mod._drop_project_for_pre_e3_test_only(conn, PID_A)  # type: ignore[arg-type]
     stmts = conn.statements
-    assert (
-        f"ALTER TABLE memory_item DETACH PARTITION {partition_name('memory_item', PID_A)}"
-        not in stmts
-    )
-    assert f"DROP TABLE IF EXISTS {partition_name('memory_item', PID_A)}" in stmts
+    name = partition_name("memory_item", PID_A)
+    assert f'ALTER TABLE public.memory_item DETACH PARTITION "public"."{name}"' not in stmts
+    assert f'DROP TABLE "public"."{name}"' not in stmts
 
 
 def test_ensure_schema_current_skips_soft_deleted_projects() -> None:
@@ -419,9 +657,9 @@ def test_ensure_schema_current_skips_soft_deleted_projects() -> None:
     storage for a tenant whose data was erased."""
     conn = _FakeConn(live_project_ids=[PID_A.value])
     partitions_mod.ensure_schema_current(conn)  # type: ignore[arg-type]
-    select = next(s for s in conn.statements if s.startswith("SELECT project_id FROM project"))
+    select = next(s for s in conn.statements if s.startswith("SELECT project_id FROM public.project"))
     assert "deleted_at IS NULL" in select
-    assert "status <> 'deleted'" in select
+    assert "status IN ('active', 'suspended')" in select
     assert any(PID_A.value.hex in s for s in conn.statements)
 
 
@@ -437,9 +675,12 @@ def test_ensure_schema_current_reapplies_the_same_ddl_as_creation() -> None:
     swept_ddl = [
         s
         for s in swept.statements
-        if s not in ("BEGIN", "COMMIT") and not s.startswith("SELECT project_id FROM project")
+        if s not in ("BEGIN", "COMMIT")
+        and not s.startswith("SELECT project_id FROM public.project")
+        and not s.startswith("SELECT to_regclass")
     ]
-    assert ddl_only == swept_ddl
+    created_ddl = [s for s in ddl_only if not s.startswith("SELECT to_regclass")]
+    assert created_ddl == swept_ddl
 
 
 def test_ensure_schema_current_uses_one_transaction_per_project() -> None:
@@ -448,6 +689,32 @@ def test_ensure_schema_current_uses_one_transaction_per_project() -> None:
     assert conn.statements.count("BEGIN") == 2
     assert conn.statements.count("COMMIT") == 2
     assert conn.open_transactions == 0
+
+
+def test_c11_partition_lifecycle_skips_unpublished_e1_parents() -> None:
+    """Staged E1 code may administer a c11 catalog, never invent c12 tables."""
+
+    c11_parents = set(PARTITIONED_TABLES[:17])
+    conn = _FakeConn(erasure_foundation=False, existing_parents=c11_parents)
+    partitions_mod.create_project_partitions(conn, PID_A)  # type: ignore[arg-type]
+
+    assert all(
+        partition_name(table, PID_A) not in "\n".join(conn.statements)
+        for table in PARTITIONED_TABLES[17:]
+    )
+    assert "subject_digests" not in "\n".join(conn.statements)
+    assert "subject_digest, run_id" not in "\n".join(conn.statements)
+
+
+def test_e2_marked_catalog_refuses_a_missing_foundation_parent() -> None:
+    """Once c12 exists, skipping one of its E2 families would hide drift."""
+
+    conn = _FakeConn(
+        erasure_foundation=True,
+        existing_parents=set(PARTITIONED_TABLES) - {"erase_mem_set"},
+    )
+    with pytest.raises(RuntimeError, match="erasure-foundation partition parent is missing"):
+        partitions_mod.create_project_partitions(conn, PID_A)  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------- #
@@ -530,6 +797,22 @@ _SEED_ROWS: dict[str, str] = {
         " VALUES (%(pid)s, gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),"
         " 0.5, 0.6, 0.1, 1, now())"
     ),
+    # trace_learning_job: the 16th partitioned table (0008). A pending job has
+    # no lease/receipt, zero attempts, and needs the ended trace timestamp.
+    "trace_learning_job": (
+        "INSERT INTO trace_learning_job"
+        " (project_id, run_id, pipeline, pipeline_version, state, attempts, max_attempts,"
+        " available_at, trace_ended_at, schedule_source, scheduled_at, updated_at)"
+        " VALUES (%(pid)s, gen_random_uuid(), 'tier_a', 1, 'pending', 0, 3,"
+        " now(), now(), 'live', now(), now())"
+    ),
+    # run_owner: the 17th partitioned table (0010). It deliberately has no
+    # foreign keys because the migration's immutable owner record is the
+    # authority binding itself.
+    "run_owner": (
+        "INSERT INTO run_owner (project_id, run_id, principal_id, agent_type_id, origin, bound_at)"
+        " VALUES (%(pid)s, gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), 'trace', now())"
+    ),
 }
 
 
@@ -598,11 +881,17 @@ class TestPartitionsIntegration:
 
                 # B's DATA, not just B's partitions (PHASE-0 Task 6: "insert
                 # into each; drop_project removes one ... other intact").
+                # The owner test role bypasses RLS and earlier trace-learning
+                # integration cases may legitimately have scheduled jobs for
+                # other projects, so count B's partition key explicitly.
                 cur.execute(
                     "SELECT set_config('tracebed.project_id', %s, true)", (str(pid_b.value),)
                 )
                 for table in PARTITIONED_TABLES:
-                    cur.execute(f"SELECT count(*) FROM {table}")  # noqa: S608 - fixed whitelist
+                    cur.execute(
+                        f"SELECT count(*) FROM {table} WHERE project_id = %s",  # noqa: S608 - fixed whitelist
+                        (pid_b.value,),
+                    )
                     row = cur.fetchone()
                     assert row is not None and row[0] == 1, f"{table} lost project B's row"
             conn.rollback()
@@ -663,6 +952,72 @@ class TestPartitionsIntegration:
                     assert row is not None and row[0] == 1, (
                         f"{table}: app role with a valid GUC saw {row[0] if row else '?'} "
                         "rows, expected exactly project A's one"
+                    )
+            app_conn.rollback()
+        finally:
+            app_conn.close()
+
+    def test_trace_learning_jobs_deny_app_delete(
+        self, pg_dsn: str, pg_pool: Any, two_projects: tuple[Any, Any]
+    ) -> None:
+        """The durable job ledger is app append/update-only on parent and child.
+
+        The catalog assertion catches a missing child repair after default
+        privileges, while the app-role execution proves RLS cannot mask an
+        accidentally restored DELETE privilege.
+        """
+        import psycopg
+
+        from tracebed.stores.pg.pool import scoped
+
+        scope_a, _ = two_projects
+        project_id = scope_a.project_id
+        child = partition_name("trace_learning_job", project_id)
+        run_id = UUID("11111111-2222-3333-4444-555555555555")
+        with scoped(pg_pool, project_id) as conn:
+            conn.execute(
+                """
+                INSERT INTO trace_learning_job
+                    (project_id, run_id, pipeline, pipeline_version, state, attempts,
+                     max_attempts, trace_ended_at)
+                VALUES (%s, %s, 'tier_a', 1, 'pending', 0, 3, clock_timestamp())
+                """,
+                (project_id.value, run_id),
+            )
+            catalog = conn.execute(
+                """
+                SELECT table_name
+                FROM information_schema.role_table_grants
+                WHERE grantee = 'tracebed_app'
+                  AND table_schema = current_schema()
+                  AND table_name IN ('trace_learning_job', %s)
+                  AND privilege_type = 'DELETE'
+                """,
+                (child,),
+            ).fetchall()
+        assert catalog == []
+
+        try:
+            app_conn = psycopg.connect(_app_role_conninfo(pg_dsn), connect_timeout=2)
+        except psycopg.OperationalError as exc:
+            pytest.skip(
+                f"tracebed_app role unreachable ({exc.__class__.__name__}); set "
+                "TB_APP_ROLE_PASSWORD for this deployment"
+            )
+        try:
+            with app_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT set_config('tracebed.project_id', %s, true)",
+                    (str(project_id.value),),
+                )
+                with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                    cur.execute(
+                        """
+                        DELETE FROM trace_learning_job
+                        WHERE project_id = %s AND run_id = %s
+                          AND pipeline = 'tier_a' AND pipeline_version = 1
+                        """,
+                        (project_id.value, run_id),
                     )
             app_conn.rollback()
         finally:

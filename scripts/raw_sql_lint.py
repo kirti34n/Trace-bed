@@ -37,7 +37,7 @@ KEY_ALLOWED = "stores/valkey/keys.py"
 EXEC_ATTRS = {"execute", "executemany", "execute_batch", "executescript", "copy"}
 
 SQL_START = re.compile(
-    r"^\s*(SELECT|INSERT|UPDATE|DELETE|WITH|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE|SET\s+LOCAL|COPY)\b",
+    r"^\s*(SELECT\s+|INSERT\s+|UPDATE\s+|DELETE\s+FROM\s+|WITH\s+|CREATE\s+|ALTER\s+|DROP\s+|TRUNCATE\s+|GRANT\s+|REVOKE\s+|SET\s+LOCAL\s+|COPY\s+)",
     re.IGNORECASE,
 )
 
@@ -61,6 +61,12 @@ class Walker(ast.NodeVisitor):
         self.sql_allowed = any(rel_path.startswith(p) for p in SQL_ALLOWED_PREFIXES)
         self.key_allowed = rel_path == KEY_ALLOWED
         self.violations: list[Violation] = []
+        self.parents: dict[int, ast.AST] = {}
+
+    def generic_visit(self, node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            self.parents[id(child)] = node
+            self.visit(child)
 
     def visit_Call(self, node: ast.Call) -> None:
         if (
@@ -81,7 +87,10 @@ class Walker(ast.NodeVisitor):
     def visit_Constant(self, node: ast.Constant) -> None:
         if isinstance(node.value, str):
             text = node.value
-            if not self.sql_allowed and SQL_START.match(text):
+            # Module/function/class documentation is executable AST data but
+            # never a query.  Other standalone prose is treated the same.
+            standalone = isinstance(self.parents.get(id(node)), ast.Expr)
+            if not standalone and not self.sql_allowed and SQL_START.match(text):
                 head = " ".join(text.split())[:60]
                 self.violations.append(
                     Violation(self.rel, node.lineno, "sql-literal",
@@ -120,6 +129,9 @@ def check_source(rel_path: str, source: str) -> list[Violation]:
 def self_test() -> int:
     cases: list[tuple[str, str, str, int]] = [
         ("api/routes.py", 'conn.execute("SELECT 1")', "must flag execute + literal", 2),
+        ("edge/main.py", '"""SELECT prose in a FastAPI docstring."""\nmethod = "DELETE"', "docs and HTTP DELETE are not SQL", 0),
+        ("edge/local_demo.py", 'query = "DELETE FROM accounts"', "real DELETE remains flagged", 1),
+        ("edge/local_demo.py", 'query = "SELECT id FROM accounts"', "real SELECT remains flagged", 1),
         ("api/routes.py", "await conn.execute(query)", "must flag execute", 1),
         ("stores/pg/repo.py", 'cur.execute("SELECT 1")', "repo is exempt", 0),
         ("hotpath/retriever.py", 'key = f"tb:{pid}:wm"', "key literal outside keys.py", 1),

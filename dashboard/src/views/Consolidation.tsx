@@ -1,6 +1,5 @@
 import { useMemo } from "react";
-import { get } from "../api/client";
-import { useQuery } from "../api/hooks";
+import { useConsolidationDiffs } from "../api/hooks";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { Table, type ColumnDef } from "../components/Table";
@@ -37,38 +36,7 @@ import { formatDateTime, formatFloat, formatInt, truncateId } from "../lib/forma
 // Interfaces transcribed from src/tracebed/api/models_reports.py:
 // ConsolidationDiffsOut / ConsolidationDiffOut.
 
-// --------------------------------------------------------------------- //
-// Wire contract for GET /admin/consolidation/diffs.
-// --------------------------------------------------------------------- //
-
-interface ConsolidationDiffOut {
-  agent_type_id: string;
-  key: string;
-  version: number;
-  value: Record<string, unknown>;
-  /** Signed percentage move from the previous version (D-022's ±10% rate
-   * clamp input). `null` for a first version — there is no previous value to
-   * have moved from, which is not the same as "moved 0%". */
-  delta_pct: number | null;
-  /** True when D-022's rate-bounded-movement clamp bound this update: the
-   * consolidator wanted to move further than one step allows. */
-  clamped: boolean;
-  /** `1 - |delta_pct|/100`, clamped to [0,1]. NOT the ACE information-retention
-   * metric — see this file's header. `null` iff `delta_pct` is null. */
-  value_retained_fraction: number | null;
-  computed_at: string;
-}
-
-interface ConsolidationDiffsOut {
-  items: ConsolidationDiffOut[];
-  limit: number;
-  offset: number;
-  returned: number;
-  /** False on every build where no writer for per-sweep ADD/AMEND/REMOVE
-   * deltas exists. Lets this view distinguish "no sweeps ran" from "sweeps
-   * are not recorded anywhere", which an empty `items` list cannot. */
-  sweep_deltas_available: boolean;
-}
+import type { ConsolidationDiffOut } from "../api/types";
 
 // --------------------------------------------------------------------- //
 // Sections
@@ -206,10 +174,7 @@ function DerivedStateTable({ items }: { items: ConsolidationDiffOut[] }) {
 // --------------------------------------------------------------------- //
 
 export default function Consolidation() {
-  const query = useQuery<ConsolidationDiffsOut>(
-    (signal) => get<ConsolidationDiffsOut>("/admin/consolidation/diffs", { signal }),
-    "/admin/consolidation/diffs"
-  );
+  const query = useConsolidationDiffs();
   const diffs = query.data;
 
   const clampedCount = useMemo(

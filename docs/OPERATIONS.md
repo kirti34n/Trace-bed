@@ -1,363 +1,284 @@
-# Tracebed — Operations Guide
+# Tracebed operations
 
-> Running Tracebed: migrations, partitions and the 1,000-project ceiling, the spend cap, the
-> kill switch and its lift report, the review queue, erasure, backup/restore, and what each
-> gate report means.
->
-> Rev. 2026-07-27 · API `:8110` · Dashboard `:8111` · Companion to `docs/ADAPTER-GUIDE.md`
-> (the integration seam) and `docs/MEMORY-FLOW.md` (the read/write/lifecycle model).
+> These are planning notes for local evaluation and deployment design. They are not a production
+> runbook, support commitment, availability claim, or evidence that a supplied configuration is
+> safe for a particular environment.
 
----
+## Navigation
 
-## 1. Bringing the stack up
+- [Local evaluation](#local-evaluation)
+- [Owner onboarding](#owner-onboarding-for-an-existing-project)
+- [SDK and request bounds](#sdk-and-request-bounds)
+- [Model-provider configuration](#model-provider-configuration)
+- [Loopback-only local demo](#loopback-only-local-demo)
 
-Local dev stack (`docker/compose.yaml`): Postgres 18 (`tensorchord/vchord-suite:pg18-latest`
-— pgvector + `vchord_bm25` + `pg_tokenizer` bundled; the stack is verified to come up on this
-image against Postgres 18.3, migrations `0001`..`0006` apply, and the full suite runs green
-against it — still pin by digest for a reproducible deployment), Valkey 8, SeaweedFS (generic
-S3 target for the trace store), and — only under the `full` profile — the `api` and
-`dashboard` containers:
+## SDK and request bounds
 
-```bash
-docker compose -f docker/compose.yaml up -d                  # postgres, valkey, seaweedfs
-docker compose -f docker/compose.yaml --profile full up -d    # + api, dashboard
-```
+The SDK keeps a bounded in-process FIFO. Its write calls append work without HTTP or JSON
+serialization on the host path. A flush leases work, freezes the payload on first send, and
+retains retryable failures for a later flush pass. `FlushReport.pending` includes leased and
+queued work; a fully leased buffer rejects a new item rather than evicting in-flight work.
 
-Ports are deliberately non-default so they never collide with a host service already running
-on the standard ports: Postgres on `5442` (not `5432`), Valkey on `6389` (not `6379`),
-SeaweedFS S3 on `8333`. Tracebed's own API is `8110`, the dashboard `8111` — both PLAN.md
-defaults, unmoved.
+This does not provide durable client spooling, exactly-once ingress, a bounded run-sequence map,
+or strict cancellation of in-progress native I/O. Server request deadlines are cooperative
+absolute budgets: each boundary checks remaining time before beginning new work and narrows
+database/query timeouts where supported. A pool health check, HTTP read already under way,
+synchronous parsing, or provider call may finish after a request has stopped waiting.
 
-Environment, split by what actually happens when it is absent — the "if absent" column is
-not decoration. Four of these five abort startup (three for both process types, one for the
-API only) and the fifth deliberately does not; a flat "required environment" list hides that
-difference until a deployment finds it the hard way.
+An isolated authority/restart acceptance sequence observed one unlabeled 503 and one feedback 500
+after 5004 ms; a later full run passed without a runtime change. Their cause remains unknown. Do
+not treat the later run or the API-health timeout correction as evidence that either observation is
+resolved.
 
-| Variable | Required by | If absent |
-|---|---|---|
-| `TB_STORAGE__PG_DSN` | `tracebed-api`, `tracebed-worker` | `TracebedSettings()` raises `ValidationError` — `StorageConfig.pg_dsn` has no default. Process does not start. |
-| `TB_EMBEDDING__MODEL_VERSION` | `tracebed-api`, `tracebed-worker` | Same: `EmbeddingConfig.model_version` has no default, deliberately (an unpinned embedding version would be stamped onto every row it embedded). Process does not start. |
-| `TB_MASTER_KEY` | `tracebed-api`, `tracebed-worker` | `crypto.shred.EnvMasterKeyProvider.__init__` raises `MasterKeyMissing` — it validates eagerly, so a broken crypto seam is found at startup, never the first time a trace is written. Base64, exactly 32 bytes. **The name has no `TB_CRYPTO__` prefix and is not a `TracebedSettings` field** (C-15: settings objects get `repr()`'d into logs, and key material must not be one accidental `str(settings)` from a leak). `docker/compose.yaml` sets exactly this name; it previously set `TB_CRYPTO__MASTER_KEY`, which nothing read, and the `full`-profile `api` container aborted with `MasterKeyMissing` even when a key was supplied. Fixed at the Phase 4 integration pass. |
-| `TB_HOLDOUT_SALT` | `tracebed-api` only | `hotpath.holdout.read_salt` raises `LookupError` inside `_build_pipeline` and the API does not start; `workers.runner.run()` never reads it. Uncaught on purpose: an unsalted arm assignment is *predictable* rather than merely weak, so the lift the kill switch reads is compromised from the first request. Not the compose file's `dev-salt-change-me` in anything but local dev. |
-| `TB_ADMIN_KEY` | neither — **optional** | The API starts, and every `/admin/*` route answers a uniform 401 (`api.main._resolve_admin_key_hash` returns `None`). Set it to bootstrap the first `POST /admin/projects` / `POST /admin/agents/register` before any OIDC or API-key principal exists; a process with no need for `/admin/*` (a read-replica dashboard, say) must still boot, which is why this one is not fatal. |
+## Model-provider configuration
 
-`TB_LLM_API_KEY` (`LLMProviderConfig.api_key_env`) and `TB_S3_ACCESS_KEY` /
-`TB_S3_SECRET_KEY` (`TraceStoreConfig`) follow the same pattern as `TB_ADMIN_KEY` — read from
-the environment by name, not modelled as settings fields, and needed only by the deployments
-that actually reach the provider or bucket they name.
+Embedding and background generation share `LLMProviderConfig.base_url` and the operator-managed
+key environment variable named by `api_key_env` (default `TB_LLM_API_KEY`). The default `gemini`
+embedding driver sends query text to its OpenAI-compatible `/embeddings` endpoint under the
+retrieval embedding sub-budget. `TB_EMBEDDING__MODEL_VERSION` is locally recorded metadata, not a
+remote-version attestation: the client sends only model and input. Its configured 768-dimensional
+pin is also not included in that request. Google's [embedding guide](https://ai.google.dev/gemini-api/docs/embeddings)
+documents a default 3072-dimensional output and a separate output-dimensionality control. No paid
+request has established that Gemini's OpenAI-compatible endpoint accepts the corresponding
+control, so live Gemini compatibility and dimension validation remain open release work. The
+default endpoint is Gemini's OpenAI-compatible API. A configured alternative endpoint is not a
+repository-validated compatibility claim.
 
-Entry points (`pyproject.toml`): `tracebed-api` (`tracebed.api.main:run`) and
-`tracebed-worker` (`tracebed.workers.runner:run`) — one process type for the sync API, one
-for the async worker loop. Both read the same `TracebedSettings`, but as the table above
-shows they do **not** need the same environment: the API additionally requires the holdout
-salt, because it is the process that assigns arms.
+This source configuration does not activate a complete learned-memory loop. Operators must assess
+provider data egress, cost, rate limits, credentials, model pinning, and approval policy before
+enabling any background use. The retrieval hot path does not call a generative provider, but it
+can call the configured embedding provider. `hash-local` avoids network calls for offline use and
+is not a semantic-model substitute.
 
-## 2. Migrations
+## Local evaluation
 
-CI, the phase gates, and `tests/phase0/test_migrations.py` all call
-`tracebed.stores.pg.migrate.apply_migrations(dsn)` / `rollback_migrations(dsn)` /
-`current_revision(dsn)` directly — never a subprocess shelling out to the `yoyo` CLI — so the
-exact same code path runs the migration tree in every environment, including CI.
+Use an isolated environment and non-production data. Review the configuration model, migrations,
+and service definitions before running them. For Compose-v1 authority-runtime credentials, use
+only the supported secret-file paths; never put those values in this repository, an issue report,
+or a test fixture. This file-only rule does not prohibit direct-process provider configuration:
+the embedding or generation client reads the operator-selected environment variable named by
+`LLMProviderConfig.api_key_env` (default `TB_LLM_API_KEY`). Keep that provider key out of source,
+shell history, reports, and Compose authority-runtime containers unless a deployment owner has
+explicitly designed its handling.
 
-```python
-from tracebed.stores.pg.migrate import apply_migrations
-apply_migrations(dsn)   # dsn = TB_STORAGE__PG_DSN
-```
-
-For interactive/manual use against a local database, `migrate` now ships a real CLI over the
-same functions — `python -m tracebed.stores.pg.migrate <apply|rollback|rollback-all|list>`,
-DSN from `--dsn` or `$TB_STORAGE__PG_DSN` (migrations run as the owner role, never the app
-role). This is the runbook command that actually touches the database; the module previously
-had no `__main__`, so `python -m ... apply` imported and exited 0 without applying anything:
+The following is a typical development sequence, not a deployment instruction:
 
 ```bash
-python -m tracebed.stores.pg.migrate apply         # DSN from $TB_STORAGE__PG_DSN
-python -m tracebed.stores.pg.migrate rollback      # roll back the most recent migration
-python -m tracebed.stores.pg.migrate rollback-all  # roll back every applied migration
-python -m tracebed.stores.pg.migrate list          # ids currently applied
+uv sync --locked --extra dev
+uv run python scripts/capability_check.py --check
+uv run pytest -q
 ```
 
-`migrations/yoyo.ini` remains for driving the `yoyo` CLI directly (it deliberately has no
-`database =` line committed — a checked-in DSN reads as a checked-in credential):
+Some repository tests and services require local dependencies or configuration that are not
+available in every environment. Record the actual environment, results, and exclusions whenever
+using a run as evidence.
+
+## Owner onboarding for an existing project
+
+The installed `tracebed-onboard-agent` command creates one **new** registered principal, agent
+type, and explicit grants in one owner transaction. It is an owner-only one-shot command, not an
+HTTP endpoint or a long-running service. It does not replay an earlier registration: retries after
+an unknown result need operator investigation rather than assuming idempotency.
+
+This repository currently has no supported public operator CLI or HTTP route for creating the
+initial standalone project. Run this procedure only after an owner-controlled provisioning process
+has supplied the project UUID. The loopback demo's internal provisioning is not that general
+operator workflow and does not issue a reusable SDK credential.
+
+For an API principal with the `data` role, obtain the project UUID, a non-secret key identifier,
+and a random secret from the operator's secret-management process. Set them in the current
+operator session without placing the secret in shell history or the command line:
 
 ```bash
-yoyo apply    -c migrations/yoyo.ini --database "$TB_STORAGE__PG_DSN"
-yoyo rollback -c migrations/yoyo.ini --database "$TB_STORAGE__PG_DSN"
-yoyo list     -c migrations/yoyo.ini --database "$TB_STORAGE__PG_DSN"
+export TB_ONBOARDING_PROJECT_ID='<existing-project-uuid>'
+export TB_ONBOARDING_AGENT_TYPE='your-agent-type'
+export TB_ONBOARDING_PRINCIPAL_KIND='api_key'
+# Use a nonempty operator-generated UUID hex value; it must not contain a dot.
+export TB_ONBOARDING_API_KEY_ID='<operator-generated-uuid-hex>'
+# Populate this from the operator's secret-management process.
+export TB_ONBOARDING_API_KEY_SECRET
+export TB_ONBOARDING_GRANTS='[{"role":"data"}]'
 ```
 
-Six migrations ship: `0001_registries.sql` (project/principal/agent_type/agent_registration,
-embedding/scoring-epoch pins, config tables — unpartitioned, small), `0002_partitioned.sql`
-(the full learning-plane DDL, `LIST PARTITION BY (project_id)`, plus `work_queue`/
-`dead_letter`), `0003_rls.sql` (`ENABLE ROW LEVEL SECURITY` + `FORCE ROW LEVEL SECURITY` on
-every partitioned table, and the app role's grants — the app role is **not** table owner and
-holds **no** `BYPASSRLS`), `0004_lifecycle.sql`, `0005_bm25.sql` (the BM25 ranking setup —
-the `tracebed_lexical` tokenizer config and the `content_bm25` column; the `vchord_bm25` +
-`pg_tokenizer` extensions themselves ship in `0001`. Per-term document frequency comes from a
-`lexemes` tsvector column; this stack **replaced the phantom `pg_textsearch` extension**, which
-does not exist — see DECISIONS D-140), and `0006_q_update_ledger.sql`. Each has a matching `.rollback.sql`.
-Migrations are plain SQL by
-design (D-034: "Alembic drags SQLAlchemy against the lean-deps rule; a first-party runner
-reinvents ordering/locking yoyo already solved") — there is no ORM layer to fight when reading
-them.
+Run the command from the repository root against the existing controller project only. Set
+`COMPOSE_PROJECT_NAME` to that exact project before invoking it; the parameter expansion rejects a
+missing value rather than accidentally creating a new Compose project. Reuse the same validated
+named-secret environment supplied to the controller. Passing only onboarding environment names
+avoids placing their values in the Docker command line. The wrapper derives its database route from
+the mounted owner password; do not set `TB_ONBOARDING_PG_DSN` yourself. This is not a raw-Compose
+repair path for a loopback demo or an incomplete deployment.
 
-New projects and DDL drift both go through `stores.pg.partitions`, not a fourth migration file
-per project — see below.
+```bash
+docker compose \
+  --project-directory . \
+  --file docker/compose.yaml \
+  --project-name "${COMPOSE_PROJECT_NAME:?set this to the existing controller project}" \
+  run --rm --no-deps \
+  -e TB_ONBOARDING_PROJECT_ID \
+  -e TB_ONBOARDING_AGENT_TYPE \
+  -e TB_ONBOARDING_PRINCIPAL_KIND \
+  -e TB_ONBOARDING_API_KEY_ID \
+  -e TB_ONBOARDING_API_KEY_SECRET \
+  -e TB_ONBOARDING_GRANTS \
+  --entrypoint tracebed-compose-onboard db-bootstrap
+```
 
-## 3. Partitions, the 1,000-project ceiling, and the HASH migration path
+The command prints public `principal_id` and `agent_type_id`. Preserve the API credential through
+the operator's secret manager as `tb_sk_<key-id>.<secret>`; the command does not print it. A
+`feedback` grant additionally requires its allowed `feedback_source`. Do not treat successful
+registration as evidence that a deployment identity boundary, provider configuration, or host
+integration is production-ready.
 
-`stores.pg.partitions.create_project_partitions` provisions one partition per project per
-learning-plane table (`stores.pg.ddl.PARTITIONED_TABLES`, ~13 tables) at project-creation
-time, under migration/admin privileges — never through the RLS-scoped app connection `Repo`
-uses. `ensure_schema_current` re-runs the same DDL for every *existing* project when the
-partition/RLS/grant/index shape changes, so new and existing projects can never drift from
-each other. `drop_project` is the deletion mechanism: `DETACH`/`DROP` across all ~13 tables in
-one transaction — O(1) per table, not a `DELETE` that has to visit every row.
+## Compose-v1 authority-cutover receipt
 
-**Documented ceiling: 1,000 projects per instance** (≈13,000 partitions total). This is not a
-soft guideline — the Postgres query planner considers every partition of every partitioned
-table referenced in a plan even when partition pruning eliminates most of them at execution
-time, and planning time degrades measurably once a table's partition count reaches the low
-thousands. Approaching this ceiling shows up as rising query-planning latency across *every*
-partitioned-table query, project-independent — it is a whole-instance symptom, not a
-per-project one, and it will not announce itself as an error.
+The supported local topology is Compose-v1 only. It uses the checked, ordered
+`docker/postgres/pg_hba.conf` profile and requires `TB_PG_HBA_PROFILE=compose-v1` inside the
+owner-only bootstrap container. Bootstrap reloads and attests the live `hba_file` and parsed
+`pg_hba_file_rules` before publication, active retry, and rollback. The former
+`TB_0011_INGRESS_QUARANTINED` environment override is rejected; it is not a routing proof.
+The final activation transaction takes the cutover singleton lock and re-attests the already
+loaded profile immediately before it publishes the two runtime logins; fresh physical probes run
+after publication. A mismatch quarantines both runtime roles and their sessions. The HBA bind
+mount is read-only to containers. Concurrent host-root mutation of that mounted file is outside
+this local Compose security boundary and is not claimed as protected.
 
-**Migration path past the ceiling.** New deployments approaching 1,000 projects switch
-`PARTITION BY LIST (project_id)` to `PARTITION BY HASH (project_id)` in the DDL. Project
-deletion becomes a bulk `DELETE FROM t WHERE project_id = $1` per table instead of
-`DETACH`/`DROP` — slower per deletion, but partition count stops scaling with project count
-at all. The public API (`create_project_partitions` / `drop_project` / `ensure_schema_current`)
-does not change across that switch (D-017: "the repository hides the strategy") — nothing
-outside `stores/pg/` should ever branch on which partitioning strategy a deployment uses. **A
-deployment operator's job when approaching the ceiling is choosing to make this switch on a
-new deployment**, not migrating a live one in place — DECISIONS.md does not describe an
-in-place LIST→HASH migration for an already-populated instance, and inventing one is exactly
-the kind of quiet workaround PLAN.md §10 forbids; treat "past the ceiling" as a capacity
-planning signal to provision a second instance or a HASH-partitioned one, not a live migration
-to perform under load.
+Run the closed lifecycle controller (`uv run python scripts/compose_stack.py start`, `upgrade`, or
+`rollback`) with named local secret-file paths. It has no arbitrary host/HBA endpoint mode. The
+bootstrap records the in-session migration receipt only after the exact Compose-v1 HBA proof and
+requires the legacy application credential to fail a real login attempt after existing sessions
+have been terminated.
 
-## 4. Spend cap
+The Compose bootstrap process derives its fixed owner-only route from
+`TB_OWNER_DB_PASSWORD_FILE`; no bootstrap DSN, plaintext password, endpoint, or free-form HBA
+input is accepted. The API and worker mount only their own password file and build their fixed
+in-network route at process start. API-only `admin_key` and readiness-token files are not mounted
+in the worker. Before any Docker mutation the controller accepts exactly one euid/egid-owned 0700
+secret directory with the fixed 0444, non-symlink, single-link leaf set. The controller rejects
+arbitrary external topology modes. On supported Linux hosts it also requires the `ip` utility and
+refuses every Docker-network or host-route overlap with the fixed `10.77.10.0/29` through
+`10.77.16.0/29` ranges before it can create a Compose resource. Hosts where that route inspection
+cannot run are an unsupported Compose-v1 prerequisite failure, not a best-effort launch.
 
-`workers.spend.SpendMeter` records every LLM call into `spend_ledger`, rolled up by
-`(project, UTC day, worker, model)` — bucketed on the **UTC calendar day** always, computed
-from `Clock.now()`, never local time, so "spend for 2026-07-25" means the same 24-hour window
-in every deployment timezone. `SpendConfig.daily_llm_cap_usd` (default 25.0/project/day) is
-the threshold `CapStatus.exceeded` reports against.
+The authority catalog has a durable admission singleton. Every authorized queue write, retrieval
+run-open, and invalidation transaction holds a shared lock on an open admission row. Upgrade or
+rollback stops dashboard/API, stops the erasure executor and waits for its live lease to release or
+expire, then closes admission, leaves worker running to drain all v1 work (including leased rows),
+and finally stops it before the owner proof. Failure leaves admission closed. It reopens only after HBA/bootstrap/S3
+success and immediately before healthy runtime publication. Runtime processes are first started
+while closed and prove their fixed identity/profile through an internal controller-only readiness
+path; `/readyz` and worker serving health additionally require the singleton to be open. The
+owner `admission-open` action is the controller's final publication mutation, with no subsequent
+fallible health probe. Any earlier publication failure stops the partial runtime and owner-proves
+that admission remained closed.
 
-`workers.spend_enforce.SpendEnforcer` is what actually *acts* on that status: on cap,
-background workers pause and an alert fires — **the hot path is structurally unaffected**.
-This is not a convention; `scripts/purity_check.py` proves no `workers` module (this one
-included) is reachable from `hotpath/`'s import graph, and `hotpath.pipeline.Pipeline` has no
-constructor dependency that is, or reaches, a spend meter. There is no value of "spend today"
-that changes what `Pipeline.retrieve()` returns. A cap that took down retrieval would turn a
-billing event into an outage — PLAN.md §6 is explicit that this must not happen.
+`start` is only for a zero-state or owner-proven idle, drained, closed stack. It refuses any
+existing API/worker/erasure/dashboard container, runtime session, or open/non-provable admission receipt
+and directs the operator to `upgrade`; it never repurposes an unknown partial runtime. A current
+project's fixed ranges receive no host-route exemption merely from Compose labels: the controller
+authenticates all seven exact bridge networks, IPAM/gateway/internal flags, static service
+attachments, container identity, and the corresponding Linux bridge device before accepting an
+exact main-table route. Malformed, partial, relabelled, foreign-attached, duplicate, or
+policy-table overlap is refused.
 
-**Deliberate exemption (PLAN.md §10):** org-level rollup of spend/token/latency is billing
-metadata and is the *one* explicit exception to the cross-project aggregation ban. Nothing
-else — memory content, memory-derived statistics, "anonymized" aggregates — gets the same
-exemption. If you build an org-rollup dashboard, it must read only `spend_ledger` (and its
-telemetry siblings), scoped project-by-project and summed outside the query layer, never a
-query that aggregates memory content across projects.
+After a successful pre-activity E4 rollback, the controller restores only a closed-ready ordinary
+worker so its next supported `upgrade` can authenticate and drain it before republishing. API,
+dashboard, and erasure remain stopped and admission remains closed. A post-activity **0013**
+rollback refusal independently re-authenticates the still-active E4 receipt, recorded executor
+activity, published role shape, and closed admission before restoring that same worker for
+`upgrade` recovery. An ambiguous owner-call failure is not treated as this certified refusal and
+leaves the worker absent/fenced. Direct Compose removal or restart is not a recovery path.
 
-## 5. The kill switch and its lift report
+This source-controlled Compose-v1 proof is not evidence for an arbitrary external HBA, firewall,
+load balancer, TLS termination, or topology. Those controls are unsupported here and must be
+independently designed and verified by a deployment owner. Run mutation through the closed
+Compose lifecycle controller; the upstream yoyo CLI is read-only (`yoyo list`) only. The
+repository wrapper adds an invocation receipt after live HBA proof, so a direct mutable yoyo
+invocation is intentionally rejected before the authority migration takes locks. That receipt
+protects against an accidental unsupported runner, not against a database owner setting an
+arbitrary custom GUC.
+The in-process trusted-DSN marker used to carry that receipt is likewise an internal accidental-
+path guard: Python code in the same process can forge it, so it is not an authorization boundary.
 
-`workers.killswitch` auto-disables one `(agent_type_id, mem_type)` cell — never a whole
-project, never a whole mem_type across every agent type — when **all three** of these hold,
-independently checked so an operator (and every test) can see which one, if any, is missing:
+## Pre-activity 0011 rollback
 
-1. **Lower confidence bound < 0**, from `workers.lift.LiftEstimate.lower_bound` — never the
-   point estimate. A `-0.01` point estimate with a `[-0.30, +0.28]` interval is not the same
-   evidence as `-0.01` with a tight interval, and the trigger reads the bound, not the centre.
-2. **Sustained for `killswitch.window_days`** (default 14): the bound must be adverse on
-   *every* day of an unbroken trailing window, not merely on the day being evaluated.
-3. **Minimum cell N (`killswitch.min_cell_n`, default 200) on every one of those days.** A
-   "sustained" run of days with too few observations to trust is thin data agreeing with
-   itself, not evidence.
+Rollback is a recovery operation for an activated cutover with no recorded authority activity. It
+does not reopen the legacy application credential. The closed controller first stops dashboard and
+API, closes admission and drains through the real worker identity, then stops worker and invokes
+the one-shot owner bootstrap with the exact Compose-v1 HBA proof.
+It has no rollback argument for a password, DSN, host, or other topology input.
 
-A fourth control — Benjamini-Hochberg correction across the whole agent-type × mem-type grid
-— exists because even when every cell clears the three conditions above at nominal alpha,
-testing many cells simultaneously produces roughly one false positive per window by chance
-alone.
+The action commits a durable `NOLOGIN` quarantine for the retired legacy application identity and
+the current API and worker runtime identities, terminates existing sessions, and proves each
+configured credential is refused before it invokes exactly the repository-owned atomic 0011
+rollback. It also authenticates the complete ordered yoyo
+history through 0011 before it can create that quarantine, so an unknown, missing, or forged
+migration-log row requires investigation rather than a role mutation. A yoyo or probe failure leaves
+that outage fence and receipt in place; repeat the same action after resolving the cause. There is deliberately no
+cancel-quarantine or automatic LOGIN compensation. A direct yoyo rollback without the live HBA
+proof, Tracebed atomic-runner receipt, and committed quarantine is rejected. The receipt guards
+against accidentally using an unsupported invocation; it is not proof against a database owner
+setting a custom GUC.
 
-**Reading the lift report correctly is the whole point.** `workers.lift` never compares "every
-`memory_on` run" against "every `holdout` run" — `abstention.target_abstention_pct` is ≥50 by
-design, so most calls in *either* arm abstain or degrade, and averaging that noise into two
-buckets computes the difference between two clouds of nothing. The corrected comparison is
-runs where **something was actually injected** (`arm=memory_on`, `injection_log` rows exist)
-against **shadow-retrieved holdout** runs (`arm=holdout`, retrieval ran and *would* have
-placed a memory), stratified per `(agent_type_id, mem_type)` cell. When you read a lift
-report:
+## Deployment decisions a human owner must make
 
-- Look at the **lower confidence bound** per cell, not an aggregate number — a pooled
-  estimate across agent types averages out "helps type A, hurts type B" into "no effect",
-  which is the same failure at a different grain.
-- `"operational lane only"` — i.e., the quality lane showing no measurable lift anywhere — is
-  a **documented passing outcome** (PLAN.md §7 Phase 3 gate), not a sign something is broken.
-  2026 evidence at the time this was written says it is the likely result; do not chase a
-  positive number that isn't there.
-- A triggered cell writes exactly one `killswitch_state` row for that `(agent_type_id,
-  mem_type)` — check `evidence` on that row for the three booleans above plus the BH-corrected
-  q-value, not just the fact that it fired.
-- There is **no automatic re-enable**. Recovery is an operator action
-  (`record_override`, tagged `evidence["source"] == "operator_override"`, distinguishable
-  from an automatic trigger's `"auto_killswitch"`) — and a known limitation applies: a
-  standing override is not re-checked before the next automatic evaluation, so a cell that
-  still meets the trigger condition will be disabled again on the next tick. Re-running the
-  evaluation right after an override without also fixing the underlying cause will look like
-  the override "didn't take."
+- Establish an identity model, project boundaries, service accounts, and least-privilege database
+  roles that match the deployment.
+- Decide which event fields may be captured, where raw evidence resides, how it is encrypted, and
+  how retention, export, and deletion requests are handled.
+- Set network boundaries, TLS, secret rotation, backup/restore testing, monitoring, alerting, and
+  incident response appropriate to the environment.
+- Review worker scheduling, rate limits, resource budgets, and failure behavior before enabling
+  derived-memory or retrieval paths.
+- Run a deployment-specific security review and use the release checklist before making a public
+  reliability or security claim.
 
-`workers.safety_lift` (CUTTABLE improvement 2) runs the identical sustained-window/min-N/BH
-machinery against policy-violation rate instead of task-quality lift, with the adverse
-direction flipped (`AdverseDirection.HIGHER`, not `LOWER`) — a benign accumulation of
-retrieved content can degrade safety with no attacker present, and render-as-data does nothing
-to stop that kind of drift because it is statistical, not an injection attack.
+See [DATA-LIFECYCLE.md](DATA-LIFECYCLE.md), [THREAT-MODEL.md](THREAT-MODEL.md), and
+[repository-settings/release-checklist.md](../repository-settings/release-checklist.md). The
+capability contract classifies this repository as `not_ready` for production readiness.
 
-## 6. The review queue
+## Loopback-only local demo
 
-Five kinds of row land in `review_queue`, each with a `reason` string naming the memory (or
-key), the numbers involved, and the threshold that was **not** met — written for a human to
-act on, not as an error code:
+Use `uv run python scripts/local_demo.py start`, `status`, and `stop` as the only supported demo
+commands. The launcher creates a private `.tracebed-demo/` secret/state tree, publishes the
+dashboard only on a chosen `127.0.0.1` port, and persists no secret in its state receipt. It uses
+the normal controller under its lifecycle lock, then runs separate owner provisioning and
+ingress-only data-seeding one-shots.
 
-1. **Scan rejections** — `core.scans.scan` refused content outright.
-2. **Open contradictions** — `candidate → validated`'s `open_contradiction` guard is blocking
-   promotion and neither the weaker- nor equal/stronger-provenance edge resolves it; nothing
-   in the state machine will ever clear this automatically.
-3. **K−1 retirement candidates** — `validated → retired`'s guard is satisfied on Q and
-   scored-use-count but refuses on distinct-principal count below K
-   (`retirement.min_distinct_principals`, D-021) — routed here instead of auto-retired.
-4. **Clamp-binding alerts** — `derived_state`'s movement clamp bound three consecutive updates
-   (`derived.clamp_alert_consecutive`).
-5. **Divergence alarms** — the fast (24h) and slow (30d) reference values for a derived-state
-   key have diverged past `derived.divergence_alarm_pct`.
+The local edge accepts the exact loopback Host and Origin plus its fixed dashboard peer and Docker
+loopback gateway. This blocks Host/Origin rebinding in the supported Docker publication boundary;
+it is not a general reverse-proxy or public-DNS deployment pattern. The demo evidence is imported
+after execution with a synthetic recorded timestamp and must not be represented as native telemetry.
 
-Plus, from Recall & Rollback (`workers.forensics`, CUTTABLE improvement 1): the contained
-memory itself, each re-opened outcome, and each derived descendant — one row per affected
-item, so a blast-radius report is actionable item-by-item, not one opaque summary row.
+`stop` fences admission and drains before fixed `down --remove-orphans`; it deliberately preserves
+state and named volumes. There is no reset command. Do not delete the state directory or use raw
+Compose to recover it. Only one fixed-subnet instance is supported per Linux host; the controller
+rejects route/IPAM collisions. The base controller's host-route proof is a supported-Linux control,
+not a claim about non-Linux deployments.
 
-**A live containment gap, reported rather than fixed** (see `workers/forensics.py`'s own
-docstring): `domain.state_machine.TRANSITIONS` has no `validated → quarantined` edge, so a
-poisoned memory discovered at `validated` is contained via the nearest *legal* edge that
-removes it from `RETRIEVABLE_STATUSES` — usually `validated → stale`. But `stale → validated`
-is a legal edge `workers.revalidation` takes **unattended** whenever its verifier re-verifies,
-and a locally-correct poisoned memory (the classic OEP shape) is exactly the kind that
-re-verifies. `BlastRadiusReport.containment_reversible_by` names every status a background
-worker can walk the row back to — **check this field**; a non-empty tuple means the
-containment does not hold unattended and a human decision (an operator edit, or a fix to
-`domain/state_machine.py`) is required before treating the memory as actually contained.
+## E4 local Compose erasure deployment epoch
 
-## 7. Erasure — delete-by-subject and crypto-shredding
+E4 adds a local-only Compose activation path. Migration `0013_erasure_deployment` first stages
+`tracebed_erasure` as `NOLOGIN`, pins an E4 privilege/schema manifest to the latest c12 receipt,
+and records a chained deployment receipt. The bootstrap container attests the committed HBA bytes,
+publishes a SCRAM verifier over its own `pg-erasure` route, rejects both a cross credential and a
+cross route, then records activation. A crash before that marker is retried only after the login is
+quarantined to `NOLOGIN PASSWORD NULL` and its sessions are terminated.
 
-`workers.edit_ops.delete_by_subject` is the operator-facing erasure entry point. It does two
-independent things, both erasure:
+The executor has exactly one database route (`postgres-erasure`, `10.77.16.0/29`) and one
+runtime-data attachment (`10.77.14.7`). It mounts only its database password and its scoped S3
+pair. Its manifest is fixed to `graph_postgres`, `trace_s3_v1`, `valkey_v1`, and
+`vector_postgres`; it waits without claiming while admission is closed. Serving health is
+non-destructive. Before final publication, controller-only readiness requires S3 bucket versioning
+to be `Enabled`, performs a bounded version/delete-marker absence proof, and runs a bounded
+nonexistent-key Valkey `UNLINK`. Seaweed's scoped erasure identity has `Read`, `List`, and
+`Write` only; Seaweed's coarse `Write` permission may include object creation, so this is not a
+claim of a delete-only S3 primitive.
 
-1. **`crypto.shred.SubjectKeyManager.destroy_subject`** destroys that subject's KEK. Every
-   trace-payload section tagged with the subject becomes cryptographically unreadable —
-   `destroyed_at` is set, `wrapped_kek` is overwritten with `b""`. **This is irreversible by
-   design.** There is no "undo" for a destroyed KEK; the ciphertext it protected is
-   permanently unrecoverable the instant this call returns. Before calling this in production,
-   be certain the subject_tag is correct — there is no confirmation step below this call, and
-   none should be added here (a confirmation step belongs in the dashboard/API layer calling
-   this, not in the destructive primitive itself).
-2. Every governed `memory_item` carrying that `subject_tag` is additionally tombstoned through
-   `state_machine.apply()` (`erasure_or_approved_delete=True`, the `*→tombstoned` wildcard row)
-   — never a direct status write. A memory reaching `tombstoned` any other way is, by
-   construction, not possible (PLAN.md §10: "no admin bypass exists in code").
+`tracebed-erasure-worker`, `tracebed-erasure-once`, `tracebed-erasure-status`, and
+`tracebed-erasure-resume` accept bounded request IDs only (and the fixed `operator_resumed` code
+for resume). Resume is an append-only chained receipt, not a direct state edit. A `P0014` closure
+change is recorded as `closure_changed`; the next eligible lease repeats the revision-sensitive
+pass rather than weakening closure evidence.
 
-**What survives, deliberately.** The trace object's bytes are never rewritten — crypto-
-shredding resolves the genuine contradiction between "the trace is the erasure target" and
-"the trace is the audit record" by encrypting payload *sections* under per-subject keys, so
-destroying a key makes exactly that subject's content unreadable while the object stays
-byte-immutable and the provenance chain of every derived memory (which points at the
-still-existing object, just now with unreadable sections) stays intact. `trace_subject` rows
-make "which runs mention this subject" an indexed lookup, not a full-corpus scan, which is
-what makes delete-by-subject tractable at all.
-
-**Project deletion** (`stores.pg.partitions.drop_project`) is the other, coarser erasure
-mechanism: `DETACH`/`DROP` across every partitioned table, O(1) per table — every row, index,
-and (if the trace store driver supports `delete_project`) trace object gone at once. Use this
-for "this project is over, remove everything", not as a substitute for delete-by-subject when
-only one subject's data needs to go.
-
-## 8. Backup and restore
-
-**Because destroying a subject KEK is irreversible by design, a backup strategy built around
-"restore the whole database from yesterday's snapshot" silently un-erases every subject
-erased since that snapshot.** This is the one operational hazard this document exists to name
-explicitly: a restore is not a neutral rollback here the way it is for an ordinary OLTP
-database, because "the erasure took effect" and "the backup predates the erasure" are two
-facts that actively conflict, and a naive restore resolves that conflict by making the
-erasure not have happened.
-
-Practical guidance, in order of preference:
-
-1. **Prefer point-in-time recovery to a moment after the erasure, not a full nightly
-   snapshot from before it**, whenever the two are in tension. If a subject was erased at
-   14:00 and a restore target is 09:00 the same day, that restore reintroduces a wrapped KEK
-   this system has already told a data-subject was destroyed.
-2. **Back up `subject_key` and the rest of the registry/learning plane on the same cadence and
-   as one consistent snapshot.** A backup regime that snapshots `subject_key` less frequently
-   than the tables whose content it protects can restore ciphertext with no key at all (a
-   correctness bug, not a security one — that data was already supposed to be unreadable) or,
-   the more dangerous direction, restore a key that has since been destroyed alongside content
-   that was supposed to stay shredded.
-3. **`TB_MASTER_KEY` is not itself in Postgres and is not covered by a database
-   backup.** Losing it makes every wrapped subject KEK in every backup permanently
-   unusable — indistinguishable, from the data's perspective, from every subject having been
-   erased simultaneously. Back it up through whatever secret-management system your
-   deployment already uses for other root secrets, separately from the database backup
-   pipeline, and test restoring it independently of a database restore drill.
-4. **Treat a restore as an event that needs its own audit entry** naming the snapshot time and
-   which erasures (if any) fall between the snapshot and the restore, once `AuditSinkPort` has
-   a real implementation (see `docs/ADAPTER-GUIDE.md`'s `AuditSinkPort` section for the
-   current gap) — this document cannot make that check automatic today, only name it as a
-   required step for whoever runs a restore in the meantime.
-
-## 9. Gate reports — what PASS, FAIL, SKIPPED-NO-STACK, and INCOMPLETE-DATA mean
-
-Every phase gate (`harness/phase{0,1,2,3}_gate.py`) runs its phase's full `pytest -m phaseN`
-selection once — never two separate runs that could disagree with each other — plus the
-static gates (`scripts/license_check.py`, `scripts/raw_sql_lint.py`, `scripts/purity_check.py`)
-and, where a bare pass/fail can't carry the needed number, direct calls into the relevant
-`harness/*.py` module (lift sim, ledger audit, guessed-reward drill, redteam probes, ...).
-Every individual assertion in the resulting `gate_report_phaseN.md` is exactly one of four
-verdicts — **the report must not lie**, so there is no fifth, softer verdict:
-
-- **`PASS`** — every test/call backing this assertion ran and passed.
-- **`FAIL`** — at least one test/call backing it ran and failed. Always a genuine defect;
-  never something to explain away in the report itself.
-- **`SKIPPED-NO-STACK`** — at least one test backing it is `@pytest.mark.integration` and could
-  not run because Postgres/Valkey/S3 is unavailable (this build environment has none of the
-  three), and *none* of the ones that did run failed. This is expected and correct on a
-  machine with no Docker — it is not a silent pass, it is an honest "untested here."
-- **`INCOMPLETE-DATA`** — this gate runner found **zero** tests matching the assertion's
-  selector at all. This is different from `SKIPPED-NO-STACK` on purpose: it usually means a
-  grouping keyword in the gate runner itself has drifted from a test file it's supposed to
-  select — a defect in the gate report, not a legitimate "no stack available" skip. It must
-  never be silently folded into `SKIPPED-NO-STACK`.
-
-**The overall gate verdict is `PASS` only when every individual assertion is `PASS`.** Any
-`SKIPPED-NO-STACK` or `INCOMPLETE-DATA` anywhere makes the overall verdict `INCOMPLETE` — this
-is why this repository's own baseline, in this environment, reads `harness/phase0_gate.py →
-INCOMPLETE 6/7` and `harness/phase1_gate.py → INCOMPLETE 6/7`: the leak suite and the latency
-bench both need a live Postgres this build environment does not have, and reporting them as
-`PASS` anyway would be exactly the lie this section exists to rule out. **`INCOMPLETE` is not
-`PASS`, and a report claiming otherwise is the defect, not the environment.**
-
-**Superseded (2026-07):** a live Postgres 18.3 / Valkey stack is now up in dev, migrations
-`0001`..`0006` apply, the cross-project leak suite passes **7/7** under the `NOBYPASSRLS` app
-role, and the full suite is green — so those `INCOMPLETE 6/7` baselines describe the *no-stack
-CI path*, not a run against the live stack, where Phase 0/1's leak suite and latency bench do
-execute. The verdict semantics above are unchanged; only the "this environment has no Docker"
-premise no longer holds for the dev bring-up.
-
-Phase 2 and Phase 3 gates (`phase2_gate.py` → `PASS 7/7`, `phase3_gate.py` → `PASS 9/9`) run
-fully offline against fakes — their invariants (staleness injection, guessed-reward, red-team
-probes, ledger reconciliation) do not need a live store, which is why they can reach a real
-`PASS` in this same environment while Phase 0/1's leak suite and latency bench cannot.
-
----
-
-*See also: `docs/ADAPTER-GUIDE.md` (the port contract this operations model plugs into),
-`docs/MEMORY-FLOW.md` (the read/write/lifecycle model), `docs/ARCHETYPE-CONFIGS.md`
-(starting configurations for common deployment shapes), `PLAN.md` §5–§7 (data model and
-phase gates in full), `DECISIONS.md` (why each threshold and mechanism is what it is).*
+This is local Compose activation evidence only. It makes no backup, legal-hold, OIDC, dashboard,
+release, production-readiness, compliance, or post-restore-absence claim.

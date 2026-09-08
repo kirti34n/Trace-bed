@@ -46,6 +46,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from psycopg_pool import PoolTimeout
 
 from tracebed.domain.clock import SystemClock
 from tracebed.domain.config import (
@@ -97,7 +98,9 @@ _BOUND_S = 2.0
 
 
 def _hit(memory_id: MemoryId, raw_score: float) -> ArmHit:
-    return ArmHit(memory_id=memory_id, raw_score=raw_score, trust_tier=TrustTier.A, status=Status.VALIDATED)
+    return ArmHit(
+        memory_id=memory_id, raw_score=raw_score, trust_tier=TrustTier.A, status=Status.VALIDATED
+    )
 
 
 class _FakeEmbeddingPort:
@@ -147,6 +150,7 @@ class _StallingLexicalSearch:
         top_n: int,
         *,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         self.lexical_started.set()
         self._release.wait(timeout=self._safety_net_s)
@@ -161,6 +165,7 @@ class _StallingLexicalSearch:
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         return self._vector_hits
 
@@ -187,6 +192,7 @@ class _StallingVectorSearch:
         top_n: int,
         *,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         return self._lexical_hits
 
@@ -199,6 +205,7 @@ class _StallingVectorSearch:
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         self._release.wait(timeout=self._safety_net_s)
         return []
@@ -219,6 +226,7 @@ class _AlwaysStallingSearch:
         top_n: int,
         *,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         self._release.wait(timeout=self._safety_net_s)
         return []
@@ -232,6 +240,7 @@ class _AlwaysStallingSearch:
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         self._release.wait(timeout=self._safety_net_s)
         return []
@@ -431,6 +440,7 @@ class _CountingStallingSearch:
         top_n: int,
         *,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         return self._arm()
 
@@ -443,6 +453,7 @@ class _CountingStallingSearch:
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         return self._arm()
 
@@ -505,7 +516,9 @@ def test_work_queued_before_the_pool_wedged_is_skipped_once_its_caller_has_given
     try:
         assert occupied.wait(timeout=_BOUND_S)
         time.sleep(0.05)  # let both of the first call's arms actually reach the worker threads
-        queued = retriever.retrieve(PROJECT, "short-budget call", cfg=RetrievalConfig(total_budget_ms=40))
+        queued = retriever.retrieve(
+            PROJECT, "short-budget call", cfg=RetrievalConfig(total_budget_ms=40)
+        )
         assert queued.degraded is True
         assert retriever._submitted_arms == 4, (
             "the second call's arms were refused, not queued -- this test is no longer exercising "
@@ -538,6 +551,7 @@ def test_a_busy_but_healthy_pool_still_queues_work_rather_than_refusing_it() -> 
             top_n: int,
             *,
             statement_timeout_ms: int | None = None,
+            deadline: object | None = None,
         ) -> list[ArmHit]:
             barrier.wait()
             return [_hit(MEM_VECTOR_HIT, 5.0)]
@@ -551,6 +565,7 @@ def test_a_busy_but_healthy_pool_still_queues_work_rather_than_refusing_it() -> 
             hnsw_iterative_scan: bool,
             hnsw_max_scan_tuples: int,
             statement_timeout_ms: int | None = None,
+            deadline: object | None = None,
         ) -> list[ArmHit]:
             barrier.wait()
             return [_hit(MEM_VECTOR_HIT, 0.9)]
@@ -614,6 +629,7 @@ def test_one_wedged_worker_does_not_refuse_work_the_other_worker_can_still_do() 
             top_n: int,
             *,
             statement_timeout_ms: int | None = None,
+            deadline: object | None = None,
         ) -> list[ArmHit]:
             if query == "stuck":
                 stuck_started.set()
@@ -634,6 +650,7 @@ def test_one_wedged_worker_does_not_refuse_work_the_other_worker_can_still_do() 
             hnsw_iterative_scan: bool,
             hnsw_max_scan_tuples: int,
             statement_timeout_ms: int | None = None,
+            deadline: object | None = None,
         ) -> list[ArmHit]:  # pragma: no cover - `_EmptyEmbedder` means this is never submitted
             raise AssertionError("no vector arm should be submitted without an embedding")
 
@@ -703,6 +720,7 @@ def test_a_refused_lexical_arm_degrades_even_when_the_vector_arm_is_admitted() -
             top_n: int,
             *,
             statement_timeout_ms: int | None = None,
+            deadline: object | None = None,
         ) -> list[ArmHit]:
             return self._arm()
 
@@ -715,6 +733,7 @@ def test_a_refused_lexical_arm_degrades_even_when_the_vector_arm_is_admitted() -
             hnsw_iterative_scan: bool,
             hnsw_max_scan_tuples: int,
             statement_timeout_ms: int | None = None,
+            deadline: object | None = None,
         ) -> list[ArmHit]:
             return self._arm()
 
@@ -754,7 +773,9 @@ def test_a_refused_lexical_arm_degrades_even_when_the_vector_arm_is_admitted() -
         assert wedging.degraded is True  # both arms are now stuck past their own deadline
 
         retriever._embedding = _UnwedgingEmbedder(retriever)  # type: ignore[assignment]
-        outcome = retriever.retrieve(PROJECT, "asymmetric", cfg=RetrievalConfig(total_budget_ms=1500))
+        outcome = retriever.retrieve(
+            PROJECT, "asymmetric", cfg=RetrievalConfig(total_budget_ms=1500)
+        )
     finally:
         release.set()
         retriever.close()
@@ -779,6 +800,7 @@ class _TimeoutRaisingLexicalSearch:
         top_n: int,
         *,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         raise TimeoutError("psycopg: socket read timed out")
 
@@ -791,6 +813,7 @@ class _TimeoutRaisingLexicalSearch:
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         return []
 
@@ -889,7 +912,15 @@ class _AssemblyMustNotBeCalled:
     `timeout_prefix_only` before ever reaching assembly -- so a stalled retriever must mean this
     is never invoked at all. Raising proves that rather than merely hoping for it."""
 
-    def run(self, scope: ProjectScope, *, query_text: str, candidates: object, cfg: object) -> CandidateSetResult:
+    def run(
+        self,
+        scope: ProjectScope,
+        *,
+        query_text: str,
+        candidates: object,
+        cfg: object,
+        deadline: object,
+    ) -> CandidateSetResult:
         raise AssertionError(
             "assembly.run() was called even though the retriever stalled past the total "
             "budget -- the second deadline check before assembly did not fire"
@@ -927,7 +958,10 @@ def test_pipeline_maps_a_stalled_retriever_to_timeout_prefix_only_not_store_erro
     assert elapsed_s < _BOUND_S
     assert result.outcome_code is OutcomeCode.TIMEOUT_PREFIX_ONLY
     assert telemetry.calls == [
-        {"outcome_code": OutcomeCode.TIMEOUT_PREFIX_ONLY, "latency_ms": telemetry.calls[0]["latency_ms"]}
+        {
+            "outcome_code": OutcomeCode.TIMEOUT_PREFIX_ONLY,
+            "latency_ms": telemetry.calls[0]["latency_ms"],
+        }
     ]
     assert isinstance(telemetry.calls[0]["latency_ms"], int)
     assert telemetry.calls[0]["latency_ms"] >= 0
@@ -991,6 +1025,212 @@ class _FakePool:
 
     def connection(self) -> _FakeConn:
         return _FakeConn(self.log)
+
+
+class _RemainingBudget:
+    def __init__(self, remaining_ms: float) -> None:
+        self._remaining_ms = remaining_ms
+
+    def remaining_ms(self) -> float:
+        return self._remaining_ms
+
+
+class _LazyPoolTimeoutContext:
+    def __enter__(self) -> _FakeConn:
+        raise PoolTimeout("checkout stalled")
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class _LazyPool:
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def connection(self, *, timeout: float) -> _LazyPoolTimeoutContext:
+        self.timeouts.append(timeout)
+        return _LazyPoolTimeoutContext()
+
+
+class _LazySuccessContext:
+    def __enter__(self) -> _FakeConn:
+        return _FakeConn([])
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class _LazySuccessPool:
+    def connection(self, *, timeout: float) -> _LazySuccessContext:
+        return _LazySuccessContext()
+
+
+class _CountingConn(_FakeConn):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.transaction_entries = 0
+
+    def transaction(self) -> _CountingConn:
+        self.transaction_entries += 1
+        return self
+
+
+class _CountingContext:
+    def __init__(self, conn: _CountingConn) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> _CountingConn:
+        return self._conn
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+class _CountingPool:
+    def __init__(self) -> None:
+        self.conn = _CountingConn()
+
+    def connection(self, *, timeout: float) -> _CountingContext:
+        return _CountingContext(self.conn)
+
+
+class _SteppingBudget:
+    def __init__(self, values: list[float]) -> None:
+        self._values = iter(values)
+
+    def remaining_ms(self) -> float:
+        return next(self._values)
+
+
+class _UnscopedCountingPool:
+    """Records both lazy checkout bounds and every registry transaction entry."""
+
+    def __init__(self) -> None:
+        self.conn = _CountingConn()
+        self.timeouts: list[float] = []
+
+    def connection(self, *, timeout: float | None = None) -> _CountingContext:
+        if timeout is not None:
+            self.timeouts.append(timeout)
+        return _CountingContext(self.conn)
+
+
+def test_scoped_converts_a_lazy_pool_checkout_timeout_to_a_deadline_expiry() -> None:
+    """`psycopg_pool.connection()` returns a lazy context manager: checkout happens in enter."""
+    pool = _LazyPool()
+    with (
+        pytest.raises(pool_module.PoolDeadlineExceeded, match="pool checkout"),
+        pool_module.scoped(pool, PROJECT, deadline=_RemainingBudget(250.0)),  # type: ignore[arg-type]
+    ):
+        raise AssertionError("a lazy checkout timeout cannot yield a connection")
+    assert pool.timeouts == [0.25]
+
+
+def test_scoped_does_not_relabel_a_pool_timeout_raised_by_transaction_body() -> None:
+    with (
+        pytest.raises(PoolTimeout, match="body failure"),
+        pool_module.scoped(
+            _LazySuccessPool(),
+            PROJECT,
+            deadline=_RemainingBudget(250.0),  # type: ignore[arg-type]
+        ),
+    ):
+        raise PoolTimeout("body failure")
+
+
+def test_scoped_enters_exactly_one_transaction_after_a_successful_checkout() -> None:
+    pool = _CountingPool()
+    with pool_module.scoped(pool, PROJECT, deadline=_SteppingBudget([250.0, 250.0])):  # type: ignore[arg-type]
+        pass
+    assert pool.conn.transaction_entries == 1
+
+
+def test_pool_wait_narrows_the_statement_timeout_after_checkout() -> None:
+    pool = _CountingPool()
+    with pool_module.scoped(pool, PROJECT, deadline=_SteppingBudget([250.0, 137.0])):  # type: ignore[arg-type]
+        pass
+    assert pool.conn._log == [
+        (pool_module._SET_PROJECT_GUC, {"project_id": str(PROJECT)}),
+        (pool_module._SET_STATEMENT_TIMEOUT, {"statement_timeout_ms": "137"}),
+    ]
+
+
+def test_scoped_expiry_after_checkout_enters_no_transaction() -> None:
+    pool = _CountingPool()
+    with (
+        pytest.raises(pool_module.PoolDeadlineExceeded, match="during pool checkout"),
+        pool_module.scoped(pool, PROJECT, deadline=_SteppingBudget([250.0, 0.0])),  # type: ignore[arg-type]
+    ):
+        raise AssertionError("expired checkout cannot yield a transaction")
+    assert pool.conn.transaction_entries == 0
+
+
+def test_unscoped_expired_deadline_never_attempts_checkout() -> None:
+    pool = _UnscopedCountingPool()
+    with (
+        pytest.raises(pool_module.PoolDeadlineExceeded, match="before pool checkout"),
+        pool_module._unscoped(pool, deadline=_RemainingBudget(0.0)),  # type: ignore[arg-type]
+    ):
+        raise AssertionError("expired work cannot acquire a connection")
+    assert pool.timeouts == []
+    assert pool.conn.transaction_entries == 0
+
+
+def test_unscoped_checkout_consumes_the_same_remaining_budget() -> None:
+    pool = _UnscopedCountingPool()
+    with pool_module._unscoped(pool, deadline=_SteppingBudget([250.0, 137.0, 137.0])):  # type: ignore[arg-type]
+        pass
+    assert pool.timeouts == [0.25]
+    assert pool.conn.transaction_entries == 1
+
+
+def test_unscoped_expiry_after_checkout_enters_no_transaction() -> None:
+    pool = _UnscopedCountingPool()
+    with (
+        pytest.raises(pool_module.PoolDeadlineExceeded, match="during pool checkout"),
+        pool_module._unscoped(pool, deadline=_SteppingBudget([250.0, 0.0])),  # type: ignore[arg-type]
+    ):
+        raise AssertionError("expired checkout cannot yield a transaction")
+    assert pool.conn.transaction_entries == 0
+
+
+def test_unscoped_does_not_relabel_a_pool_timeout_raised_by_transaction_body() -> None:
+    body_error = PoolTimeout("body failure")
+    with (
+        pytest.raises(PoolTimeout) as raised,
+        pool_module._unscoped(_UnscopedCountingPool(), deadline=_RemainingBudget(250.0)),  # type: ignore[arg-type]
+    ):
+        raise body_error
+    assert raised.value is body_error
+
+
+def test_unscoped_does_not_issue_setup_sql_before_caller_sets_transaction_characteristics() -> None:
+    pool = _UnscopedCountingPool()
+    isolation = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+    with pool_module._unscoped(pool, deadline=_SteppingBudget([250.0, 250.0, 250.0])) as conn:  # type: ignore[arg-type]
+        conn.execute(isolation)
+    assert pool.conn._log == [(isolation, None)]
+
+
+def test_unscoped_caller_refreshes_the_remaining_statement_timeout_after_isolation() -> None:
+    pool = _UnscopedCountingPool()
+    isolation = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+    deadline = _SteppingBudget([250.0, 137.0, 137.0, 137.0, 137.0])
+    with pool_module._unscoped(pool, deadline=deadline) as conn:  # type: ignore[arg-type]
+        conn.execute(isolation)
+        pool_module.refresh_deadline_statement_timeout(conn, deadline)
+    assert pool.conn._log == [
+        (isolation, None),
+        (pool_module._SET_STATEMENT_TIMEOUT, {"statement_timeout_ms": "137"}),
+    ]
+
+
+def test_unscoped_preserves_historical_no_deadline_behavior() -> None:
+    pool = _UnscopedCountingPool()
+    with pool_module._unscoped(pool):  # type: ignore[arg-type]
+        pass
+    assert pool.timeouts == []
+    assert pool.conn.transaction_entries == 1
 
 
 def test_scoped_without_timeouts_issues_only_the_rls_guc_unchanged_behaviour() -> None:
@@ -1094,6 +1334,7 @@ class _FakeConnectionPoolCtor:
     last_kwargs: dict[str, Any] | None = None
     last_call: dict[str, Any] | None = None
     last_timeout: object = _SENTINEL
+    last_check: object = _SENTINEL
 
     def __init__(
         self,
@@ -1104,6 +1345,7 @@ class _FakeConnectionPoolCtor:
         open: bool,
         kwargs: dict[str, Any] | None,
         timeout: float | object = _SENTINEL,
+        check: object = _SENTINEL,
     ) -> None:
         type(self).last_call = {
             "dsn": dsn,
@@ -1116,6 +1358,7 @@ class _FakeConnectionPoolCtor:
         # NOT passing it is the behaviour under test for the no-checkout-timeout case: psycopg's
         # own 30s default must remain psycopg's business, not something this repository restates.
         type(self).last_timeout = timeout
+        type(self).last_check = check
 
 
 def test_create_pool_without_connect_timeout_matches_the_prior_call_shape(
@@ -1172,6 +1415,19 @@ def test_create_pool_with_checkout_timeout_passes_it_as_the_pools_own_timeout(
     assert _FakeConnectionPoolCtor.last_kwargs is None
 
 
+def test_create_pool_can_opt_into_a_physical_check_on_each_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pool_module, "ConnectionPool", _FakeConnectionPoolCtor)
+
+    def check(_connection: Any) -> None:
+        return None
+
+    pool_module.create_pool("postgresql://example/db", checkout_check=check)
+
+    assert _FakeConnectionPoolCtor.last_check is check
+
+
 @pytest.mark.parametrize("bad", [0, -1, -0.5])
 def test_create_pool_refuses_a_non_positive_checkout_timeout(
     bad: float, monkeypatch: pytest.MonkeyPatch
@@ -1206,8 +1462,11 @@ class _RecordingSearch:
         top_n: int,
         *,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
-        self.lexical_timeouts.append(statement_timeout_ms)
+        self.lexical_timeouts.append(
+            None if deadline is None else max(1, int(deadline.remaining_ms()))  # type: ignore[union-attr]
+        )
         return []
 
     def vector_arm(
@@ -1219,8 +1478,11 @@ class _RecordingSearch:
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
-        self.vector_timeouts.append(statement_timeout_ms)
+        self.vector_timeouts.append(
+            None if deadline is None else max(1, int(deadline.remaining_ms()))  # type: ignore[union-attr]
+        )
         return []
 
 

@@ -5,32 +5,32 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   get,
-  postAdmin,
   postJson,
   streamNdjson,
   ApiError,
 } from "./client";
 import type {
   AcceptedOut,
-  AgentRegisteredOut,
   ConfigOut,
+  DemoManifestOut,
   ExportRow,
   ExportTable,
   FeedbackIn,
   InvalidationIn,
   InvalidationListOut,
+  InjectionsOut,
   KillswitchStateOut,
+  ConsolidationDiffsOut,
+  LiftReportOut,
   MemoryItemOut,
   MemoryListOut,
-  ProjectCreateIn,
-  ProjectCreatedOut,
   ProposeIn,
-  RegisterAgentIn,
   RetrieveIn,
   RetrieveResult,
   ReviewQueueOut,
   ScopeOut,
   SpendOut,
+  StalenessReportOut,
   Status,
   TraceIn,
 } from "./types";
@@ -78,6 +78,9 @@ export function useQuery<T>(
     }
     const controller = new AbortController();
     setStatus("loading");
+    // A request-key change (cursor, scope, or server-side filter) must not
+    // leave prior-page data rendered while the new page is in flight.
+    setData(undefined);
     setError(undefined);
     activeFetcher(controller.signal)
       .then((result) => {
@@ -100,8 +103,7 @@ export function useQuery<T>(
 }
 
 // --------------------------------------------------------------------- //
-// useMutation — write-side (the 202-accepted routes, plus the two admin
-// registry routes). Distinct from useQuery because a mutation never
+// useMutation — write-side (the accepted data routes). Distinct from useQuery because a mutation never
 // auto-fires and never auto-retries — it runs exactly when a component
 // calls `mutate`.
 // --------------------------------------------------------------------- //
@@ -208,6 +210,7 @@ export function useExportRows(
 
   useEffect(() => {
     const controller = new AbortController();
+    let active = true;
     setStatus("loading");
     setRows([]);
     setTruncated(false);
@@ -216,25 +219,38 @@ export function useExportRows(
 
     (async () => {
       const collected: ExportRow[] = [];
+      let reachedRowCap = false;
       for await (const envelope of streamNdjson<ExportRow>("/export/project", {
         signal: controller.signal,
       })) {
         if (wanted.size > 0 && !wanted.has(envelope.table)) continue;
         collected.push(envelope);
         if (collected.length >= maxRows) {
-          setTruncated(true);
+          reachedRowCap = true;
+          // Closing both layers is intentional: the generator cancels its
+          // reader as it unwinds, and the controller aborts the fetch body.
+          controller.abort();
           break;
         }
       }
+      if (!active) return;
       setRows(collected);
+      setTruncated(reachedRowCap);
       setStatus("success");
     })().catch((err: unknown) => {
-      if (err instanceof ApiError && err.kind === "cancelled") return;
+      if (!active || (err instanceof ApiError && err.kind === "cancelled")) return;
+      // A rejected bound/completeness check must discard locally collected
+      // rows: no partial export is ever a successful dashboard state.
+      setRows([]);
+      setTruncated(false);
       setError(err instanceof ApiError ? err : new ApiError("network", "unknown error"));
       setStatus("error");
     });
 
-    return () => controller.abort();
+    return () => {
+      active = false;
+      controller.abort();
+    };
   }, [tablesKey, maxRows, generation]);
 
   const reload = useCallback(() => setGeneration((g) => g + 1), []);
@@ -267,19 +283,6 @@ export function useInvalidation(): MutationState<InvalidationIn, AcceptedOut> {
   return useMutation((body, signal) => postJson<AcceptedOut>("/v1/invalidation", body, { signal }));
 }
 
-/** `POST /admin/projects` — bootstrap admin-key auth (Settings view territory). */
-export function useCreateProject(): MutationState<ProjectCreateIn, ProjectCreatedOut> {
-  return useMutation((body, signal) => postAdmin<ProjectCreatedOut>("/admin/projects", body, { signal }));
-}
-
-/** `POST /admin/agents/register` — the ONE route allowed to carry `project_id`
- * (the admin is naming the project being provisioned, contract §9.3). */
-export function useRegisterAgent(): MutationState<RegisterAgentIn, AgentRegisteredOut> {
-  return useMutation((body, signal) =>
-    postAdmin<AgentRegisteredOut>("/admin/agents/register", body, { signal, allowProjectId: true })
-  );
-}
-
 // --------------------------------------------------------------------- //
 // Control-plane reads (D-093). Each maps 1:1 to a route in api/admin.py and
 // replaces a view that previously rendered a hand-authored fixture. All of
@@ -298,18 +301,37 @@ export function useScope(): QueryState<ScopeOut> {
   );
 }
 
+/** Optional public marker emitted only by the separately configured local
+ * demo edge. A production 404 is intentionally rendered as no badge. */
+export function useDemoManifest(): QueryState<DemoManifestOut> {
+  return useQuery<DemoManifestOut>(
+    (signal) => get<DemoManifestOut>("/auth/demo-manifest", { signal }),
+    "/auth/demo-manifest"
+  );
+}
+
 /** `GET /admin/memory` — a bounded, status-filtered page of memory_item rows.
  * Pass `statuses` to narrow; omit it to get every status including the ones
  * the hot path can never serve. */
 export function useMemoryList(
   statuses: readonly Status[] | null,
-  limit = 200
+  cursor: string | null,
+  limit = 100
 ): QueryState<MemoryListOut> {
   const query = new URLSearchParams();
   if (statuses !== null) for (const s of statuses) query.append("status", s);
   query.set("limit", String(limit));
+  if (cursor !== null) query.set("cursor", cursor);
   const path = `/admin/memory?${query.toString()}`;
   return useQuery<MemoryListOut>((signal) => get<MemoryListOut>(path, { signal }), path);
+}
+
+/** `GET /admin/injections` — newest-first page, never an exported project
+ * dump. `offset` is explicit so the caller cannot mistake one page for the
+ * complete feed. */
+export function useInjections(limit = 100, offset = 0): QueryState<InjectionsOut> {
+  const path = `/admin/injections?limit=${limit}&offset=${offset}`;
+  return useQuery<InjectionsOut>((signal) => get<InjectionsOut>(path, { signal }), path);
 }
 
 /** `GET /admin/review_queue` — open items by default. Read-only: resolving an
@@ -350,4 +372,23 @@ export function useProjectConfig(): QueryState<ConfigOut> {
     (signal) => get<ConfigOut>("/admin/config", { signal }),
     "/admin/config"
   );
+}
+
+export function useLiftReport(): QueryState<LiftReportOut> {
+  return useQuery<LiftReportOut>(
+    (signal) => get<LiftReportOut>("/admin/lift/report", { signal }),
+    "/admin/lift/report"
+  );
+}
+
+export function useStalenessReport(): QueryState<StalenessReportOut> {
+  return useQuery<StalenessReportOut>(
+    (signal) => get<StalenessReportOut>("/admin/staleness/report", { signal }),
+    "/admin/staleness/report"
+  );
+}
+
+export function useConsolidationDiffs(limit = 200, offset = 0): QueryState<ConsolidationDiffsOut> {
+  const path = `/admin/consolidation/diffs?limit=${limit}&offset=${offset}`;
+  return useQuery<ConsolidationDiffsOut>((signal) => get<ConsolidationDiffsOut>(path, { signal }), path);
 }

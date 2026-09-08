@@ -135,21 +135,27 @@ def _alter_column_ops(sql: str, table: str) -> list[tuple[str, str, str]]:
     runs the route against a real database. Order matters because `ADD x` then `DROP x` and
     `DROP x` then `ADD x` describe different schemas.
     """
-    pattern = re.compile(
-        rf"ALTER TABLE\s+{re.escape(table)}\s+"
-        r"(?:ADD COLUMN(?:\s+IF NOT EXISTS)?\s+(?P<added>\w+)"
+    statement_pattern = re.compile(
+        rf"ALTER TABLE\s+{re.escape(table)}\s+(?P<actions>.*?);", re.IGNORECASE | re.DOTALL
+    )
+    action_pattern = re.compile(
+        r"(?:ADD COLUMN(?:\s+IF NOT EXISTS)?\s+(?P<added>\w+)(?:\s+.*)?"
         r"|DROP COLUMN(?:\s+IF EXISTS)?\s+(?P<dropped>\w+)"
-        r"|RENAME COLUMN\s+(?P<renamed>\w+)\s+TO\s+(?P<renamed_to>\w+))",
+        r"|RENAME COLUMN\s+(?P<renamed>\w+)\s+TO\s+(?P<renamed_to>\w+))$",
         re.IGNORECASE,
     )
     ops: list[tuple[str, str, str]] = []
-    for m in pattern.finditer(sql):
-        if m.group("added"):
-            ops.append(("add", m.group("added").lower(), ""))
-        elif m.group("dropped"):
-            ops.append(("drop", m.group("dropped").lower(), ""))
-        else:
-            ops.append(("rename", m.group("renamed").lower(), m.group("renamed_to").lower()))
+    for statement in statement_pattern.finditer(sql):
+        for action in _split_top_level(statement.group("actions")):
+            m = action_pattern.fullmatch(action.strip())
+            if m is None:
+                continue
+            if m.group("added"):
+                ops.append(("add", m.group("added").lower(), ""))
+            elif m.group("dropped"):
+                ops.append(("drop", m.group("dropped").lower(), ""))
+            else:
+                ops.append(("rename", m.group("renamed").lower(), m.group("renamed_to").lower()))
     return ops
 
 
@@ -471,6 +477,19 @@ class TestParserCatchesAnUnaccountedColumn:
             "\nALTER TABLE widget DROP COLUMN IF EXISTS secret_field;\n"
         )
         assert self._real(ddl) == {"id", "project_id", "added_col"}
+
+    def test_comma_separated_column_actions_are_all_parsed(self) -> None:
+        ddl = self._FAKE_DDL + (
+            "\nALTER TABLE widget ADD COLUMN first_col integer, ADD COLUMN second_col text, "
+            "RENAME COLUMN secret_field TO public_field;\n"
+        )
+        assert self._real(ddl) == {
+            "id",
+            "project_id",
+            "first_col",
+            "second_col",
+            "public_field",
+        }
 
     def test_non_column_alters_are_ignored(self) -> None:
         """`ALTER TABLE ... ENABLE ROW LEVEL SECURITY` (0003_rls.sql issues one per table)

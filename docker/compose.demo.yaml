@@ -1,0 +1,57 @@
+# Explicit opt-in local demonstration overlay.  It is never loaded by the
+# normal stack/controller, and mounts only the one API-key secret needed by
+# the dedicated local edge entrypoint.
+services:
+  edge:
+    entrypoint: ["tracebed-local-demo-edge"]
+    environment:
+      TB_LOCAL_DEMO_ORIGIN: "${TB_LOCAL_DEMO_ORIGIN:?TB_LOCAL_DEMO_ORIGIN must be exact http://127.0.0.1:<port>}"
+    secrets:
+      - demo_api_key_secret
+
+  # One-shot owner operation: it has no ingress/API connection and receives
+  # only the owner/master/demo-secret material needed for registry work.
+  demo-provision:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    entrypoint: ["tracebed-local-demo-provision"]
+    environment:
+      TB_OWNER_DB_PASSWORD_FILE: /run/secrets/owner_db_password
+      TB_MASTER_KEY_FILE: /run/secrets/master_key
+      TB_DEMO_API_KEY_SECRET_FILE: /run/secrets/demo_api_key_secret
+      TB_DEMO_PROJECT_NAME: "${TB_DEMO_PROJECT_NAME:-tracebed-local-demo}"
+    secrets:
+      - owner_db_password
+      - master_key
+      - demo_api_key_secret
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      pg-admin: {}
+    profiles: ["local-demo-provision"]
+    restart: "no"
+
+  # Separate data-only operation. It can call the normal API but never mounts
+  # owner or master secrets and cannot reach the owner database network.
+  demo-data:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    entrypoint: ["tracebed-local-demo-seed"]
+    environment:
+      TB_DEMO_API_KEY_SECRET_FILE: /run/secrets/demo_api_key_secret
+    secrets:
+      - demo_api_key_secret
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      ingress: {}
+    profiles: ["local-demo-provision"]
+    restart: "no"
+
+secrets:
+  demo_api_key_secret:
+    file: "${TB_DEMO_API_KEY_SECRET_FILE:?TB_DEMO_API_KEY_SECRET_FILE must name the dedicated local demo secret}"

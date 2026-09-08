@@ -1,10 +1,9 @@
 """`/admin/lift/report`, `/admin/staleness/report`, `/admin/consolidation/diffs`,
 `/admin/injections` (D-093 gap: dashboard aggregate reads with no route until this chunk).
 
-Same auth plane as every other read route in `api/admin.py`: `ScopeDep` (`api.deps.get_scope`),
-so a caller with no credential never reaches a query (401 before any read) and a caller naming
-another project in a query parameter is silently ignored -- `scope.project_id`, server-derived
-from the authenticated principal, is the only project id any handler here ever passes to
+The ADMIN grant is required for every route. A caller with no credential never reaches a query
+(401 before any read), and a caller naming another project in a query parameter is ignored --
+the access context's server-derived project id is the only project id any handler passes to
 `ReportsRepo` (invariant 4). None of these four routes takes a `project_id` field anywhere.
 
 WIRING NOTE (read before assuming a missing `AppDeps` field is a bug): `stores.pg.reports
@@ -31,7 +30,7 @@ from typing import Annotated, Protocol, runtime_checkable
 
 from fastapi import APIRouter, Query, Request
 
-from tracebed.api.deps import AppDepsDep, ScopeDep
+from tracebed.api.deps import AdminReadDep, AppDepsDep
 from tracebed.api.models_reports import (
     ConsolidationDiffOut,
     ConsolidationDiffsOut,
@@ -54,6 +53,7 @@ from tracebed.domain.ids import ProjectId, RunId
 from tracebed.stores.pg.reports import (
     MAX_LIFT_OBSERVATIONS,
     MAX_REPORT_LIMIT,
+    MAX_REPORT_OFFSET,
     MAX_STALE_FOR_MATCHING,
     ConsolidationDiffRow,
     InjectionFeedRow,
@@ -100,6 +100,7 @@ _bh_adjusted_p_values = bh_adjusted_p_values
 # locally (not imported from `api.admin`, a sibling route module this chunk does not own) for
 # the wire-level 422 bound on every `Query(..., le=...)` below.
 _MAX_LIST_LIMIT = MAX_REPORT_LIMIT
+_MAX_REPORT_OFFSET = MAX_REPORT_OFFSET
 _MAX_WINDOW_DAYS = 365
 
 # Per-event cap on how many matched memories cross the wire.
@@ -172,12 +173,12 @@ def _reports_store(request: Request) -> ReportsPort:
 
 @router.get("/admin/lift/report", response_model=LiftReportOut)
 def get_lift_report(
-    scope: ScopeDep,
+    access: AdminReadDep,
     deps: AppDepsDep,
     request: Request,
     days: Annotated[int, Query(ge=1, le=_MAX_WINDOW_DAYS)] = 14,
     q_limit: Annotated[int, Query(ge=1, le=_MAX_LIST_LIMIT)] = 100,
-    q_offset: Annotated[int, Query(ge=0)] = 0,
+    q_offset: Annotated[int, Query(ge=0, le=_MAX_REPORT_OFFSET)] = 0,
 ) -> LiftReportOut:
     """Stratified task-quality lift per `(agent_type_id, mem_type)` cell over the trailing
     `days`-day window, plus the Q-value trajectory (`stores.pg.reports` module docstring, gap
@@ -189,7 +190,7 @@ def get_lift_report(
     store = _reports_store(request)
     since = deps.clock.now() - timedelta(days=days)
 
-    rows = store.lift_observations(scope.project_id, since=since)
+    rows = store.lift_observations(access.project_id, since=since)
     # A join that came back exactly at the cap was (or may have been) cut short, so every N
     # below is a LOWER BOUND on this window's real N, not the window's N. That distinction is
     # the difference between "this cell has 6,000 runs behind it" and "this cell has at least
@@ -280,7 +281,7 @@ def get_lift_report(
         for cell, bh in zip(cells, bh_adjusted, strict=True)
     ]
 
-    q_rows = store.q_trajectory(scope.project_id, limit=q_limit, offset=q_offset)
+    q_rows = store.q_trajectory(access.project_id, limit=q_limit, offset=q_offset)
     q_points = [
         QTrajectoryPointOut(
             agent_type_id=str(r.agent_type_id),
@@ -433,14 +434,14 @@ def _matched_memories(
 
 @router.get("/admin/staleness/report", response_model=StalenessReportOut)
 def get_staleness_report(
-    scope: ScopeDep,
+    access: AdminReadDep,
     deps: AppDepsDep,
     request: Request,
     event_limit: Annotated[int, Query(ge=1, le=_MAX_LIST_LIMIT)] = 100,
-    event_offset: Annotated[int, Query(ge=0)] = 0,
+    event_offset: Annotated[int, Query(ge=0, le=_MAX_REPORT_OFFSET)] = 0,
     r_days: Annotated[int, Query(ge=1, le=3650)] = LifecycleConfig().revalidation_age_days,
     approaching_limit: Annotated[int, Query(ge=1, le=_MAX_LIST_LIMIT)] = 100,
-    approaching_offset: Annotated[int, Query(ge=0)] = 0,
+    approaching_offset: Annotated[int, Query(ge=0, le=_MAX_REPORT_OFFSET)] = 0,
 ) -> StalenessReportOut:
     """`invalidation_event` rows (paginated) with the currently-`stale` memories each one's
     selector matches, plus `validated` memories approaching `lifecycle.revalidation_age_days`
@@ -450,8 +451,8 @@ def get_staleness_report(
     store = _reports_store(request)
     now = deps.clock.now()
 
-    events = store.invalidation_events(scope.project_id, limit=event_limit, offset=event_offset)
-    stale_rows = store.stale_memories(scope.project_id)
+    events = store.invalidation_events(access.project_id, limit=event_limit, offset=event_offset)
+    stale_rows = store.stale_memories(access.project_id)
     truncated = len(stale_rows) >= MAX_STALE_FOR_MATCHING
     # Built ONCE per request, not per event -- see `_StaleProvenanceIndex` for what the
     # per-event alternative costs at this route's own wire bounds.
@@ -478,7 +479,7 @@ def get_staleness_report(
 
     threshold_at = now - timedelta(days=r_days * _APPROACHING_FRACTION)
     candidates = store.revalidation_candidates(
-        scope.project_id,
+        access.project_id,
         threshold_at=threshold_at,
         now=now,
         limit=approaching_limit,
@@ -513,17 +514,17 @@ def get_staleness_report(
 
 @router.get("/admin/consolidation/diffs", response_model=ConsolidationDiffsOut)
 def get_consolidation_diffs(
-    scope: ScopeDep,
+    access: AdminReadDep,
     request: Request,
     limit: Annotated[int, Query(ge=1, le=_MAX_LIST_LIMIT)] = 100,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=_MAX_REPORT_OFFSET)] = 0,
 ) -> ConsolidationDiffsOut:
     """`derived_state` versions (`stores.pg.reports` module docstring, gap 2). Honestly empty
     on every build shipped today -- no writer for this table exists yet anywhere in this
     codebase; see that docstring before assuming a non-empty response is a bug in this route
     rather than a genuinely unwired writer."""
     store = _reports_store(request)
-    rows = store.consolidation_diffs(scope.project_id, limit=limit, offset=offset)
+    rows = store.consolidation_diffs(access.project_id, limit=limit, offset=offset)
     items = [
         ConsolidationDiffOut(
             agent_type_id=str(r.agent_type_id),
@@ -546,15 +547,15 @@ def get_consolidation_diffs(
 
 @router.get("/admin/injections", response_model=InjectionsOut)
 def get_injections(
-    scope: ScopeDep,
+    access: AdminReadDep,
     request: Request,
     limit: Annotated[int, Query(ge=1, le=_MAX_LIST_LIMIT)] = 100,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=_MAX_REPORT_OFFSET)] = 0,
 ) -> InjectionsOut:
     """The `injection_log` feed, newest first, paginated -- every entry already carries
     `memory_id` (joinable to `GET /admin/memory/{memory_id}` by construction)."""
     store = _reports_store(request)
-    rows = store.injection_feed(scope.project_id, limit=limit, offset=offset)
+    rows = store.injection_feed(access.project_id, limit=limit, offset=offset)
     items = [
         InjectionEntryOut(
             run_id=str(r.run_id),

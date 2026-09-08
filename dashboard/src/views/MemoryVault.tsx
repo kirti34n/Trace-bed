@@ -1,6 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { useExportRows } from "../api/hooks";
+import { useMemoryList } from "../api/hooks";
 import type { ColumnDef } from "../components/Table";
 import { Table } from "../components/Table";
 import { StatusBadge, TrustTierBadge } from "../components/StatusBadge";
@@ -15,27 +15,16 @@ import {
   TRUST_TIERS,
 } from "../api/types";
 import type {
-  ExportRow,
   Lane,
   MemType,
-  MemoryItemExportRow,
+  MemoryItemOut,
   ScopeType,
   Status,
   TrustTier,
 } from "../api/types";
 import { formatDateTime, formatFloat, formatRelativeTime, truncateId } from "../lib/format";
 
-// contract_gap: Repo.list_memories (PHASE0-CONTRACT.md §5.1) is never exposed
-// over HTTP — GET /admin/memory/{id} is by-id only, and no route filters or
-// paginates memory_item. This view is built against the closest REAL data
-// available: GET /export/project's memory_item rows via useExportRows. That
-// makes it an honest project *snapshot* (capped at MAX_ROWS, flagged
-// `truncated`), not a live paginated/filtered feed — every filter below runs
-// client-side over whatever rows the cap let through, never the full vault.
-// A real Repo.list_memories-backed route would let filters run server-side
-// and remove the cap entirely; until then this is the documented workaround,
-// not a fabricated endpoint (task brief rule 2).
-const MAX_ROWS = 4000;
+const LIST_LIMIT = 100;
 
 type AgeOption = "any" | "24h" | "7d" | "30d" | "90d";
 const AGE_OPTIONS: { value: AgeOption; label: string }[] = [
@@ -79,14 +68,6 @@ function clampUnit(raw: string, fallback: number): number {
   return Math.min(1, Math.max(0, parsed));
 }
 
-function memoryItemRows(all: ExportRow[]): MemoryItemExportRow[] {
-  const out: MemoryItemExportRow[] = [];
-  for (const entry of all) {
-    if (entry.table === "memory_item") out.push(entry.row);
-  }
-  return out;
-}
-
 function toggled<T>(set: Set<T>, value: T): Set<T> {
   const next = new Set(set);
   if (next.has(value)) next.delete(value);
@@ -99,7 +80,7 @@ function toggled<T>(set: Set<T>, value: T): Set<T> {
  * has left quarantine into `candidate` is NOT servable — counting it as
  * retrievable would tell an operator that unpromoted content-derived material
  * is already reaching prompts, which is the opposite of true. */
-function isRetrievableNow(row: MemoryItemExportRow): boolean {
+function isRetrievableNow(row: MemoryItemOut): boolean {
   if (!RETRIEVABLE_STATUSES.has(row.status)) return false;
   return !(row.status === "candidate" && row.trust_tier === "B");
 }
@@ -134,23 +115,20 @@ function ScoredValue({
   );
 }
 
-/** Every headline count here is computed over a capped export snapshot, so
- * when the cap bound it is a LOWER BOUND, not a total — it renders as "≥ N".
- * Before the stream resolves it renders "—", never "0": a placeholder zero on
+/** Every headline count here is computed over the current cursor page. Before
+ * it resolves it renders "—", never "0": a placeholder zero on
  * a "Quarantined Tier B" tile reads as "you have none", which is a claim this
  * view has not yet earned the right to make. */
 function CountTile({
   label,
   value,
   loaded,
-  truncated,
   tone = "neutral",
   hint,
 }: {
   label: string;
   value: number;
   loaded: boolean;
-  truncated: boolean;
   tone?: "neutral" | "quarantined";
   hint?: string;
 }) {
@@ -179,13 +157,8 @@ function CountTile({
           (quarantined ? "text-status-quarantined-fg" : "text-text")
         }
       >
-        {loaded ? `${truncated ? "≥ " : ""}${value.toLocaleString()}` : "—"}
+        {loaded ? value.toLocaleString() : "—"}
       </p>
-      {loaded && truncated && (
-        <p className="mt-0.5 text-[10px] uppercase tracking-wide text-text-faint">
-          lower bound — snapshot capped
-        </p>
-      )}
       {hint !== undefined && <p className="mt-1 text-[11px] leading-snug text-text-muted">{hint}</p>}
     </div>
   );
@@ -256,9 +229,6 @@ function ChipGroup<T extends string>({ legend, options, selected, onToggle }: Ch
 
 export default function MemoryVault() {
   const navigate = useNavigate();
-  const { status, rows, truncated, error, reload } = useExportRows(["memory_item"], MAX_ROWS);
-  const allMemories = useMemo(() => memoryItemRows(rows), [rows]);
-
   const [statuses, setStatuses] = useState<Set<Status>>(new Set(STATUSES));
   const [tiers, setTiers] = useState<Set<TrustTier>>(new Set(TRUST_TIERS));
   const [memTypes, setMemTypes] = useState<Set<MemType>>(new Set(MEM_TYPES));
@@ -268,6 +238,22 @@ export default function MemoryVault() {
   const [maxQ, setMaxQ] = useState(1);
   const [age, setAge] = useState<AgeOption>("any");
   const [search, setSearch] = useState("");
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [cursorHistory, setCursorHistory] = useState<Array<string | null>>([]);
+  const statusValues = useMemo(() => [...statuses].sort(), [statuses]);
+  const statusKey = statusValues.join(",");
+  const { status, data, error, reload } = useMemoryList(
+    statusValues.length === STATUSES.length ? null : statusValues,
+    cursor,
+    LIST_LIMIT
+  );
+  const allMemories = useMemo(() => data?.items ?? [], [data]);
+
+  const filterPageKey = `${statusKey}|${[...tiers].sort().join(",")}|${[...memTypes].sort().join(",")}|${[...lanes].sort().join(",")}|${[...scopeTypes].sort().join(",")}|${minQ}|${maxQ}|${age}|${search}`;
+  useEffect(() => {
+    setCursor(null);
+    setCursorHistory([]);
+  }, [filterPageKey]);
 
   const filtered = useMemo(() => {
     const cutoff = ageCutoffMs(age);
@@ -302,9 +288,11 @@ export default function MemoryVault() {
     setMaxQ(1);
     setAge("any");
     setSearch("");
+    setCursor(null);
+    setCursorHistory([]);
   }
 
-  const columns: ColumnDef<MemoryItemExportRow>[] = [
+  const columns: ColumnDef<MemoryItemOut>[] = [
     {
       key: "content",
       header: "Content",
@@ -416,8 +404,8 @@ export default function MemoryVault() {
       header: "Pinned",
       width: "8ch",
       align: "center",
-      render: (row) => (row.pinned ? "Yes" : "—"),
-      sortValue: (row) => (row.pinned ? 1 : 0),
+      render: (row) => (row.status === "pinned" ? "Yes" : "—"),
+      sortValue: (row) => (row.status === "pinned" ? 1 : 0),
     },
     {
       key: "created_at",
@@ -429,7 +417,7 @@ export default function MemoryVault() {
   ];
 
   if (status === "error") {
-    return <ErrorState error={error} onRetry={reload} title="Couldn't load the vault snapshot" />;
+    return <ErrorState error={error} onRetry={reload} title="Couldn't load the memory list" />;
   }
 
   return (
@@ -446,35 +434,22 @@ export default function MemoryVault() {
       </div>
 
       <div className="rounded-md border border-status-candidate-border/60 bg-status-candidate-bg/40 px-3 py-2 text-xs text-status-candidate-fg">
-        No filtered/paginated memory list endpoint exists (PHASE0-CONTRACT.md §5.1's{" "}
-        <code className="font-mono">Repo.list_memories</code> is never exposed over HTTP). This table is
-        a snapshot of <code className="font-mono">GET /export/project</code>&apos;s{" "}
-        <code className="font-mono">memory_item</code> rows, capped at {MAX_ROWS.toLocaleString()} and
-        filtered client-side — not a live server-side filter.
-        {truncated && (
-          <>
-            {" "}
-            <strong>The cap was reached:</strong> older or lower-priority rows beyond the cap are not
-            represented below.
-          </>
-        )}
+        This is one server page from <code className="font-mono">GET /admin/memory</code> (up to {LIST_LIMIT} rows). Counts describe this page, not the whole vault; use Older/Newer to traverse opaque server cursors.
       </div>
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <CountTile label="In snapshot" value={allMemories.length} loaded={loaded} truncated={truncated} />
-        <CountTile label="Matching filters" value={filtered.length} loaded={loaded} truncated={truncated} />
+        <CountTile label="In page" value={allMemories.length} loaded={loaded} />
+        <CountTile label="Matching page" value={filtered.length} loaded={loaded} />
         <CountTile
           label="Quarantined Tier B"
           value={quarantinedTierBCount}
           loaded={loaded}
-          truncated={truncated}
           tone="quarantined"
         />
         <CountTile
           label="Retrievable now"
           value={retrievableCount}
           loaded={loaded}
-          truncated={truncated}
           hint="validated, pinned, and Tier A candidates only — a Tier B candidate has left quarantine but is still not servable (PLAN.md §5)."
         />
       </div>
@@ -571,20 +546,53 @@ export default function MemoryVault() {
       ) : status === "success" && filtered.length === 0 ? (
         <EmptyState
           title="No memories match these filters"
-          description="Loosen a filter above — the snapshot has rows, none of them fit the current combination."
+          description="Loosen a filter above — the current bounded list has rows, none match this combination."
           action={{ label: "Reset filters", onClick: resetFilters }}
         />
       ) : (
-        <Table
-          caption="Memory vault rows filtered by status, tier, type, lane, scope, Q value and age"
-          columns={columns}
-          rows={filtered}
-          getRowId={(row) => row.id}
-          loading={status === "loading"}
-          initialSort={{ key: "created_at", direction: "desc" }}
-          onRowClick={(row) => navigate(`/memory-vault/${row.id}`)}
-          maxHeight="65vh"
-        />
+        <>
+          <Table
+            caption="Memory vault rows filtered by status, tier, type, lane, scope, Q value and age"
+            columns={columns}
+            rows={filtered}
+            getRowId={(row) => row.id}
+            loading={status === "loading"}
+            initialSort={{ key: "created_at", direction: "desc" }}
+            onRowClick={(row) => navigate(`/memory-vault/${row.id}`)}
+            maxHeight="65vh"
+          />
+        </>
+      )}
+      {status === "success" && (
+        <nav aria-label="Memory vault pages" className="flex items-center justify-end gap-3 text-sm">
+          <button
+            type="button"
+            disabled={cursorHistory.length === 0}
+            onClick={() =>
+              setCursorHistory((history) => {
+                const previous = history.at(-1) ?? null;
+                setCursor(previous);
+                return history.slice(0, -1);
+              })
+            }
+            className="rounded-md border border-border-strong px-3 py-1.5 disabled:opacity-40"
+          >
+            Newer
+          </button>
+          <span className="text-text-muted">{allMemories.length} row(s) on this page</span>
+          <button
+            type="button"
+            disabled={data?.next_cursor === null || data?.next_cursor === undefined}
+            onClick={() => {
+              if (data?.next_cursor === null || data?.next_cursor === undefined) return;
+              setCursorHistory((history) => [...history, cursor]);
+              setCursor(data.next_cursor);
+            }}
+            className="rounded-md border border-border-strong px-3 py-1.5 disabled:opacity-40"
+          >
+            Older
+          </button>
+        </nav>
       )}
     </div>
   );

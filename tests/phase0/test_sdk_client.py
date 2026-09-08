@@ -26,7 +26,9 @@ from typing import Any, cast
 from uuid import uuid4
 
 import pytest
+from pydantic import BaseModel
 
+from tracebed.domain.clock import FakeClock
 from tracebed.domain.enums import AdapterClass, Arm, OutcomeCode
 from tracebed.domain.events import (
     MEMORY_HEADER,
@@ -81,6 +83,9 @@ class _RecordingServer(http.server.ThreadingHTTPServer):
         self.received: list[tuple[str, dict[str, Any]]] = []
         self.received_headers: list[dict[str, str]] = []
         self.stall_s = 0.0
+        self.stall_by_path: dict[str, float] = {}
+        self.status_by_path: dict[str, list[int]] = {}
+        self.drop_response_once: set[str] = set()
         self.retrieve_response: dict[str, Any] = {
             "run_id": str(uuid7()),
             "run_id_origin": "server",
@@ -98,6 +103,12 @@ class _RecordingServer(http.server.ThreadingHTTPServer):
         if path == "/v1/retrieve":
             return self.retrieve_response
         return {"status": "accepted"}
+
+    def status_for(self, path: str) -> int:
+        if path == "/v1/retrieve":
+            return 200
+        statuses = self.status_by_path.get(path)
+        return statuses.pop(0) if statuses else 202
 
     def handle_error(self, request: object, client_address: object) -> None:
         # A client that hits its own deadline mid-request closes the socket while
@@ -117,10 +128,14 @@ class _RecordingHandler(http.server.BaseHTTPRequestHandler):
             body = {"_raw": raw.decode("utf-8", "replace")}
         server.received.append((self.path, body))
         server.received_headers.append(dict(self.headers.items()))
-        if server.stall_s:
-            time.sleep(server.stall_s)
+        delay = server.stall_by_path.get(self.path, server.stall_s)
+        if delay:
+            time.sleep(delay)
+        if self.path in server.drop_response_once:
+            server.drop_response_once.remove(self.path)
+            return
         response = server.response_for(self.path)
-        code = 200 if self.path == "/v1/retrieve" else 202
+        code = server.status_for(self.path)
         payload = json.dumps(response).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -222,9 +237,7 @@ class TestHotPathLatency:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         caplog.set_level(logging.DEBUG, logger="tracebed.sdk")
-        client = TracebedClient(
-            _closed_port_url(), buffer_capacity=200_000, flush_interval_s=3600
-        )
+        client = TracebedClient(_closed_port_url(), buffer_capacity=200_000, flush_interval_s=3600)
         run = mint_run_id()
         n = 2500
 
@@ -403,9 +416,7 @@ class TestFlush:
         run = RunId(result.run_id)
         assert result.arm == Arm.HOLDOUT
 
-        client.trace(
-            run, RunStart(type="run_start", ts=_NOW, payload={"query_text": "hi"})
-        )
+        client.trace(run, RunStart(type="run_start", ts=_NOW, payload={"query_text": "hi"}))
         report = client.flush()
         assert report.sent == 1
 
@@ -447,6 +458,8 @@ class TestUnserialisablePayload:
         report = client.flush()  # must not raise
 
         assert report.sent == 2
+        assert report.dropped == 1
+        assert report.pending == 0
         assert [evt["seq"] for evt in _sent_trace_events(fake_server)] == [0, 2]
 
     def test_run_end_does_not_raise_into_the_host_over_a_poison_event(
@@ -499,9 +512,7 @@ class TestBackgroundFlusher:
         )
 
         assert _wait_until(lambda: len(_sent_trace_events(fake_server)) == 1)
-        assert _wait_until(
-            lambda: any(p == "/v1/feedback" for p, _ in list(fake_server.received))
-        )
+        assert _wait_until(lambda: any(p == "/v1/feedback" for p, _ in list(fake_server.received)))
 
     def test_background_pass_does_not_consume_the_drop_counter(
         self, fake_server: _RecordingServer, fake_server_url: str
@@ -521,6 +532,16 @@ class TestBackgroundFlusher:
         assert report.sent == 0  # the background pass already delivered them
         assert report.dropped == 3  # ...but the drops are still the host's to see
         assert client.flush().dropped == 0  # and are reported exactly once
+
+    def test_background_terminal_drop_remains_for_the_next_explicit_report(
+        self, fake_server: _RecordingServer, fake_server_url: str
+    ) -> None:
+        client = TracebedClient(fake_server_url, flush_interval_s=0.02)
+        run = mint_run_id()
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"bad": object()}))
+        assert _wait_until(lambda: client._buffer.dropped_total == 1)
+        assert client.flush() == FlushReport(sent=0, dropped=1, pending=0)
+        assert client.flush() == FlushReport(sent=0, dropped=0, pending=0)
 
     def test_dropping_the_client_stops_its_flusher_thread(self) -> None:
         # The thread must not be what keeps a discarded client (and its whole
@@ -570,12 +591,359 @@ class TestFlushDeadline:
         attempts = len(fake_server.received)
         assert 1 <= attempts < 3
         assert elapsed < 1.5
-        # And the undrained remainder is still buffered, not thrown away.
-        # Derived from `attempts` rather than hardcoded, because `_post`'s own
-        # docstring makes a drained-then-failed batch lost by design: exactly
-        # `_MAX_DRAIN_BATCH` items go with each attempt that reached the wire.
+        assert report.pending == 1200
+        # The timed-out in-flight batch and the undrained tail remain pending;
+        # the next pass retries the exact first batch before later work.
         fake_server.stall_s = 0.0
-        assert client.flush(timeout_s=10.0).sent == 1200 - 500 * attempts
+        assert client.flush(timeout_s=10.0).sent == 1200
+
+
+class TestReliableFlush:
+    def test_transient_503_retries_all_kinds_without_bypassing_the_tail(
+        self, fake_server: _RecordingServer, fake_server_url: str
+    ) -> None:
+        fake_server.status_by_path = {
+            "/v1/trace/batch": [503, 202],
+            "/v1/feedback": [503, 202],
+            "/v1/propose_memory": [503, 202],
+        }
+        client = TracebedClient(fake_server_url, flush_interval_s=3600)
+        run = mint_run_id()
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"n": 1}))
+        feedback_id = uuid4()
+        client.feedback(
+            run,
+            FeedbackEvent(adapter=AdapterClass.VERDICT, outcome="positive", event_id=feedback_id),
+        )
+        client.propose_memory(
+            run, MemoryProposal(mem_type="lesson", content="retry", claimed_scope="agent_type")
+        )
+
+        assert client.flush() == FlushReport(sent=0, dropped=0, pending=3)
+        assert [path for path, _body in fake_server.received] == ["/v1/trace/batch"]
+        assert client.flush() == FlushReport(sent=1, dropped=0, pending=2)
+        assert client.flush() == FlushReport(sent=1, dropped=0, pending=1)
+        assert client.flush() == FlushReport(sent=1, dropped=0, pending=0)
+        paths = [path for path, _body in fake_server.received]
+        assert paths == [
+            "/v1/trace/batch",
+            "/v1/trace/batch",
+            "/v1/feedback",
+            "/v1/feedback",
+            "/v1/propose_memory",
+            "/v1/propose_memory",
+        ]
+        feedbacks = [body for path, body in fake_server.received if path == "/v1/feedback"]
+        assert [body["event"]["event_id"] for body in feedbacks] == [
+            str(feedback_id),
+            str(feedback_id),
+        ]
+
+    def test_retry_reuses_the_first_frozen_payload_after_caller_mutates_event(
+        self, fake_server: _RecordingServer, fake_server_url: str
+    ) -> None:
+        fake_server.status_by_path = {"/v1/trace/batch": [503, 202]}
+        client = TracebedClient(fake_server_url, flush_interval_s=3600)
+        run = mint_run_id()
+        event = ToolCall(type="tool_call", ts=_NOW, payload={"value": "before"})
+        client.trace(run, event)
+        assert client.flush().pending == 1
+        event.payload["value"] = "after"
+        assert client.flush().sent == 1
+        attempts = [body for path, body in fake_server.received if path == "/v1/trace/batch"]
+        assert [body["events"][0]["event"]["payload"] for body in attempts] == [
+            {"value": "before"},
+            {"value": "before"},
+        ]
+
+    def test_ambiguous_accepted_response_loss_replays_same_trace_identity(
+        self, fake_server: _RecordingServer, fake_server_url: str
+    ) -> None:
+        fake_server.drop_response_once.add("/v1/trace/batch")
+        client = TracebedClient(fake_server_url, flush_interval_s=3600)
+        run = mint_run_id()
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={}))
+        assert client.flush() == FlushReport(sent=0, dropped=0, pending=1)
+        assert client.flush() == FlushReport(sent=1, dropped=0, pending=0)
+        attempts = _sent_trace_events(fake_server)
+        assert [(event["run_id"], event["seq"]) for event in attempts] == [
+            (str(run.value), 0),
+            (str(run.value), 0),
+        ]
+
+    def test_deadline_mid_dispatch_requeues_failed_and_unattempted_items(
+        self,
+        fake_server: _RecordingServer,
+        fake_server_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = TracebedClient(fake_server_url, flush_interval_s=3600)
+        clock = FakeClock(_NOW)
+        client._clock = clock
+        run = mint_run_id()
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={}))
+        client.feedback(
+            run, FeedbackEvent(adapter=AdapterClass.VERDICT, outcome="positive", event_id=uuid4())
+        )
+        # This poison trace is after the stalled feedback.  The expired budget
+        # must leave it pending, without serializing it into a terminal drop.
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"bad": object()}))
+        original_post = client._post
+
+        def expire_during_feedback(path: str, payload: object, deadline_ms: float) -> str:
+            if path == "/v1/feedback":
+                clock.advance(ms=2)
+                return "retry"
+            return original_post(path, payload, deadline_ms)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(client, "_post", expire_during_feedback)
+        report = client.flush(timeout_s=0.001)
+        assert report == FlushReport(sent=1, dropped=0, pending=2)
+        assert [path for path, _body in fake_server.received] == ["/v1/trace/batch"]
+        monkeypatch.setattr(client, "_post", original_post)
+        assert client.flush(timeout_s=5.0) == FlushReport(sent=1, dropped=1, pending=0)
+
+    def test_wire_poison_drops_without_holding_healthy_trace_batch(
+        self, fake_server: _RecordingServer, fake_server_url: str
+    ) -> None:
+        client = TracebedClient(fake_server_url, flush_interval_s=3600)
+        run = mint_run_id()
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"value": chr(0xD800)}))
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"value": "healthy"}))
+        assert client.flush() == FlushReport(sent=1, dropped=1, pending=0)
+        assert [event["seq"] for event in _sent_trace_events(fake_server)] == [1]
+        assert client.flush() == FlushReport(sent=0, dropped=0, pending=0)
+
+    def test_deadline_before_each_trace_freeze_leaves_later_poison_pending(
+        self,
+        fake_server: _RecordingServer,
+        fake_server_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = TracebedClient(fake_server_url, flush_interval_s=3600)
+        clock = FakeClock(_NOW)
+        client._clock = clock
+        run = mint_run_id()
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"value": "first"}))
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"value": chr(0xD800)}))
+        original_freeze = client._freeze
+        freezes = 0
+
+        def expire_after_first_freeze(item: object, key: str) -> object:
+            nonlocal freezes
+            freezes += 1
+            frozen = original_freeze(item, key)  # type: ignore[arg-type]
+            if freezes == 1:
+                clock.advance(ms=2)
+            return frozen
+
+        monkeypatch.setattr(client, "_freeze", expire_after_first_freeze)
+        assert client.flush(timeout_s=0.001) == FlushReport(sent=0, dropped=0, pending=2)
+        assert fake_server.received == []
+
+    def test_expired_after_freeze_skips_token_provider_and_keeps_work_pending(
+        self,
+        fake_server: _RecordingServer,
+        fake_server_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        clock = FakeClock(_NOW)
+        token_calls = 0
+
+        def token() -> str:
+            nonlocal token_calls
+            token_calls += 1
+            return "must-not-be-called"
+
+        client = TracebedClient(fake_server_url, token_provider=token, flush_interval_s=3600)
+        client._clock = clock
+        client.trace(mint_run_id(), ToolCall(type="tool_call", ts=_NOW, payload={}))
+        original_freeze = client._freeze
+
+        def expire_in_freeze(item: object, key: str) -> object:
+            frozen = original_freeze(item, key)  # type: ignore[arg-type]
+            clock.advance(ms=2)
+            return frozen
+
+        monkeypatch.setattr(client, "_freeze", expire_in_freeze)
+        assert client.flush(timeout_s=0.001) == FlushReport(sent=0, dropped=0, pending=1)
+        assert token_calls == 0
+        assert fake_server.received == []
+
+    def test_unexpected_later_helper_failure_keeps_prior_success_and_frozen_retry(
+        self,
+        fake_server: _RecordingServer,
+        fake_server_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = TracebedClient(fake_server_url, flush_interval_s=3600)
+        run = mint_run_id()
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"trace": "sent"}))
+        feedback = FeedbackEvent(
+            adapter=AdapterClass.VERDICT,
+            outcome="positive",
+            event_id=uuid4(),
+            payload={"v": "before"},
+        )
+        client.feedback(run, feedback)
+        original_post = client._post
+
+        def fail_after_trace(path: str, payload: object, deadline_ms: float) -> str:
+            if path == "/v1/feedback":
+                raise RuntimeError("injected later helper failure")
+            return original_post(path, payload, deadline_ms)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(client, "_post", fail_after_trace)
+        assert client.flush() == FlushReport(sent=1, dropped=0, pending=1)
+        feedback.payload["v"] = "after"
+        monkeypatch.setattr(client, "_post", original_post)
+        assert client.flush() == FlushReport(sent=1, dropped=0, pending=0)
+        assert len(_sent_trace_events(fake_server)) == 1
+        [body] = [body for path, body in fake_server.received if path == "/v1/feedback"]
+        assert body["event"]["payload"] == {"v": "before"}
+
+    def test_feedback_retry_stays_ahead_of_later_traces_across_flush_passes(
+        self, fake_server: _RecordingServer, fake_server_url: str
+    ) -> None:
+        fake_server.status_by_path = {"/v1/feedback": [503, 202]}
+        client = TracebedClient(fake_server_url, flush_interval_s=3600)
+        run = mint_run_id()
+        client.feedback(
+            run, FeedbackEvent(adapter=AdapterClass.VERDICT, outcome="positive", event_id=uuid4())
+        )
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"n": 0}))
+        assert client.flush() == FlushReport(sent=0, dropped=0, pending=2)
+        # This append happens after the failed feedback was leased.  It must
+        # remain behind the requeued feedback on the next pass.
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"n": 1}))
+        assert client.flush() == FlushReport(sent=3, dropped=0, pending=0)
+        assert [path for path, _body in fake_server.received] == [
+            "/v1/feedback",
+            "/v1/feedback",
+            "/v1/trace/batch",
+        ]
+        assert [event["seq"] for event in _sent_trace_events(fake_server)] == [0, 1]
+
+    def test_token_provider_failure_retries_without_unauthenticated_post(
+        self, fake_server: _RecordingServer, fake_server_url: str
+    ) -> None:
+        calls = 0
+
+        def token() -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("token refresh unavailable")
+            return "recovered"
+
+        client = TracebedClient(fake_server_url, token_provider=token, flush_interval_s=3600)
+        run = mint_run_id()
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={}))
+        assert client.flush() == FlushReport(sent=0, dropped=0, pending=1)
+        assert fake_server.received == []
+        assert client.flush() == FlushReport(sent=1, dropped=0, pending=0)
+        assert fake_server.received_headers[0]["Authorization"] == "Bearer recovered"
+
+    def test_token_provider_that_consumes_budget_does_not_start_http(
+        self, fake_server: _RecordingServer, fake_server_url: str
+    ) -> None:
+        clock = FakeClock(_NOW)
+
+        def slow_token() -> str:
+            clock.advance(ms=2)
+            return "late"
+
+        client = TracebedClient(fake_server_url, token_provider=slow_token, flush_interval_s=3600)
+        client._clock = clock
+        client.trace(mint_run_id(), ToolCall(type="tool_call", ts=_NOW, payload={}))
+        assert client.flush(timeout_s=0.001) == FlushReport(sent=0, dropped=0, pending=1)
+        assert fake_server.received == []
+
+    def test_permanent_http_failure_and_poison_payload_are_counted_once(
+        self, fake_server: _RecordingServer, fake_server_url: str
+    ) -> None:
+        fake_server.status_by_path = {"/v1/trace/batch": [422]}
+        client = TracebedClient(fake_server_url, flush_interval_s=3600)
+        run = mint_run_id()
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={}))
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"bad": object()}))
+        assert client.flush() == FlushReport(sent=0, dropped=2, pending=0)
+        assert client.flush() == FlushReport(sent=0, dropped=0, pending=0)
+
+    def test_timed_flush_lock_contention_reports_pending_without_double_counting(
+        self, fake_server_url: str
+    ) -> None:
+        client = TracebedClient(fake_server_url, flush_interval_s=3600)
+        run = mint_run_id()
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={}))
+        assert client._flush_lock.acquire(timeout=1)
+        try:
+            started = time.monotonic()
+            report = client.flush(timeout_s=0.03)
+            assert time.monotonic() - started < 0.5
+        finally:
+            client._flush_lock.release()
+        assert report == FlushReport(sent=0, dropped=0, pending=1)
+
+    def test_concurrent_timed_flushes_report_one_existing_drop_once(
+        self, fake_server_url: str
+    ) -> None:
+        client = TracebedClient(fake_server_url, buffer_capacity=1, flush_interval_s=3600)
+        run = mint_run_id()
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"n": 0}))
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"n": 1}))
+        assert client._buffer.dropped_total == 1
+        assert client._flush_lock.acquire(timeout=1)
+        barrier = threading.Barrier(3)
+        reports: list[FlushReport] = []
+
+        def caller() -> None:
+            barrier.wait()
+            reports.append(client.flush(timeout_s=0.03))
+
+        threads = [threading.Thread(target=caller) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=1)
+        client._flush_lock.release()
+        assert len(reports) == 2
+        assert sum(report.dropped for report in reports) == 1
+        assert all(report.pending == 1 for report in reports)
+        assert client.flush(timeout_s=0.0).dropped == 0
+
+    def test_append_during_gated_http_lease_keeps_capacity_and_reports_overflow(
+        self,
+        fake_server: _RecordingServer,
+        fake_server_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = TracebedClient(fake_server_url, buffer_capacity=2, flush_interval_s=3600)
+        run = mint_run_id()
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"n": 0}))
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"n": 1}))
+        entered = threading.Event()
+        release = threading.Event()
+        original_post = client._http.post
+
+        def gated_post(*args: object, **kwargs: object) -> object:
+            entered.set()
+            assert release.wait(timeout=2)
+            return original_post(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(client._http, "post", gated_post)
+        reports: list[FlushReport] = []
+        thread = threading.Thread(target=lambda: reports.append(client.flush(timeout_s=5.0)))
+        thread.start()
+        assert entered.wait(timeout=2)
+        client.trace(run, ToolCall(type="tool_call", ts=_NOW, payload={"n": 2}))
+        assert client._buffer.pending_count == 2
+        assert client._buffer.dropped_total == 1
+        release.set()
+        thread.join(timeout=2)
+        assert reports == [FlushReport(sent=2, dropped=1, pending=0)]
+        assert [event["seq"] for event in _sent_trace_events(fake_server)] == [0, 1]
 
 
 class TestAuthHeaders:
@@ -649,7 +1017,7 @@ class TestWireShapeMatchesTheServerModels:
         )
         client.run_end(run, "ok")
 
-        models = {
+        models: dict[str, type[BaseModel]] = {
             "/v1/retrieve": RetrieveIn,
             "/v1/trace/batch": TraceBatchIn,
             "/v1/feedback": FeedbackIn,

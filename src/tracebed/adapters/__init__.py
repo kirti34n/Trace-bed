@@ -1,10 +1,6 @@
-"""Ports and shipped defaults.
+"""Ports and adapter helpers.
 
-PLAN.md §3: the core must run, fully featured, against zero host. Every
-host-specific concern is a port in `ports.py` with a working default
-implementation in this package. A host platform (Atom, or anything else)
-integrates by implementing a port — never by patching the core.
-
-`adapters/atom/` holds documented interface stubs only. No integration code
-lives here; the human writes that against the port definitions.
+Deployments integrate through the Protocols in :mod:`tracebed.adapters.ports`.
+This package does not ship a host-specific integration.  Consult the capability
+contract and adapter guide before treating any adapter path as deployable.
 """

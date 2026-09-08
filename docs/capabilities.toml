@@ -1,0 +1,401 @@
+# Tracebed's source-controlled capability contract.
+#
+# A state records what this repository can responsibly claim about a capability;
+# it is not a release approval, service-level objective, or deployment attestation.
+schema_version = 1
+title = "Tracebed capability contract"
+
+[states]
+blocked = "A known control, operating, or validation gap prevents a responsible readiness claim."
+implemented_unverified = "Code and focused tests exist, but this contract does not establish deployment, load, or adversarial validation."
+interface_only = "A Protocol or documented seam exists; a deployment must supply and validate an implementation."
+not_assessed = "No independent security, privacy, performance, or operational assessment is represented here."
+not_ready = "Explicitly excluded from a production-readiness claim."
+partial = "Some components exist, but a required path, evidence source, integration, or validation remains incomplete."
+
+[evidence_classes]
+documentation_only = "A documented gap or intended seam is present; it is not evidence of a deployed control."
+source_and_clean_stack_integration = "Relevant source, focused tests, and a clean-stack integration path are present; this is not deployment, load, high-availability, or security attestation."
+source_and_focused_tests = "Relevant source and focused tests are present, but this is not an end-to-end or deployment attestation."
+source_inventory = "Relevant source locations were inventoried; operation and adversarial behavior remain unverified."
+not_assessed = "No source, test, or external assessment establishes the control as operating."
+
+[[capability]]
+id = "audit-sink"
+name = "Durable security and operator audit sink"
+state = "blocked"
+summary = "The repository does not establish a durable, access-controlled, tamper-evident sink for security-relevant or administrative actions."
+limits = [
+  "Application logs and database records are not treated as a complete security audit trail.",
+  "No retention, review, export, or alerting commitment for audit records is represented here.",
+]
+future_gates = [
+  "Define accountable audit events, fields, access roles, retention, and alert ownership.",
+  "Implement a durable sink and verify append, access-control, export, and failure behavior in an integration environment.",
+]
+evidence_class = "documentation_only"
+evidence = [
+  "docs/THREAT-MODEL.md",
+  "SECURITY.md",
+]
+
+[[capability]]
+id = "background-learning"
+name = "Background learning pipeline"
+state = "implemented_unverified"
+summary = "A terminal trace can be processed through the Tier-A/v1 pull loop into a lower-trust candidate memory, embedded with hash-local, independently retrieved by lexical and vector arms, and rendered as a candidate_note."
+limits = [
+  "This narrow path does not implement promotion, corroboration, or a measured-improvement claim.",
+  "The clean-stack evidence is local and single-process; it is not deployment, high-availability, load, or security validation.",
+  "Candidate memories remain Tier-A/lower-trust and are rendered only as candidate_note context.",
+]
+future_gates = [
+  "Define and validate promotion, corroboration, quality, poisoning-resistance, rollback, and measured-improvement criteria with an accountable operator.",
+  "Validate deployment, multi-process, high-availability, load, and security behavior before expanding this claim.",
+]
+evidence_class = "source_and_clean_stack_integration"
+evidence = [
+  "src/tracebed/stores/pg/trace_learning.py",
+  "src/tracebed/workers/trace_learning_coordinator.py",
+  "src/tracebed/workers/composition.py",
+  "src/tracebed/workers/runner.py",
+  "tests/phase2/test_trace_p2a_e2e.py",
+  "tests/phase2/test_trace_learning_p2b_e2e.py",
+  "tests/phase2/test_trace_learning_runtime_e2e.py",
+]
+
+[[capability]]
+id = "backup-restore-and-high-availability"
+name = "Backup, restore, and high availability"
+state = "blocked"
+summary = "No backup policy, restore drill, recovery objective, failover design, or high-availability validation is established by this repository."
+limits = [
+  "Source-controlled schema and migration code do not prove recoverability of a deployed data set.",
+  "No RPO, RTO, backup owner, or failure-domain assumption is claimed.",
+]
+future_gates = [
+  "Assign backup and recovery ownership, data scope, RPO/RTO targets, and encryption/key recovery procedures.",
+  "Run and record restore and failover drills against a representative deployment before changing this state.",
+]
+evidence_class = "not_assessed"
+evidence = [
+  "docs/DATA-LIFECYCLE.md",
+  "docs/THREAT-MODEL.md",
+]
+
+[[capability]]
+id = "dependency-sbom-provenance-and-release"
+name = "Dependency, SBOM, provenance, and release controls"
+state = "blocked"
+summary = "Source implements candidate-release dependency gates, SBOM generation, vulnerability blocking, keyless signing, provenance verification, and a human publication gate; it does not establish configured approvers, a trusted publishing destination, or a released artifact."
+limits = [
+  "Passing source gates and retaining candidate evidence do not prove a published artifact, a configured protected environment, or an operating incident process.",
+  "No release authority, trusted-publisher destination, security contact, branch-protection rule, or approved vulnerability exception is configured by this repository.",
+]
+future_gates = [
+  "Configure accountable human approvers, branch protections, a private security route, and GitHub OIDC trusted publishing in repository settings.",
+  "Run and independently verify a candidate artifact through the protected human gate before an authorized publication.",
+]
+evidence_class = "source_and_focused_tests"
+evidence = [
+  ".github/workflows/release.yml",
+  "docs/RELEASE-POLICY.md",
+  "scripts/release_check.py",
+  "scripts/release_manifest.py",
+  "scripts/release_verifier.py",
+  "scripts/release_notices.py",
+  "repository-settings/release-checklist.md",
+  "repository-settings/security-exceptions.md",
+  "SECURITY.md",
+]
+
+[[capability]]
+id = "edge-and-dashboard-authentication"
+name = "Edge and dashboard authentication"
+state = "implemented_unverified"
+summary = "Source implements a same-origin OIDC BFF with Code+PKCE, browser-bound state and opaque HttpOnly sessions, a fixed allowlist, CSRF checks, bounded discovery/session state, and API bearer forwarding. An isolated loopback-only local demo uses a separate server-held API key and opaque HttpOnly session; browser JavaScript does not receive either credential. Deployment identity-provider configuration and end-to-end operating evidence are unverified."
+limits = [
+  "The process-local pending-login/session store intentionally invalidates sessions on restart and is bounded rather than a distributed production session service.",
+  "Source and mock-transport checks do not attest a configured production IdP, public callback origin, deployment TLS/proxy behavior, user-to-project onboarding, or incident response.",
+  "The bounded export relay avoids unbounded buffering but does not make an export complete, audited, or authorized beyond the API's scoped bearer decision.",
+  "The local demo is not a production identity, TLS, proxy, or public-origin configuration.",
+]
+future_gates = [
+  "Run a configured Compose/deployment authentication path against an independently controlled IdP and API principal/project mapping, including allowed and denied whoami/export cases.",
+  "Threat-model and validate reverse-proxy TLS, callback, logout, expiry, session-store restart, rate/load, monitoring, and incident-response behavior in the target environment.",
+]
+evidence_class = "source_and_focused_tests"
+evidence = [
+  "src/tracebed/edge/config.py",
+  "src/tracebed/edge/main.py",
+  "src/tracebed/edge/local_demo.py",
+  "scripts/local_demo.py",
+  "src/tracebed/adapters/identity.py",
+  "docker/compose.yaml",
+  "dashboard/nginx.conf",
+  "tests/phase0/test_edge_bff.py",
+  "tests/phase0/test_auth.py",
+  "docs/THREAT-MODEL.md",
+]
+
+[[capability]]
+id = "erasure-and-project-deletion"
+name = "Erasure and project deletion"
+state = "blocked"
+summary = "Source implements a lease-bound E3 executor plus an authenticated E4 local-Compose deployment epoch, scoped runtime identity, and prepublication evidence; production activation and complete deployment evidence remain blocked."
+limits = [
+  "Local Compose activation evidence is not a backup, legal-hold, OIDC, dashboard, release, compliance, or production-readiness claim.",
+  "No compliance, legal-hold, backup-expiry, restoration, export, or post-restore absence behavior is claimed.",
+]
+future_gates = [
+  "Independently audit the dedicated executor identity, store credentials, object-lock/legal-hold policy, and deployment wiring in the target environment.",
+  "Produce live evidence for every configured manifest store, backup expiry, and post-restore absence checks for the agreed inventory.",
+]
+evidence_class = "source_and_clean_stack_integration"
+evidence = [
+  "docs/DATA-LIFECYCLE.md",
+  "migrations/0012_erasure_saga.sql",
+  "migrations/0013_erasure_deployment.sql",
+  "src/tracebed/erasure/executor.py",
+  "src/tracebed/erasure/composition.py",
+  "tests/phase3/test_erasure_executor.py",
+]
+
+[[capability]]
+id = "execution-trace-intake"
+name = "Execution-derived trace intake"
+state = "implemented_unverified"
+summary = "The SDK and ingest code provide bounded in-process asynchronous recording of trace, feedback, and proposal evidence; retryable delivery retains stable identities and frozen first-send payloads for a later flush pass."
+limits = [
+  "A deployment must supply configuration, credentials, and an operating queue/store.",
+  "The SDK is at-least-once rather than ingress exactly-once, can lose terminally failed or overflowed work, has no durable spool, and retains an unbounded per-run sequence map for its process lifetime.",
+  "This state is not evidence that every host event is captured, delivered to a host model, or retained appropriately for a deployment.",
+]
+future_gates = [
+  "Validate end-to-end intake, authorization, loss handling, and retention behavior in a representative deployment.",
+  "Measure capture completeness against the host events an operator intends to rely on.",
+]
+evidence_class = "source_and_focused_tests"
+evidence = [
+  "src/tracebed/sdk/client.py",
+  "src/tracebed/sdk/buffer.py",
+  "src/tracebed/ingest/outcome_intake.py",
+  "src/tracebed/ingest/trace_writer.py",
+  "tests/phase0/test_trace_writer.py",
+]
+
+[[capability]]
+id = "export-authorization-and-completeness"
+name = "Export authorization and completeness"
+state = "blocked"
+summary = "Source enforces an export grant, derives project scope from the authenticated principal, retains disclosure-lifetime gates, and uses project-scoped/RLS queries over a fixed export inventory. The BFF aborts an over-limit stream instead of presenting partial data as complete. Approved-scope inventory completeness, deployment authorization, and auditability are not established."
+limits = [
+  "The repository's fixed inventory is not evidence that every record required by an approved business, legal, or regulatory scope is included.",
+  "Source and focused tests do not establish deployment authorization review, export auditability, redaction, legal-hold, or export-retention controls.",
+]
+future_gates = [
+  "Define and approve the target export inventory, scope-completeness semantics, redaction, retention, legal-hold, and audit requirements.",
+  "Validate authorized, denied, cross-project, and disclosure-lifetime paths in the target deployment with accountable audit evidence.",
+]
+evidence_class = "source_and_focused_tests"
+evidence = [
+  "src/tracebed/api/admin.py",
+  "src/tracebed/api/deps.py",
+  "src/tracebed/edge/main.py",
+  "tests/phase0/test_edge_bff.py",
+  "tests/phase0/test_export_column_list.py",
+  "tests/phase1/test_edge_nginx_socket.py",
+  "dashboard/README.md",
+  "docs/DATA-LIFECYCLE.md",
+]
+
+[[capability]]
+id = "feedback-authenticity-and-poisoning"
+name = "Feedback authenticity and poisoning resistance"
+state = "blocked"
+summary = "Source requires a durable feedback grant with a source-bound feedback authorization before enqueueing feedback, and includes focused authorization tests. It does not establish replay resistance, abuse controls, corroboration, poisoning evaluation, or deployment assurance for learning-influencing feedback."
+limits = [
+  "A source-bound grant and route tests do not make feedback trustworthy or establish replay, rate-limit, moderation, corroboration, rollback, or deployment monitoring controls.",
+  "No poisoning evaluation or accountable operating policy for learning-influencing feedback is claimed.",
+]
+future_gates = [
+  "Define replay and abuse controls, provenance/review thresholds, rollback ownership, and deployment monitoring for approved feedback sources.",
+  "Test adversarial and low-quality feedback paths in the target deployment before relying on feedback for a learning loop.",
+]
+evidence_class = "source_and_focused_tests"
+evidence = [
+  "src/tracebed/ingest/outcome_intake.py",
+  "src/tracebed/api/routes_v1.py",
+  "src/tracebed/api/deps.py",
+  "tests/phase0/test_api_scope.py",
+  "tests/phase3/test_api_b2_authority.py",
+  "docs/THREAT-MODEL.md",
+]
+
+[[capability]]
+id = "host-integration"
+name = "Host integration seams"
+state = "interface_only"
+summary = "Typed ports describe several deployment integration points. No host-specific adapter package is shipped or implied."
+limits = [
+  "An operator owns adapter implementation, credential handling, integration tests, and acceptance criteria.",
+  "Port definitions alone do not provide a working integration.",
+]
+future_gates = [
+  "Implement a deployment-owned adapter with explicit configuration and least-privilege credentials.",
+  "Run acceptance and failure-mode tests against the target host before making an integration claim.",
+]
+evidence_class = "documentation_only"
+evidence = [
+  "src/tracebed/adapters/ports.py",
+  "docs/ADAPTER-GUIDE.md",
+]
+
+[[capability]]
+id = "project-scoped-memory"
+name = "Project-scoped memory and retrieval"
+state = "implemented_unverified"
+summary = "Repository, storage, and hot-path code contain project-scoped memory and retrieval mechanisms. An authorized retrieval hold writes its final selected result through one transaction, but that record does not prove host delivery or form a complete security audit sink."
+limits = [
+  "Correctness depends on deployment authentication, database roles, migrations, and configuration.",
+  "This contract does not certify isolation against a particular deployed environment or threat actor.",
+  "Selected-for-response and HOLDOUT shadow-selection records are not evidence of prompt delivery, user exposure, or agent improvement.",
+]
+future_gates = [
+  "Exercise tenant-isolation and authorization properties against a representative database and identity boundary.",
+  "Complete independent security review of cross-project and administrative access paths.",
+]
+evidence_class = "source_and_focused_tests"
+evidence = [
+  "src/tracebed/stores/pg/repo.py",
+  "src/tracebed/stores/pg/authority.py",
+  "src/tracebed/hotpath/pipeline.py",
+  "harness/leak_suite/test_leaks.py",
+]
+
+[[capability]]
+id = "provisioning-atomicity"
+name = "Project provisioning atomicity"
+state = "implemented_unverified"
+summary = "ProjectProvisioner atomically creates or replays an identical project provisioning request. Owner onboarding atomically creates one new principal, registration, and explicit grants; it is not replay-idempotent. The local demo uses separate deterministic owner paths."
+limits = [
+  "Source and focused tests do not establish deployment recovery, external-resource reconciliation, or accountable operating ownership.",
+  "The bounded local-demo owner path is not a general public provisioning API.",
+  "No supported public operator CLI or HTTP path creates the initial standalone project; onboarding requires an existing project UUID from an owner-controlled provisioning process.",
+]
+future_gates = [
+  "Validate failure recovery and reconciliation against the target deployment's external resources and operating process.",
+  "Design and validate a supported initial-project operator workflow before representing standalone onboarding as complete.",
+]
+evidence_class = "source_and_focused_tests"
+evidence = [
+  "src/tracebed/stores/pg/provisioning.py",
+  "src/tracebed/stores/pg/local_demo.py",
+  "src/tracebed/local_demo_provision.py",
+  "tests/phase1/test_local_demo_provision.py",
+]
+
+[[capability]]
+id = "production-readiness"
+name = "Production readiness"
+state = "not_ready"
+summary = "This repository does not make a production-ready claim. A release decision requires deployment-specific validation and accountable human approval."
+limits = [
+  "Complete the repository release checklist and the deployment owner's controls before any release decision.",
+  "Do not treat local tests, generated documentation, or source presence as a production attestation.",
+]
+future_gates = [
+  "Resolve every blocked capability with deployment-specific evidence and accountable owner approval.",
+  "Complete the release checklist, threat model review, operational validation, and human release decision.",
+]
+evidence_class = "documentation_only"
+evidence = [
+  "repository-settings/release-checklist.md",
+  "docs/THREAT-MODEL.md",
+  "SECURITY.md",
+]
+
+[[capability]]
+id = "rbac-and-authorization"
+name = "RBAC and authorization"
+state = "implemented_unverified"
+summary = "Source persists project roles and identity mappings, enforces source-bound feedback, route guards and project RLS/scoping, and includes focused allowed/denied tests."
+limits = [
+  "Focused source tests do not replace independent authorization review, deployment identity governance, or production access monitoring.",
+  "Role grants and source-bound feedback policy still require accountable deployment ownership.",
+]
+future_gates = [
+  "Complete an independent cross-project and administrative authorization audit in the target deployment.",
+]
+evidence_class = "source_and_focused_tests"
+evidence = [
+  "src/tracebed/stores/pg/authority.py",
+  "src/tracebed/api/deps.py",
+  "tests/phase3/test_api_b2_authority.py",
+  "tests/phase0/test_api_scope.py",
+]
+
+[[capability]]
+id = "retention-policy"
+name = "Retention policy enforcement"
+state = "blocked"
+summary = "No accountable data-classification, retention, expiration, legal-hold, or deletion policy is implemented and validated as a deployment control."
+limits = [
+  "TTL-like source behavior, if any, is not treated as a complete policy across stores, exports, logs, and backups.",
+  "No jurisdictional, contractual, or regulatory retention representation is made.",
+]
+future_gates = [
+  "Define data classes, retention periods, legal holds, deletion owners, and evidence requirements for each deployed store.",
+  "Implement and test expiration and exception handling across the approved data inventory.",
+]
+evidence_class = "documentation_only"
+evidence = [
+  "docs/DATA-LIFECYCLE.md",
+  "docs/THREAT-MODEL.md",
+]
+
+[[capability]]
+id = "runtime-and-worker-operation"
+name = "Runtime and worker operation"
+state = "implemented_unverified"
+summary = "Compose-v1 defines a closed local API/worker/bootstrap topology with fixed HBA routing, admission fencing, secret-file entrypoints, authenticated readiness, and source/clean-stack integration gates. The supported loopback demo launcher and overlay add isolated edge, provisioning, and public-API seed one-shots."
+limits = [
+  "This is Compose-v1 source and clean-stack evidence only; arbitrary external HBA/topologies are unsupported.",
+  "Host-root mutation of the checked HBA mount, external network routing, TLS termination, and deployed secret distribution are outside this local Compose evidence.",
+  "No production readiness, SLO, alerting, capacity, high availability, backup/restore, or on-call commitment is claimed.",
+]
+future_gates = [
+  "Complete an independent assessment and representative deployment validation with failure injection, observability, and incident ownership.",
+  "Define operating ownership, runbooks, capacity thresholds, backup/restore, high availability, and incident escalation before changing this state.",
+]
+evidence_class = "source_and_clean_stack_integration"
+evidence = [
+  "src/tracebed/api/main.py",
+  "src/tracebed/workers/runner.py",
+  "docker/compose.yaml",
+  "docker/postgres/pg_hba.conf",
+  "scripts/compose_stack.py",
+  "scripts/local_demo.py",
+  "docker/compose.demo.yaml",
+  "scripts/compose_acceptance.py",
+  "docs/THREAT-MODEL.md",
+]
+
+[[capability]]
+id = "security-assurance"
+name = "Independent security assurance"
+state = "not_assessed"
+summary = "No independent security review, penetration test, compliance assessment, or vulnerability-management service is claimed by this repository."
+limits = [
+  "The threat model identifies areas a deployment owner must assess; it is not an assurance report.",
+  "Security reporting and ownership must be configured by humans before a public release.",
+]
+future_gates = [
+  "Assign accountable security ownership and complete an independent review proportionate to the deployment's risk.",
+  "Track, remediate, and verify findings through an approved vulnerability-management and release process.",
+]
+evidence_class = "not_assessed"
+evidence = [
+  "docs/THREAT-MODEL.md",
+  "SECURITY.md",
+]

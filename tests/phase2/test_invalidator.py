@@ -15,6 +15,7 @@ test rather than staying silently green.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -182,6 +183,21 @@ class _FakeRepo:
         )
 
 
+class _ActivityProbe:
+    """Offline proof that E2's fast drain covers the actual side effect."""
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    @contextmanager
+    def shared(self, _project_id: ProjectId) -> object:
+        self._events.append("acquire")
+        try:
+            yield
+        finally:
+            self._events.append("release")
+
+
 def test_flipping_a_tool_definition_marks_only_its_dependents_stale() -> None:
     validated_dependent = _row(1, status=Status.VALIDATED, tool_refs=("tool-x",))
     other_tool = _row(2, status=Status.VALIDATED, tool_refs=("tool-y",))
@@ -257,6 +273,49 @@ def test_cache_flush_flushes_and_touches_no_memory() -> None:
     assert result.transitioned_to_stale == ()
     assert repo.provenance_calls == 0
     assert repo.persisted == []
+
+
+def test_e2_activity_gate_spans_cache_flush_and_memory_persistence() -> None:
+    row = _row(1, status=Status.VALIDATED, tool_refs=("tool-x",))
+    repo = _FakeRepo([row])
+    events: list[str] = []
+    activity = _ActivityProbe(events)
+
+    def _flush(_project_id: ProjectId) -> int:
+        assert events == ["acquire"]
+        events.append("flush")
+        return 1
+
+    invalidator = Invalidator(
+        repo,
+        FakeClock(EPOCH),
+        flush_cache=_flush,
+        activity=activity,  # type: ignore[arg-type]
+    )
+    invalidator.process_event(
+        PROJECT,
+        InvalidationEvent(event_type=CACHE_FLUSH_EVENT_TYPE, selector=InvalidationSelector()),
+        _effective_config(),
+    )
+    assert events == ["acquire", "flush", "release"]
+
+    events.clear()
+    original_persist = repo.persist
+
+    def _persist(project_id: ProjectId, write: LifecycleTransitionWrite) -> None:
+        assert events == ["acquire"]
+        events.append("persist")
+        original_persist(project_id, write)
+
+    repo.persist = _persist  # type: ignore[method-assign]
+    invalidator.process_event(
+        PROJECT,
+        InvalidationEvent(
+            event_type="tool_changed", selector=InvalidationSelector(tool_refs=("tool-x",))
+        ),
+        _effective_config(),
+    )
+    assert events == ["acquire", "persist", "release"]
 
 
 def test_cache_flush_with_no_flush_callable_reports_that_nothing_was_flushed() -> None:
@@ -420,6 +479,27 @@ def test_process_raw_batch_drains_multiple_payloads() -> None:
     assert results[0].transitioned_to_stale == (dependent.id,)
     assert results[1].cache_flushed is True
     assert results[1].flushed_keys == 7
+
+
+def test_e2_activity_gate_is_held_once_for_a_whole_raw_batch() -> None:
+    row = _row(1, status=Status.VALIDATED, tool_refs=("tool-x",))
+    events: list[str] = []
+    invalidator = Invalidator(
+        _FakeRepo([row]),
+        FakeClock(EPOCH),
+        activity=_ActivityProbe(events),  # type: ignore[arg-type]
+    )
+
+    invalidator.process_raw_batch(
+        PROJECT,
+        [
+            {"event_type": "tool_changed", "selector": {"tool_refs": ["tool-x"]}},
+            {"event_type": "tool_changed", "selector": {"tool_refs": ["tool-y"]}},
+        ],
+        _effective_config(),
+    )
+
+    assert events == ["acquire", "release"]
 
 
 def test_process_raw_batch_refuses_the_whole_batch_before_writing_anything() -> None:

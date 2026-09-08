@@ -123,12 +123,8 @@ def test_no_v1_handler_accepts_a_project_id_parameter() -> None:
         assert "project_id" not in params, f"routes_v1.{name} takes a project_id parameter"
 
 
-def test_only_the_admin_registry_route_names_a_project() -> None:
-    """`api/admin.py` has two auth planes. The `require_admin_key` routes may
-    name a project (there is no registration yet for the caller creating one);
-    the `ScopeDep` routes may not, and get the same server-derived scope as
-    `/v1/*`. Read off the real handler signatures, so a route that changed
-    planes would fail here."""
+def test_admin_routes_take_server_resolved_authority_not_a_project() -> None:
+    """B2 has no registry route on the listener; reads take an access context."""
     scoped_handlers = (
         "get_memory",
         "export_project",
@@ -147,11 +143,10 @@ def test_only_the_admin_registry_route_names_a_project() -> None:
         fn = getattr(admin_routes, name)
         params = inspect.signature(fn).parameters
         assert "project_id" not in params, f"admin.{name} takes a project_id"
-        assert "scope" in params, f"admin.{name} does not resolve a ProjectScope"
+        assert "access" in params, f"admin.{name} does not resolve authority"
 
-    # And the registry route does name one — the exception, made explicit.
-    assert "body" in inspect.signature(admin_routes.register_agent).parameters
-    assert "project_id" in api_models.RegisterAgentIn.model_fields
+    assert not hasattr(admin_routes, "create_project")
+    assert not hasattr(admin_routes, "register_agent")
 
 
 def test_enqueue_requires_a_typed_projectid_not_a_bare_uuid() -> None:
@@ -484,15 +479,19 @@ def test_appdeps_has_a_port_for_every_router_dependency() -> None:
         "memory_reader",
         "exporter",
         "invalidations",
-        "admin",
-        "partitions",
-        "keys",
+        "retrieval_opener",
         "clock",
         "pipeline",
         # D-093: the dashboard's read surface. Optional like `pipeline`, and
         # for the same reason — a `TestClient` app built against Phase 0 fakes
         # must keep constructing without one.
         "control_plane",
+        # B2 route authority is mandatory: no legacy project-scope fallback.
+        "access_resolver",
+        # E2 has a narrowly scoped request/status port and a shared read gate
+        # that keeps fence checks alive through response disclosure.
+        "erasure_requests",
+        "read_gate",
     }
     for name, annotation in hints.items():
         # `pipeline` is `PipelinePort | None` — optional because a real

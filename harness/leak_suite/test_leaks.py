@@ -569,7 +569,7 @@ def test_probe7_rls_bypass_zero_rows_without_or_with_wrong_guc(
     except psycopg.OperationalError as exc:
         pytest.skip(
             f"tracebed_app role unreachable ({exc.__class__.__name__}); needs "
-            "docker/initdb/01-roles.sql bootstrapped first (harness Task 1's concern, "
+            "the owner bootstrap or Compose db-bootstrap one-shot must run first (harness Task 1's concern, "
             "not this probe's)."
         )
     try:

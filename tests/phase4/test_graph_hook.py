@@ -53,7 +53,7 @@ _MERGE_NODE_PATTERN = re.compile(r"MERGE\s+\(\s*\w+\s*\{([^}]*)\}\s*\)")
 class _FakeExecutor:
     """Satisfies `CypherExecutorPort`. `edges` models a `derived_from` adjacency list;
     `direct_derived_descendants`'s query is recognised by its own `RETURN` clause and answered
-    from it, everything else (`upsert_link`/`delete_by_project`) just records the call."""
+    from it; `upsert_link` records its write call."""
 
     def __init__(
         self, edges: dict[MemoryId, list[MemoryId]] | None = None, *, leak_wrong_project: bool = False
@@ -86,7 +86,6 @@ def _every_query_the_module_can_emit() -> list[str]:
         PROJECT_A, MEM_ROOT, max_generations=8, max_descendants=8
     )
     store.upsert_link(PROJECT_A, MEM_ROOT, MEM_A, "derived_from")
-    store.delete_by_project(PROJECT_A)
     return [call[2] for call in executor.calls]
 
 
@@ -244,20 +243,11 @@ def test_upsert_link_binds_both_endpoints_and_scopes_to_project_id() -> None:
     assert "MERGE (src)-[r:LINK {relation: $relation}]->(dst)" in cypher
 
 
-def test_delete_by_project_scopes_to_project_id_and_nothing_narrower() -> None:
-    executor = _FakeExecutor()
-    store = AgeGraphStore(executor=executor)
+def test_normal_graph_port_exposes_no_destructive_project_operation() -> None:
+    """The AGE deletion command is only available through the E3 adapter."""
 
-    store.delete_by_project(PROJECT_A)
-
-    called_project_id, _graph_name, cypher, params = executor.calls[0]
-    assert called_project_id == PROJECT_A
-    assert params == {"project_id": str(PROJECT_A.value)}
-    assert "project_id: $project_id" in cypher
-    assert "DETACH DELETE" in cypher
-    # An erasure narrowed by anything else leaves behind exactly what it exists to destroy.
-    assert "WHERE" not in cypher
-    assert _NODE_PATTERN.findall(cypher) == [("n", "project_id: $project_id")]
+    assert not hasattr(AgeGraphStore, "delete_by_project")
+    assert not hasattr(GraphStorePort, "delete_by_project")
 
 
 def test_two_projects_produce_independent_calls_with_distinct_scoping() -> None:

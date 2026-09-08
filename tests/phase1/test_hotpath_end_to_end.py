@@ -26,6 +26,7 @@ The four questions this file exists to answer, none of which any single chunk co
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -37,6 +38,7 @@ from fastapi.testclient import TestClient
 from tracebed.adapters.identity import Principal
 from tracebed.api.deps import AppDeps
 from tracebed.api.main import create_app
+from tracebed.domain.authority import AccessContext, GrantBinding
 from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import (
     ConfigResolver,
@@ -44,7 +46,8 @@ from tracebed.domain.config import (
     StorageConfig,
     TracebedSettings,
 )
-from tracebed.domain.enums import Arm, MemType, OutcomeCode, ScopeType, Slot, TrustTier
+from tracebed.domain.deadline import RemainingBudget
+from tracebed.domain.enums import Arm, MemType, OutcomeCode, ProjectRole, ScopeType, Slot, TrustTier
 from tracebed.domain.errors import AuthenticationFailed, EmbeddingTimeout
 from tracebed.domain.events import MEMORY_HEADER
 from tracebed.domain.ids import AgentTypeId, MemoryId, PrincipalId, ProjectId, RunId
@@ -84,6 +87,7 @@ class FakeSearchStore:
         corpus: int = 1_000,
         clock: FakeClock | None = None,
         arm_stall_ms: float = 0.0,
+        store_stall_ms: float = 0.0,
         raises: bool = False,
     ) -> None:
         self._hits = list(hits)
@@ -93,20 +97,26 @@ class FakeSearchStore:
         # shape production cannot produce (and, as first written, it did: the whole retrieval
         # failed closed on a 50.0 "cosine", which is the guard working).
         self._vector_hits = (
-            list(vector_hits)
-            if vector_hits is not None
-            else [_cosine(hit) for hit in hits]
+            list(vector_hits) if vector_hits is not None else [_cosine(hit) for hit in hits]
         )
         self._rows = list(rows)
         self._corpus = corpus
         self._clock = clock
         self._arm_stall_ms = arm_stall_ms
+        self._store_stall_ms = store_stall_ms
         self._raises = raises
         self.project_ids: list[ProjectId] = []
+        self.fetch_calls = 0
+        self.corpus_calls = 0
+        self.df_calls = 0
 
     def _charge(self) -> None:
         if self._arm_stall_ms and self._clock is not None:
             self._clock.advance(ms=self._arm_stall_ms)
+
+    def _charge_store(self) -> None:
+        if self._store_stall_ms and self._clock is not None:
+            self._clock.advance(ms=self._store_stall_ms)
 
     def lexical_arm(
         self,
@@ -115,6 +125,7 @@ class FakeSearchStore:
         top_n: int,
         *,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         self.project_ids.append(project_id)
         self._charge()
@@ -131,6 +142,7 @@ class FakeSearchStore:
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         self.project_ids.append(project_id)
         if self._raises:
@@ -138,18 +150,30 @@ class FakeSearchStore:
         return list(self._vector_hits)
 
     def fetch_candidates(
-        self, project_id: ProjectId, memory_ids: Sequence[MemoryId]
+        self,
+        project_id: ProjectId,
+        memory_ids: Sequence[MemoryId],
+        *,
+        deadline: object | None = None,
     ) -> list[CandidateRow]:
         self.project_ids.append(project_id)
+        self.fetch_calls += 1
+        self._charge_store()
         wanted = set(memory_ids)
         return [row for row in self._rows if row.memory_id in wanted]
 
-    def document_frequency(self, project_id: ProjectId, terms: Sequence[str]) -> dict[str, int]:
+    def document_frequency(
+        self, project_id: ProjectId, terms: Sequence[str], *, deadline: object | None = None
+    ) -> dict[str, int]:
         self.project_ids.append(project_id)
+        self.df_calls += 1
+        self._charge_store()
         return dict.fromkeys(terms, 1)
 
-    def corpus_size(self, project_id: ProjectId) -> int:
+    def corpus_size(self, project_id: ProjectId, *, deadline: object | None = None) -> int:
         self.project_ids.append(project_id)
+        self.corpus_calls += 1
+        self._charge_store()
         return self._corpus
 
 
@@ -177,18 +201,31 @@ class FakeConfigStore:
 
     def __init__(self, overrides: Mapping[str, object] | None = None) -> None:
         self._overrides = dict(overrides or {})
+        self.deadlines: list[object | None] = []
 
-    def get_project_config(self, project_id: ProjectId) -> Mapping[str, object]:
+    def get_project_config(
+        self, project_id: ProjectId, *, deadline: object | None = None
+    ) -> Mapping[str, object]:
+        del project_id
+        self.deadlines.append(deadline)
         return self._overrides
 
     def get_agent_type_config(
-        self, project_id: ProjectId, agent_type_id: AgentTypeId
+        self, project_id: ProjectId, agent_type_id: AgentTypeId, *, deadline: object | None = None
     ) -> Mapping[str, object]:
+        del project_id, agent_type_id
+        self.deadlines.append(deadline)
         return {}
 
     def get_killswitch_overlay(
-        self, project_id: ProjectId, agent_type_id: AgentTypeId | None = None
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId | None = None,
+        *,
+        deadline: object | None = None,
     ) -> Mapping[str, bool]:
+        del project_id, agent_type_id
+        self.deadlines.append(deadline)
         return {}
 
 
@@ -239,9 +276,13 @@ class FakeVerifier:
     principal_id: PrincipalId
 
     def authenticate(
-        self, *, authorization: str | None = None, api_key: str | None = None
+        self,
+        *,
+        authorization: str | None = None,
+        api_key: str | None = None,
+        deadline: RemainingBudget | None = None,
     ) -> Principal:
-        del authorization
+        del authorization, deadline
         if api_key == "good":
             return Principal(principal_id=self.principal_id, kind="api_key", external_ref="k1")
         raise AuthenticationFailed("bad credential")
@@ -256,10 +297,25 @@ class FakeResolver:
         self.calls.append(principal_id)
         return self.scope
 
+    def resolve_access(
+        self, principal_id: PrincipalId, *, deadline: RemainingBudget | None = None
+    ) -> AccessContext:
+        del deadline
+        self.calls.append(principal_id)
+        return AccessContext(
+            project_id=self.scope.project_id,
+            agent_type_id=self.scope.agent_type_id,
+            principal_id=principal_id,
+            grants=(GrantBinding(uuid4(), ProjectRole.DATA),),
+        )
+
 
 class _Inert:
-    def enqueue(self, topic: str, project_id: ProjectId, payload: Mapping[str, object]) -> UUID:
-        return uuid4()
+    telemetry: RecordingTelemetry | None = None
+    project_id: ProjectId | None = None
+
+    def enqueue_many_authorized(self, *args: object, **kwargs: object) -> tuple[int, ...]:
+        return ()
 
     def get_memory_by_id(self, project_id: ProjectId, memory_id: MemoryId) -> MemoryItemRow:
         raise AssertionError("not exercised here")
@@ -267,31 +323,49 @@ class _Inert:
     def iter_export_rows(self, project_id: ProjectId) -> Iterator[dict[str, object]]:
         return iter(())
 
-    def insert_invalidation_event(
-        self, project_id: ProjectId, event_type: str, selector: Mapping[str, object] | None = None
-    ) -> UUID:
+    def insert(self, *args: object, **kwargs: object) -> UUID:
         return uuid4()
 
-    def create_project(
-        self, name: str, retention_policy: Mapping[str, object] | None = None
-    ) -> ProjectId:
-        raise AssertionError("not exercised here")
+    def open(self, access: AccessContext, run_id: RunId) -> object:
+        assert access.grant_for(ProjectRole.DATA) is not None
+        assert type(run_id) is RunId
+        return object()
 
-    def create_agent_registration(
+    @contextmanager
+    def hold(
         self,
-        project_id: ProjectId,
-        agent_type_name: str,
-        principal_kind: str,
-        external_ref: str,
-        key_hash: str | None,
-    ) -> tuple[PrincipalId, AgentTypeId]:
-        raise AssertionError("not exercised here")
+        access: AccessContext,
+        run_id: RunId,
+        *,
+        subject_tags: tuple[str, ...] = (),
+        deadline: RemainingBudget | None = None,
+    ) -> Iterator[object]:
+        del subject_tags, deadline
+        assert access.grant_for(ProjectRole.DATA) is not None
+        assert type(run_id) is RunId
+        assert self.telemetry is not None and self.project_id is not None
+        yield type("Scope", (), {"audit": _Audit(self.telemetry, self.project_id)})()
 
-    def create_project_partitions(self, project_id: ProjectId) -> None:
-        return None
 
-    def ensure_project_kek(self, project_id: ProjectId) -> None:
-        return None
+class _Audit:
+    def __init__(self, telemetry: RecordingTelemetry, project_id: ProjectId) -> None:
+        self._telemetry, self._project_id = telemetry, project_id
+
+    def record_terminal(self, **kwargs: object) -> None:
+        row = kwargs["row"]
+        injections = tuple(kwargs["injections"])
+        if injections:
+            self._telemetry.record_injections(self._project_id, row.run_id, injections)
+        self._telemetry.record_retrieval(
+            self._project_id,
+            row.run_id,
+            outcome_code=row.outcome_code,
+            latency_ms=row.latency_ms,
+            embed_latency_ms=row.embed_latency_ms,
+            candidates_considered=row.candidates_considered,
+            top_score=row.top_score,
+            arm=row.arm,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -369,6 +443,7 @@ class Harness:
     telemetry: RecordingTelemetry
     resolver: FakeResolver
     clock: FakeClock
+    config_store: FakeConfigStore
 
 
 def _harness(
@@ -395,10 +470,12 @@ def _harness(
     settings = _settings()
     resolver = FakeResolver(scope=scope)
     inert = _Inert()
+    inert.telemetry, inert.project_id = telemetry, scope.project_id
 
+    config_store = FakeConfigStore(config_overrides)
     pipeline = Pipeline(
         clock=clock,
-        config=ConfigResolver(settings, FakeConfigStore(config_overrides)),
+        config=ConfigResolver(settings, config_store),
         telemetry=telemetry,
         retriever=Retriever(store, embedder, clock),  # type: ignore[arg-type]
         assembly=CandidateAssembly(store, clock),
@@ -413,9 +490,8 @@ def _harness(
         memory_reader=inert,  # type: ignore[arg-type]
         exporter=inert,  # type: ignore[arg-type]
         invalidations=inert,  # type: ignore[arg-type]
-        admin=inert,  # type: ignore[arg-type]
-        partitions=inert,  # type: ignore[arg-type]
-        keys=inert,  # type: ignore[arg-type]
+        retrieval_opener=inert,  # type: ignore[arg-type]
+        access_resolver=resolver,
         clock=clock,
         pipeline=pipeline,
     )
@@ -426,11 +502,15 @@ def _harness(
         telemetry=telemetry,
         resolver=resolver,
         clock=clock,
+        config_store=config_store,
     )
 
 
 def _post(harness: Harness, **body_overrides: object) -> Any:
-    body: dict[str, object] = {"agent_type": "declared-by-the-caller", "run_ctx": {"query_text": QUERY}}
+    body: dict[str, object] = {
+        "agent_type": "declared-by-the-caller",
+        "run_ctx": {"query_text": QUERY},
+    }
     body.update(body_overrides)
     return harness.client.post("/v1/retrieve", json=body, headers={"x-api-key": "good"})
 
@@ -462,6 +542,19 @@ def test_a_healthy_call_renders_a_real_memory_into_the_response() -> None:
     assert CONTENT in body["context_block"]["rendered"]
     assert [s["memory_id"] for s in body["context_block"]["slots"]] == [str(mid)]
     assert [s["slot"] for s in body["context_block"]["slots"]] == [Slot.FACT.value]
+
+
+def test_real_pipeline_forwards_one_request_deadline_to_all_config_reads() -> None:
+    _, store = _one_memory()
+    harness = _harness(store=store)
+
+    response = _post(harness)
+
+    assert response.status_code == 200
+    assert len(harness.config_store.deadlines) == 3
+    deadline = harness.config_store.deadlines[0]
+    assert deadline is not None
+    assert harness.config_store.deadlines == [deadline, deadline, deadline]
 
 
 def test_the_run_id_is_minted_server_side_and_reported_as_such() -> None:
@@ -531,8 +624,16 @@ def test_the_bodys_agent_type_reaches_nothing() -> None:
     scope = _scope()
     _, store_a = _one_memory()
     _, store_b = _one_memory()
-    first = _post(_harness(scope=scope, store=store_a), agent_type="claim-one", run_ctx={"query_text": QUERY, "session_id": "s-1"})
-    second = _post(_harness(scope=scope, store=store_b), agent_type="claim-two", run_ctx={"query_text": QUERY, "session_id": "s-1"})
+    first = _post(
+        _harness(scope=scope, store=store_a),
+        agent_type="claim-one",
+        run_ctx={"query_text": QUERY, "session_id": "s-1"},
+    )
+    second = _post(
+        _harness(scope=scope, store=store_b),
+        agent_type="claim-two",
+        run_ctx={"query_text": QUERY, "session_id": "s-1"},
+    )
     assert first.json()["arm"] == second.json()["arm"]
 
 
@@ -579,15 +680,33 @@ def test_a_stage_that_blows_the_total_budget_degrades_even_though_its_own_sub_bu
     clock = FakeClock(NOW)
     mid = MemoryId(uuid4())
     store = FakeSearchStore(hits=[_hit(mid)], rows=[_row(mid)], clock=clock, arm_stall_ms=180.0)
-    harness = _harness(
-        store=store, embedder=FakeEmbedder(clock=clock, stall_ms=190.0), clock=clock
-    )
+    harness = _harness(store=store, embedder=FakeEmbedder(clock=clock, stall_ms=190.0), clock=clock)
 
-    body = _post(harness).json()
+    response = _post(harness)
 
-    assert body["outcome_code"] == OutcomeCode.TIMEOUT_PREFIX_ONLY.value
-    assert body["context_block"]["rendered"] == ""
+    assert response.status_code == 503
     assert harness.telemetry.retrievals[0]["outcome_code"] is OutcomeCode.TIMEOUT_PREFIX_ONLY
+
+
+def test_shared_pipeline_deadline_stops_late_assembly_calls() -> None:
+    """A 250ms retrieval plus 290ms fetch used to permit all three assembly calls (~1120ms)."""
+    clock = FakeClock(NOW)
+    mid = MemoryId(uuid4())
+    store = FakeSearchStore(
+        hits=[_hit(mid)],
+        rows=[_row(mid)],
+        clock=clock,
+        arm_stall_ms=250.0,
+        store_stall_ms=290.0,
+    )
+    harness = _harness(store=store, embedder=FakeEmbedder(), clock=clock)
+
+    response = _post(harness)
+
+    assert response.status_code == 503
+    assert store.fetch_calls == 1
+    assert store.corpus_calls == 0
+    assert store.df_calls == 0
 
 
 def test_the_embed_sub_budget_is_narrowed_by_what_the_total_budget_has_left() -> None:
@@ -606,10 +725,10 @@ def test_the_embed_sub_budget_is_narrowed_by_what_the_total_budget_has_left() ->
         _harness(
             store=store,
             embedder=RecordingEmbedder(),
-            config_overrides={"retrieval.total_budget_ms": 50},
+            config_overrides={"retrieval.total_budget_ms": 300, "retrieval.embed_timeout_ms": 50},
         )
     )
-    assert seen and seen[0] <= 50
+    assert seen == [50]
 
 
 # --------------------------------------------------------------------------- #
@@ -680,7 +799,9 @@ def test_an_injection_payload_in_stored_content_survives_escaped_never_as_a_toke
     store = FakeSearchStore(hits=[_hit(mid)], rows=[_row(mid, content=payload)])
 
     body = _post(_harness(store=store)).json()
-    assert body["outcome_code"] == OutcomeCode.INJECTED.value, "the payload must actually be rendered"
+    assert body["outcome_code"] == OutcomeCode.INJECTED.value, (
+        "the payload must actually be rendered"
+    )
     rendered = body["context_block"]["rendered"]
 
     # The forged header DOES appear in the byte stream -- inside the escaped JSON value, on the
@@ -727,7 +848,10 @@ def test_a_retrieval_event_is_written_even_when_the_store_is_dead() -> None:
 
 def test_a_config_store_outage_degrades_rather_than_500s() -> None:
     class ExplodingConfigStore(FakeConfigStore):
-        def get_project_config(self, project_id: ProjectId) -> Mapping[str, object]:
+        def get_project_config(
+            self, project_id: ProjectId, *, deadline: object | None = None
+        ) -> Mapping[str, object]:
+            del project_id, deadline
             raise RuntimeError("config store unreachable")
 
     scope = _scope()
@@ -735,6 +859,7 @@ def test_a_config_store_outage_degrades_rather_than_500s() -> None:
     telemetry = RecordingTelemetry()
     clock = FakeClock(NOW)
     inert = _Inert()
+    inert.telemetry, inert.project_id = telemetry, scope.project_id
     pipeline = Pipeline(
         clock=clock,
         config=ConfigResolver(settings, ExplodingConfigStore()),
@@ -752,9 +877,8 @@ def test_a_config_store_outage_degrades_rather_than_500s() -> None:
         memory_reader=inert,  # type: ignore[arg-type]
         exporter=inert,  # type: ignore[arg-type]
         invalidations=inert,  # type: ignore[arg-type]
-        admin=inert,  # type: ignore[arg-type]
-        partitions=inert,  # type: ignore[arg-type]
-        keys=inert,  # type: ignore[arg-type]
+        retrieval_opener=inert,  # type: ignore[arg-type]
+        access_resolver=FakeResolver(scope=scope),
         clock=clock,
         pipeline=pipeline,
     )

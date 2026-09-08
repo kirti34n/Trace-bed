@@ -23,13 +23,17 @@ import pytest
 from pydantic import ValidationError
 
 from tracebed.domain import errors as errors_module
+from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import (
+    MAX_QUEUE_ATTEMPTS,
     OVERRIDABLE_SECTIONS,
+    AuthConfig,
     ConfigResolver,
     ConfigStorePort,
     EffectiveConfig,
     EmbeddingConfig,
     StorageConfig,
+    TierAConfig,
     TracebedSettings,
 )
 from tracebed.domain.errors import (
@@ -37,10 +41,12 @@ from tracebed.domain.errors import (
     GuardNotSatisfied,
     IllegalTransition,
     NotFound,
+    RequestDeadlineExceeded,
     ScanRejected,
     TracebedError,
 )
 from tracebed.domain.ids import AgentTypeId, ProjectId
+from tracebed.hotpath.budget import Deadline
 
 if TYPE_CHECKING:
     # errors.py annotates the two state-machine exceptions with `Status` under
@@ -59,6 +65,52 @@ REQUIRED_ENV = {
     "TB_STORAGE__PG_DSN": "postgresql://user:pass@localhost:5432/tracebed",
     "TB_EMBEDDING__MODEL_VERSION": "2026-01-01",
 }
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"oidc_issuer": "https://idp.example.test"},
+        {
+            "oidc_issuer": "https://idp.example.test",
+            "oidc_jwks_url": "https://idp.example.test/jwks",
+        },
+        {
+            "oidc_issuer": "http://idp.example.test",
+            "oidc_jwks_url": "https://idp.example.test/jwks",
+            "oidc_audience": "tracebed-api",
+        },
+    ],
+)
+def test_auth_oidc_is_an_all_or_nothing_controlled_https_boundary(kwargs: dict[str, str]) -> None:
+    with pytest.raises(ValidationError):
+        AuthConfig(**kwargs)
+
+
+def test_auth_oidc_accepts_a_complete_controlled_configuration() -> None:
+    auth = AuthConfig(
+        oidc_issuer="https://idp.example.test/realm",
+        oidc_jwks_url="https://idp.example.test/jwks",
+        oidc_audience="tracebed-api",
+    )
+    assert auth.oidc_audience == "tracebed-api"
+
+
+def test_auth_oidc_empty_environment_group_normalizes_to_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = AuthConfig(oidc_issuer="", oidc_jwks_url="", oidc_audience="")
+    assert auth.oidc_issuer is None
+    assert auth.oidc_jwks_url is None
+    assert auth.oidc_audience is None
+    monkeypatch.setenv("TB_AUTH__OIDC_ISSUER", "")
+    monkeypatch.setenv("TB_AUTH__OIDC_JWKS_URL", "")
+    monkeypatch.setenv("TB_AUTH__OIDC_AUDIENCE", "")
+    for key, value in REQUIRED_ENV.items():
+        monkeypatch.setenv(key, value)
+    settings = TracebedSettings()
+    assert settings.auth.oidc_issuer is None
+
 
 # `workers` joined this list with the scheduler wiring (D-128): one `Scheduler` serves every
 # project in the process, so a per-project sweep cadence is a knob that silently does nothing.
@@ -120,6 +172,8 @@ class TestTracebedSettingsDefaults:
         # Spot-check defaults across sections per PHASE-0.md Task 2 / contract §3.4.
         assert settings.api.port == 8110
         assert settings.api.workers == 2
+        assert settings.api.retrieval_request_ceiling_ms == 1000
+        assert settings.api.retrieval_admission_capacity == 4
         assert settings.dashboard.port == 8111
         assert settings.auth.api_key_mode is True
         assert settings.auth.admin_key_env == "TB_ADMIN_KEY"
@@ -160,13 +214,20 @@ class TestTracebedSettingsDefaults:
         assert settings.queue.max_attempts == 5
         assert settings.queue.batch_size == 100
 
+    def test_tier_a_candidate_cap_is_bounded_by_finalizer_capacity(self) -> None:
+        assert TierAConfig(candidate_cap_per_run=0).candidate_cap_per_run == 0
+        assert TierAConfig(candidate_cap_per_run=100).candidate_cap_per_run == 100
+        with pytest.raises(ValidationError):
+            TierAConfig(candidate_cap_per_run=101)
+
     @pytest.mark.phase0
-    def test_missing_required_storage_env_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_legacy_storage_dsn_defaults_to_none_for_runtime_settings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.delenv("TB_STORAGE__PG_DSN", raising=False)
         monkeypatch.setenv("TB_EMBEDDING__MODEL_VERSION", "2026-01-01")
 
-        with pytest.raises(ValidationError):
-            TracebedSettings()
+        assert TracebedSettings().storage.pg_dsn is None
 
     @pytest.mark.phase0
     def test_missing_required_embedding_env_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -192,9 +253,29 @@ class TestTracebedSettingsDefaults:
         assert settings.api.workers == 2
 
     @pytest.mark.phase0
+    def test_queue_attempts_above_durable_job_limit_are_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv("TB_QUEUE__MAX_ATTEMPTS", str(MAX_QUEUE_ATTEMPTS + 1))
+
+        with pytest.raises(ValidationError):
+            TracebedSettings()
+
+    @pytest.mark.phase0
     def test_unknown_nested_key_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _set_required_env(monkeypatch)
         monkeypatch.setenv("TB_STORAGE__NOT_A_REAL_FIELD", "x")
+
+        with pytest.raises(ValidationError):
+            TracebedSettings()
+
+    @pytest.mark.phase0
+    def test_normal_runtime_settings_reject_an_owner_postgres_dsn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_required_env(monkeypatch)
+        monkeypatch.setenv("TB_STORAGE__ADMIN_PG_DSN", "postgresql://tracebed_owner@owner/db")
 
         with pytest.raises(ValidationError):
             TracebedSettings()
@@ -288,17 +369,26 @@ class _FakeConfigStore:
     ) -> None:
         self._overlay[(project_id, agent_type_id)] = overlay
 
-    def get_project_config(self, project_id: ProjectId) -> dict[str, object]:
+    def get_project_config(
+        self, project_id: ProjectId, *, deadline: object | None = None
+    ) -> dict[str, object]:
+        del deadline
         return dict(self._project.get(project_id, {}))
 
     def get_agent_type_config(
-        self, project_id: ProjectId, agent_type_id: AgentTypeId
+        self, project_id: ProjectId, agent_type_id: AgentTypeId, *, deadline: object | None = None
     ) -> dict[str, object]:
+        del deadline
         return dict(self._agent_type.get((project_id, agent_type_id), {}))
 
     def get_killswitch_overlay(
-        self, project_id: ProjectId, agent_type_id: AgentTypeId | None
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId | None,
+        *,
+        deadline: object | None = None,
     ) -> dict[str, bool]:
+        del deadline
         return dict(self._overlay.get((project_id, agent_type_id), {}))
 
 
@@ -314,18 +404,62 @@ class _AliasingConfigStore:
     def __init__(self, overlay: dict[str, bool]) -> None:
         self.overlay = overlay
 
-    def get_project_config(self, project_id: ProjectId) -> dict[str, object]:
+    def get_project_config(
+        self, project_id: ProjectId, *, deadline: object | None = None
+    ) -> dict[str, object]:
+        del project_id, deadline
         return {}
 
     def get_agent_type_config(
-        self, project_id: ProjectId, agent_type_id: AgentTypeId
+        self, project_id: ProjectId, agent_type_id: AgentTypeId, *, deadline: object | None = None
     ) -> dict[str, object]:
+        del project_id, agent_type_id, deadline
         return {}
 
     def get_killswitch_overlay(
-        self, project_id: ProjectId, agent_type_id: AgentTypeId | None
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId | None,
+        *,
+        deadline: object | None = None,
     ) -> dict[str, bool]:
+        del project_id, agent_type_id, deadline
         return self.overlay
+
+
+class _AdvancingConfigStore(_FakeConfigStore):
+    def __init__(self, clock: FakeClock, *, advance_ms: float) -> None:
+        super().__init__()
+        self._clock = clock
+        self._advance_ms = advance_ms
+        self.calls: list[tuple[str, object | None, float | None]] = []
+
+    def _record(self, name: str, deadline: object | None) -> None:
+        remaining = deadline.remaining_ms() if isinstance(deadline, Deadline) else None
+        self.calls.append((name, deadline, remaining))
+        self._clock.advance(ms=self._advance_ms)
+
+    def get_project_config(
+        self, project_id: ProjectId, *, deadline: object | None = None
+    ) -> dict[str, object]:
+        self._record("project", deadline)
+        return super().get_project_config(project_id, deadline=deadline)
+
+    def get_agent_type_config(
+        self, project_id: ProjectId, agent_type_id: AgentTypeId, *, deadline: object | None = None
+    ) -> dict[str, object]:
+        self._record("agent", deadline)
+        return super().get_agent_type_config(project_id, agent_type_id, deadline=deadline)
+
+    def get_killswitch_overlay(
+        self,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId | None,
+        *,
+        deadline: object | None = None,
+    ) -> dict[str, bool]:
+        self._record("overlay", deadline)
+        return super().get_killswitch_overlay(project_id, agent_type_id, deadline=deadline)
 
 
 @pytest.fixture
@@ -404,6 +538,39 @@ class TestConfigResolver:
         assert effective.killswitch_overlay == {}
 
     @pytest.mark.phase0
+    def test_deadline_is_shared_across_all_three_config_reads(
+        self,
+        settings: TracebedSettings,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId,
+    ) -> None:
+        clock = FakeClock()
+        deadline = Deadline(clock=clock, total_budget_ms=100, embed_timeout_ms=50)
+        store = _AdvancingConfigStore(clock, advance_ms=10)
+
+        ConfigResolver(settings, store).effective(project_id, agent_type_id, deadline=deadline)
+
+        assert [name for name, _, _ in store.calls] == ["project", "agent", "overlay"]
+        assert [seen_deadline for _, seen_deadline, _ in store.calls] == [deadline] * 3
+        assert [remaining for _, _, remaining in store.calls] == [100.0, 90.0, 80.0]
+
+    @pytest.mark.phase0
+    def test_expiry_after_a_config_read_stops_later_reads(
+        self,
+        settings: TracebedSettings,
+        project_id: ProjectId,
+        agent_type_id: AgentTypeId,
+    ) -> None:
+        clock = FakeClock()
+        deadline = Deadline(clock=clock, total_budget_ms=10, embed_timeout_ms=10)
+        store = _AdvancingConfigStore(clock, advance_ms=10)
+
+        with pytest.raises(RequestDeadlineExceeded):
+            ConfigResolver(settings, store).effective(project_id, agent_type_id, deadline=deadline)
+
+        assert [name for name, _, _ in store.calls] == ["project"]
+
+    @pytest.mark.phase0
     def test_project_config_overrides_defaults(
         self, settings: TracebedSettings, project_id: ProjectId
     ) -> None:
@@ -448,9 +615,7 @@ class TestConfigResolver:
     ) -> None:
         store = _FakeConfigStore()
         store.set_project_config(project_id, {"retrieval.total_budget_ms": 250})
-        store.set_agent_type_config(
-            project_id, agent_type_id, {"retrieval.total_budget_ms": 111}
-        )
+        store.set_agent_type_config(project_id, agent_type_id, {"retrieval.total_budget_ms": 111})
         resolver = ConfigResolver(settings, store)
 
         by_agent_type = resolver.effective(project_id, agent_type_id)
@@ -480,9 +645,7 @@ class TestConfigResolver:
             project_id,
             {"retrieval.total_budget_ms": 250, "retrieval.rrf_k": 33, "budget.total_tokens": 900},
         )
-        store.set_agent_type_config(
-            project_id, agent_type_id, {"retrieval.total_budget_ms": 111}
-        )
+        store.set_agent_type_config(project_id, agent_type_id, {"retrieval.total_budget_ms": 111})
 
         effective = ConfigResolver(settings, store).effective(project_id, agent_type_id)
 
@@ -499,9 +662,7 @@ class TestConfigResolver:
         other_agent_type_id: AgentTypeId,
     ) -> None:
         store = _FakeConfigStore()
-        store.set_agent_type_config(
-            project_id, agent_type_id, {"retrieval.total_budget_ms": 111}
-        )
+        store.set_agent_type_config(project_id, agent_type_id, {"retrieval.total_budget_ms": 111})
         resolver = ConfigResolver(settings, store)
 
         # Resolve the overridden agent type FIRST: if the resolver leaked its
@@ -680,9 +841,7 @@ class TestConfigResolver:
     @pytest.mark.phase0
     def test_deployment_sections_are_absent_from_the_overridable_set(self) -> None:
         assert OVERRIDABLE_SECTIONS.isdisjoint(DEPLOYMENT_SECTIONS)
-        assert set(TracebedSettings.model_fields) == OVERRIDABLE_SECTIONS | set(
-            DEPLOYMENT_SECTIONS
-        )
+        assert set(TracebedSettings.model_fields) == OVERRIDABLE_SECTIONS | set(DEPLOYMENT_SECTIONS)
 
     @pytest.mark.phase0
     def test_dotted_key_without_a_field_component_raises(
@@ -738,9 +897,7 @@ class TestConfigResolver:
     ) -> None:
         """Both layers go through the same validation — no second, laxer path."""
         store = _FakeConfigStore()
-        store.set_agent_type_config(
-            project_id, agent_type_id, {"retrieval.not_a_real_field": 1}
-        )
+        store.set_agent_type_config(project_id, agent_type_id, {"retrieval.not_a_real_field": 1})
         resolver = ConfigResolver(settings, store)
 
         with pytest.raises(ConfigError):
@@ -903,8 +1060,13 @@ CONTRACT_ERROR_NAMES = frozenset(
         "TracebedError",
         "ConfigError",
         "AuthenticationFailed",
+        "AuthorizationDenied",
         "ScopeResolutionFailed",
+        "RunAuthorityDenied",
+        "ProjectInactive",
+        "ActivityBusy",
         "DuplicateRegistration",
+        "ProjectProvisioningConflict",
         "NotFound",
         "ProvenanceIncomplete",
         "ScanRejected",
@@ -915,14 +1077,26 @@ CONTRACT_ERROR_NAMES = frozenset(
         "Tombstoned",
         "MasterKeyMissing",
         "EmbeddingTimeout",
+        "ErasureClosureChanged",
+        "ErasureDependencyTimeout",
+        "ErasureFenced",
+        "ErasureLeaseLost",
+        "ErasureOperatorBlocked",
+        "ErasureRequestNotFound",
+        "ErasureSnapshotStale",
+        "ErasureTargetConflict",
         "BudgetExceeded",
         "CapExceeded",
         "CrossEpochComparison",
+        "RequestDeadlineExceeded",
+        "RetrievalAuditUnavailable",
     }
 )
-"""Transcribed from PHASE0-CONTRACT.md §3.1. Deliberately a literal, not
-derived from the module: a test that reads its expectation out of the code
-under test proves nothing about the contract."""
+"""Approved error vocabulary, deliberately literal rather than derived from
+the module. `ProjectProvisioningConflict` was added for M4's opaque idempotent
+project-provisioning 409. The authority errors are Phase 3A's opaque role,
+run-binding, project-state and retry vocabulary; the remaining names originate
+in the Phase 0 contract."""
 
 
 def _defined_exception_classes() -> dict[str, type[BaseException]]:

@@ -33,31 +33,8 @@ from uuid import uuid4
 import pytest
 
 from tracebed.core.scans.tier_a_template import ErrorClassEnum, render_note
-from tracebed.domain.clock import FakeClock
-from tracebed.domain.config import (
-    AbstentionConfig,
-    BudgetConfig,
-    CacheConfig,
-    DerivedConfig,
-    EffectiveConfig,
-    KillswitchConfig,
-    LifecycleConfig,
-    PromotionConfig,
-    ProposalConfig,
-    QueueConfig,
-    RetirementConfig,
-    RetrievalConfig,
-    ScoreConfig,
-    ScoringConfig,
-    SessionConfig,
-    SpendConfig,
-    TierAConfig,
-)
 from tracebed.domain.events import ErrorEvent, RunStart, TraceEvent
-from tracebed.domain.ids import AgentTypeId, MemoryId, PrincipalId, ProjectId, RunId, mint_memory_id
-from tracebed.domain.memory import NewMemoryItem
-from tracebed.domain.scan import ScanVerdict
-from tracebed.domain.scope import ProjectScope
+from tracebed.domain.ids import RunId
 from tracebed.workers.extractors import IDENTIFIER_RE, ToolFailureExtractor
 
 pytestmark = pytest.mark.phase2
@@ -107,47 +84,6 @@ def _assert_no_shared_8byte_window(source_text: str, notes: Sequence[str]) -> No
         )
 
 
-class _FakeWriter:
-    def __init__(self) -> None:
-        self.inserted: list[NewMemoryItem] = []
-
-    def insert_memory_item(
-        self, project_id: ProjectId, item: NewMemoryItem, scan_verdict: ScanVerdict
-    ) -> MemoryId:
-        self.inserted.append(item)
-        return mint_memory_id()
-
-
-def _scope() -> ProjectScope:
-    return ProjectScope(
-        project_id=ProjectId(uuid4()),
-        agent_type_id=AgentTypeId(uuid4()),
-        principal_id=PrincipalId(uuid4()),
-    )
-
-
-def _cfg() -> EffectiveConfig:
-    return EffectiveConfig(
-        retrieval=RetrievalConfig(),
-        abstention=AbstentionConfig(),
-        score=ScoreConfig(),
-        budget=BudgetConfig(),
-        scoring=ScoringConfig(),
-        promotion=PromotionConfig(),
-        retirement=RetirementConfig(),
-        lifecycle=LifecycleConfig(),
-        derived=DerivedConfig(),
-        proposals=ProposalConfig(),
-        tier_a=TierAConfig(candidate_cap_per_run=2),
-        killswitch=KillswitchConfig(),
-        spend=SpendConfig(),
-        cache=CacheConfig(),
-        session=SessionConfig(),
-        queue=QueueConfig(),
-        killswitch_overlay={},
-    )
-
-
 def _start(ts: datetime, manifest: Sequence[str]) -> RunStart:
     return RunStart(
         type="run_start", ts=ts, payload={"query_text": "q", "tool_manifest": list(manifest)}
@@ -182,10 +118,12 @@ def _extract(
     tool_id: str = _TOOL_ID,
     tool_version: str = "v1",
     manifest: Sequence[str] | None = None,
-) -> tuple[str, list[NewMemoryItem]]:
+) -> tuple[str, list[str]]:
     """Runs `ToolFailureExtractor` over two runs carrying the same fixture body
-    (so the min-repeat-count gate is cleared) and returns the rendered note
-    text plus everything that was actually written."""
+    (so the min-repeat-count gate is cleared) and returns rendered proposals.
+
+    Extractors are intentionally pure: finalization is the only writer.
+    """
     declared = [tool_id] if manifest is None else list(manifest)
     run_a, run_b = RunId(uuid4()), RunId(uuid4())
     traces: dict[RunId, list[TraceEvent]] = {
@@ -206,12 +144,9 @@ def _extract(
             ),
         ],
     }
-    writer = _FakeWriter()
-    outcomes = ToolFailureExtractor().extract(
-        _scope(), traces, cfg=_cfg(), clock=FakeClock(_BASE_TS), writer=writer
-    )
-    rendered = "\n".join(render_note(o.note) for o in outcomes)
-    return rendered, writer.inserted
+    proposals = ToolFailureExtractor().propose(traces)
+    rendered_notes = [render_note(proposal.note) for proposal in proposals]
+    return "\n".join(rendered_notes), rendered_notes
 
 
 # --------------------------------------------------------------------------- #
@@ -318,7 +253,7 @@ def test_an_error_body_echoed_into_tool_version_never_reaches_a_note(body: str) 
     )
     assert len(inserted) == 1
     _assert_no_shared_8byte_window(body, [rendered])
-    _assert_no_shared_8byte_window(body, [inserted[0].content])
+    _assert_no_shared_8byte_window(body, inserted)
 
 
 def test_note_content_is_the_scanned_content() -> None:
@@ -327,7 +262,7 @@ def test_note_content_is_the_scanned_content() -> None:
     the one that reached the store."""
     rendered, inserted = _extract(ErrorClassEnum.TIMEOUT.value, "boring failure text")
     assert len(inserted) == 1
-    assert rendered == inserted[0].content
+    assert rendered == inserted[0]
 
 
 def test_a_declared_tool_id_is_the_only_thing_that_can_carry_wire_bytes() -> None:

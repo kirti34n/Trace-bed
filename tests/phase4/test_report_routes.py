@@ -34,9 +34,10 @@ from tracebed.adapters.identity import Principal
 from tracebed.api.deps import AppDeps
 from tracebed.api.main import create_app
 from tracebed.api.reports import _bh_adjusted_p_values
+from tracebed.domain.authority import AccessContext, GrantBinding
 from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import AuthConfig, EmbeddingConfig, StorageConfig, TracebedSettings
-from tracebed.domain.enums import Arm, MemType, OutcomeCode, ProvenanceClass
+from tracebed.domain.enums import Arm, MemType, OutcomeCode, ProjectRole, ProvenanceClass
 from tracebed.domain.errors import AuthenticationFailed, NotFound
 from tracebed.domain.ids import AgentTypeId, MemoryId, PrincipalId, ProjectId, RunId
 from tracebed.domain.memory import Provenance
@@ -90,22 +91,24 @@ class _Resolver:
         return ProjectScope(project_id=PROJECT, agent_type_id=AGENT_TYPE, principal_id=principal_id)
 
 
+class _AccessResolver:
+    def resolve_access(self, principal_id: PrincipalId) -> AccessContext:
+        return AccessContext(
+            project_id=PROJECT,
+            agent_type_id=AGENT_TYPE,
+            principal_id=principal_id,
+            grants=(GrantBinding(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"), ProjectRole.ADMIN),),
+        )
+
+
 class _NeverCalledQueue:
-    def enqueue(self, *args: object, **kwargs: object) -> int:
+    def enqueue_many_authorized(self, *args: object, **kwargs: object) -> tuple[int, ...]:
         raise AssertionError("no report route enqueues")
 
 
 class _NeverCalledTelemetry:
     def record_retrieval(self, *args: object, **kwargs: object) -> None:
         raise AssertionError("no report route records telemetry")
-
-
-class _NeverCalledAdmin:
-    def create_project(self, *args: object, **kwargs: object) -> ProjectId:
-        raise AssertionError("no report route writes the registry")
-
-    def create_agent_registration(self, *args: object, **kwargs: object) -> tuple[PrincipalId, AgentTypeId]:
-        raise AssertionError("no report route writes the registry")
 
 
 class _Stubs:
@@ -117,14 +120,11 @@ class _Stubs:
     def iter_export_rows(self, project_id: ProjectId) -> Iterator[dict[str, object]]:
         return iter(())
 
-    def insert_invalidation_event(self, *args: object, **kwargs: object) -> UUID:
+    def insert(self, *args: object, **kwargs: object) -> UUID:
         raise AssertionError("no read route writes")
 
-    def create_project_partitions(self, project_id: ProjectId) -> None:
-        raise AssertionError("no read route provisions partitions")
-
-    def ensure_project_kek(self, project_id: ProjectId) -> None:
-        raise AssertionError("no read route provisions keys")
+    def open(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("no report route opens a run")
 
 
 # --------------------------------------------------------------------------- #
@@ -217,9 +217,8 @@ def _build(reports_store: FakeReportsStore | None) -> tuple[TestClient, FakeRepo
         memory_reader=stubs,
         exporter=stubs,
         invalidations=stubs,
-        admin=_NeverCalledAdmin(),
-        partitions=stubs,
-        keys=stubs,
+        retrieval_opener=stubs,
+        access_resolver=_AccessResolver(),
         clock=FakeClock(EPOCH),
     )
     settings = TracebedSettings(
@@ -485,6 +484,10 @@ class TestLiftReport:
             == 422
         )
         assert client.get("/admin/lift/report", params={"days": 0}, headers=AUTH).status_code == 422
+        assert (
+            client.get("/admin/lift/report", params={"q_offset": 10_001}, headers=AUTH).status_code
+            == 422
+        )
 
 
 class TestBhAdjustedPValues:
@@ -694,6 +697,12 @@ class TestStalenessReport:
         assert (
             client.get(
                 "/admin/staleness/report", params={"approaching_offset": -1}, headers=AUTH
+            ).status_code
+            == 422
+        )
+        assert (
+            client.get(
+                "/admin/staleness/report", params={"event_offset": 10_001}, headers=AUTH
             ).status_code
             == 422
         )

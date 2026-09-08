@@ -1,0 +1,616 @@
+name: release-evidence
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing exact vX.Y.Z tag to build and verify
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+  UV_VERSION: "0.11.21"
+  UV_CHECKSUM_LINUX_X64: "8c88519b0ef0af9801fcdee419bbb12116bd9e6b18e162ae093c932d8b264050"
+  NODE_VERSION: "20.19.0"
+  SYFT_VERSION: "v1.38.0"
+  SYFT_CHECKSUM_LINUX_X64: "bc664debb00db1b9b4b9dae4ba1a29d99621e33b641b94b78b9048374b812a3d"
+  GRYPE_VERSION: "v0.104.0"
+  GRYPE_CHECKSUM_LINUX_X64: "862816d0addab60968f9401fe5dbaeaf244bf86a3f759003103c11efe151b31d"
+  COSIGN_VERSION: "v2.5.0"
+  GH_VERSION: "2.83.1"
+  GH_CHECKSUM_LINUX_X64: "1c5252d4ce3db07b51c01ff0b909583da6364ff3fdc06d0c2e75e62dc0380a34"
+  HATCHLING_VERSION: "1.29.0"
+  PIP_VERSION: "26.2"
+  BUILD_PYTHON_VERSION: "3.13.14"
+  NPM_VERSION: "10.8.2"
+  DOCKER_IDENTITY: "Docker version 29.6.2, build dfc4efb"
+
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      ref: ${{ steps.source.outputs.ref }}
+      commit: ${{ steps.source.outputs.commit }}
+      repository: ${{ steps.source.outputs.repository }}
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
+        with:
+          version: "0.11.21"
+          checksum: "8c88519b0ef0af9801fcdee419bbb12116bd9e6b18e162ae093c932d8b264050"
+      - id: source
+        name: Prove the requested immutable tag is the checked-out source
+        run: |
+          test "$GITHUB_REF" = "refs/tags/${RELEASE_TAG}"
+          git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"
+          tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          test "$tag_commit" = "$head_commit"
+          test "$head_commit" = "$GITHUB_SHA"
+          uv sync --locked --extra dev
+          .venv/bin/python scripts/release_check.py --check
+          version="$(.venv/bin/python scripts/release_manifest.py check --tag "$RELEASE_TAG")"
+          printf 'tag=%s\nref=refs/tags/%s\ncommit=%s\nrepository=%s\nversion=%s\n' "$RELEASE_TAG" "$RELEASE_TAG" "$head_commit" "$GITHUB_REPOSITORY" "$version" >> "$GITHUB_OUTPUT"
+
+  build-test-scan:
+    needs: policy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.policy.outputs.tag }}
+      RELEASE_REF: ${{ needs.policy.outputs.ref }}
+      RELEASE_COMMIT: ${{ needs.policy.outputs.commit }}
+      RELEASE_REPOSITORY: ${{ needs.policy.outputs.repository }}
+      RELEASE_VERSION: ${{ needs.policy.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.policy.outputs.ref }}
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
+        with:
+          version: "0.11.21"
+          checksum: "8c88519b0ef0af9801fcdee419bbb12116bd9e6b18e162ae093c932d8b264050"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20.19.0"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - name: Re-prove exact checked-out tag and install only locked graphs
+        run: |
+          test "$(git rev-parse "${RELEASE_REF}^{commit}")" = "$RELEASE_COMMIT"
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          uv sync --locked --extra dev
+          npm ci --prefix dashboard
+      - name: Run complete candidate gates
+        run: |
+          .venv/bin/python scripts/license_check.py --self-test
+          .venv/bin/python scripts/license_check.py
+          .venv/bin/python scripts/license_check.py --dependency-audit
+          .venv/bin/python scripts/raw_sql_lint.py --self-test
+          .venv/bin/python scripts/raw_sql_lint.py
+          .venv/bin/python scripts/image_check.py --self-test
+          .venv/bin/python scripts/image_check.py
+          .venv/bin/python scripts/purity_check.py --self-test
+          .venv/bin/python scripts/purity_check.py
+          .venv/bin/python scripts/capability_check.py --check
+          .venv/bin/python scripts/release_check.py --check
+          .venv/bin/ruff check src tests harness scripts
+          .venv/bin/mypy
+          .venv/bin/pytest -m "not integration" -q
+          .venv/bin/python harness/guessed_reward.py
+          .venv/bin/python harness/failopen_drill.py
+          .venv/bin/python harness/consolidation_regression.py
+          .venv/bin/python harness/workflow_scope.py
+          node dashboard/scripts/license_check.mjs --self-test
+          node dashboard/scripts/license_check.mjs
+          npm test --prefix dashboard
+          npm run lint --prefix dashboard
+          npm run build --prefix dashboard
+          env -u TB_HOLDOUT_SALT .venv/bin/python scripts/compose_acceptance.py
+      - name: Lint workflow YAML with actionlint
+        run: |
+          curl --fail --location --output /tmp/actionlint.tar.gz https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+          echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  /tmp/actionlint.tar.gz" | sha256sum --check --strict
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          /tmp/actionlint -version | tee /tmp/actionlint-version.txt
+          /tmp/actionlint
+      - name: Install exact Syft and Grype binaries
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-tools"
+          curl --fail --location --output "$RUNNER_TEMP/syft.tar.gz" "https://github.com/anchore/syft/releases/download/${SYFT_VERSION}/syft_${SYFT_VERSION#v}_linux_amd64.tar.gz"
+          echo "${SYFT_CHECKSUM_LINUX_X64}  $RUNNER_TEMP/syft.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/syft.tar.gz" -C "$RUNNER_TEMP/release-tools" syft
+          curl --fail --location --output "$RUNNER_TEMP/grype.tar.gz" "https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}/grype_${GRYPE_VERSION#v}_linux_amd64.tar.gz"
+          echo "${GRYPE_CHECKSUM_LINUX_X64}  $RUNNER_TEMP/grype.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/grype.tar.gz" -C "$RUNNER_TEMP/release-tools" grype
+          "$RUNNER_TEMP/release-tools/syft" version | tee "$RUNNER_TEMP/syft-version.txt"
+          "$RUNNER_TEMP/release-tools/grype" version | tee "$RUNNER_TEMP/grype-version.txt"
+          grep -F "Version: ${SYFT_VERSION#v}" "$RUNNER_TEMP/syft-version.txt"
+          grep -F "Version: ${GRYPE_VERSION#v}" "$RUNNER_TEMP/grype-version.txt"
+      - name: Build immutable candidate and wheelhouse
+        run: |
+          mkdir -p release-candidate/python release-candidate/wheelhouse release-candidate/notices release-candidate/sbom release-candidate/vulnerabilities release-candidate/tool-metadata
+          uv build --no-build-isolation --out-dir release-candidate/python
+          uv export --locked --no-dev --no-emit-project --format requirements-txt --output-file release-candidate/requirements-runtime.txt
+          uv export --locked --extra dev --no-emit-project --format requirements-txt --output-file release-candidate/requirements-build.txt
+          .venv/bin/python -m pip download --require-hashes --dest release-candidate/wheelhouse -r release-candidate/requirements-runtime.txt -r release-candidate/requirements-build.txt
+          .venv/bin/python scripts/artifact_smoke.py release-candidate/python/*.whl release-candidate/python/*.tar.gz --wheelhouse release-candidate/wheelhouse
+          .venv/bin/python -m venv release-runtime/python
+          release-runtime/python/bin/python -m pip install --no-index --require-hashes --find-links release-candidate/wheelhouse -r release-candidate/requirements-runtime.txt
+          release-runtime/python/bin/python -m pip install --no-index --find-links release-candidate/wheelhouse release-candidate/python/*.whl
+          .venv/bin/python -m venv release-runtime/sdist
+          release-runtime/sdist/bin/python -m pip install --no-index --require-hashes --find-links release-candidate/wheelhouse -r release-candidate/requirements-runtime.txt
+          release-runtime/sdist/bin/python -m pip install --no-index --find-links release-candidate/wheelhouse release-candidate/python/*.tar.gz
+          mkdir -p release-runtime/dashboard
+          cp dashboard/package.json dashboard/package-lock.json release-runtime/dashboard/
+          npm ci --omit=dev --prefix release-runtime/dashboard
+          tar -C dashboard/dist -czf "release-candidate/tracebed-dashboard-${RELEASE_VERSION}.tar.gz" .
+          docker build --pull=false --tag "tracebed-api:${RELEASE_VERSION}" --file docker/api.Dockerfile .
+          docker image save "tracebed-api:${RELEASE_VERSION}" --output "release-candidate/tracebed-api-${RELEASE_VERSION}.tar"
+          cp LICENSE NOTICE THIRD_PARTY_NOTICES.md dashboard/package-lock.json scripts/release_manifest.py scripts/release_verifier.py release-candidate/
+          site_packages="$(release-runtime/python/bin/python -c 'import site; print(site.getsitepackages()[0])')"
+          .venv/bin/python scripts/release_notices.py --site-packages "$site_packages" --node-modules release-runtime/dashboard/node_modules --output release-candidate/notices/RESOLVED_THIRD_PARTY_NOTICES.txt
+      - name: Generate and scan exact shipped dependency graphs
+        run: |
+          syft="$RUNNER_TEMP/release-tools/syft"
+          grype="$RUNNER_TEMP/release-tools/grype"
+          "$syft" --source-name tracebed-api --source-version "$RELEASE_VERSION" "tracebed-api:${RELEASE_VERSION}" -o spdx-json > release-candidate/sbom/image.spdx.json
+          "$syft" --source-name tracebed-api --source-version "$RELEASE_VERSION" "tracebed-api:${RELEASE_VERSION}" -o cyclonedx-json > release-candidate/sbom/image.cyclonedx.json
+          "$syft" --source-name tracebed-python-runtime --source-version "$RELEASE_VERSION" "dir:release-runtime/python" -o spdx-json > release-candidate/sbom/python.spdx.json
+          "$syft" --source-name tracebed-python-runtime --source-version "$RELEASE_VERSION" "dir:release-runtime/python" -o cyclonedx-json > release-candidate/sbom/python.cyclonedx.json
+          "$syft" --source-name tracebed-dashboard-runtime --source-version "$RELEASE_VERSION" "dir:release-runtime/dashboard" -o spdx-json > release-candidate/sbom/dashboard.spdx.json
+          "$syft" --source-name tracebed-dashboard-runtime --source-version "$RELEASE_VERSION" "dir:release-runtime/dashboard" -o cyclonedx-json > release-candidate/sbom/dashboard.cyclonedx.json
+          "$grype" "tracebed-api:${RELEASE_VERSION}" --fail-on high -o json > release-candidate/vulnerabilities/image.json
+          "$grype" "dir:release-runtime/python" --fail-on high -o json > release-candidate/vulnerabilities/python.json
+          "$grype" "dir:release-runtime/dashboard" --fail-on high --output json=release-candidate/vulnerabilities/dashboard.json
+      - name: Bind SBOM, scan, and exact tool evidence to shipped graphs
+        run: |
+          test "$(.venv/bin/python -c "from importlib.metadata import version; print(version('hatchling'))")" = "$HATCHLING_VERSION"
+          test "$(.venv/bin/python -m pip --version | awk '{print $2}')" = "$PIP_VERSION"
+          "$RUNNER_TEMP/release-tools/grype" db status -o json > release-candidate/tool-metadata/grype-db.json
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+
+          root = Path("release-candidate")
+          def digest(path: Path) -> str:
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          payloads = {
+              "image": root / f"tracebed-api-{os.environ['RELEASE_VERSION']}.tar",
+              "python": next((root / "python").glob("*.whl")),
+              "dashboard": root / f"tracebed-dashboard-{os.environ['RELEASE_VERSION']}.tar.gz",
+          }
+          sdist = next((root / "python").glob("*.tar.gz"))
+          bindings = {"schema_version": 1, "version": os.environ["RELEASE_VERSION"], "payloads": {}}
+          expected_sbom_roots = {
+              "image": ("tracebed-api", "container"),
+              "python": ("tracebed-python-runtime", "file"),
+              "dashboard": ("tracebed-dashboard-runtime", "file"),
+          }
+          for name, payload in payloads.items():
+              spdx = json.loads((root / "sbom" / f"{name}.spdx.json").read_text())
+              cdx = json.loads((root / "sbom" / f"{name}.cyclonedx.json").read_text())
+              report = json.loads((root / "vulnerabilities" / f"{name}.json").read_text())
+              cdx_root = cdx.get("metadata", {}).get("component") if isinstance(cdx.get("metadata"), dict) else None
+              if not spdx.get("packages") or not spdx.get("relationships") or not isinstance(spdx.get("name"), str) or cdx.get("bomFormat") != "CycloneDX" or cdx.get("specVersion") != "1.6" or not cdx.get("components") or not isinstance(cdx_root, dict) or set(cdx_root) < {"name", "version", "type"} or not all(isinstance(cdx_root.get(key), str) and cdx_root[key] for key in ("name", "version", "type")):
+                  raise SystemExit(f"invalid SBOM graph: {name}")
+              expected_name, expected_type = expected_sbom_roots[name]
+              if spdx.get("name") != expected_name or cdx_root.get("name") != expected_name or cdx_root.get("version") != os.environ["RELEASE_VERSION"] or cdx_root.get("type") != expected_type:
+                  raise SystemExit(f"Syft root identity/version/type mismatch: {name}")
+              spdx_names = {(item.get("name"), item.get("versionInfo")) for item in spdx["packages"] if isinstance(item, dict)}
+              cdx_names = {(item.get("name"), item.get("version")) for item in cdx["components"] if isinstance(item, dict)}
+              if name in {"image", "python"} and (("tracebed", os.environ["RELEASE_VERSION"]) not in spdx_names or ("tracebed", os.environ["RELEASE_VERSION"]) not in cdx_names):
+                  raise SystemExit(f"Tracebed root/version absent from {name} SBOM")
+              if name == "python" and payload.name != f"tracebed-{os.environ['RELEASE_VERSION']}-py3-none-any.whl":
+                  raise SystemExit("Python wheel filename/version is not exact")
+              if name == "dashboard" and not {"react", "react-dom", "react-router-dom"}.issubset({entry[0] for entry in spdx_names}):
+                  raise SystemExit("dashboard SBOM omits production package identities")
+              descriptor = report.get("descriptor")
+              source = report.get("source")
+              if name == "image":
+                  source_valid = isinstance(source, dict) and isinstance(source.get("target"), dict) and source["target"].get("userInput") == f"tracebed-api:{os.environ['RELEASE_VERSION']}"
+              else:
+                  expected_directory = "release-runtime/python" if name == "python" else "release-runtime/dashboard"
+                  source_valid = isinstance(source, dict) and source.get("type") == "directory" and source.get("target") == expected_directory
+              if not isinstance(report.get("matches"), list) or not isinstance(descriptor, dict) or descriptor.get("name") != "grype" or descriptor.get("version") != os.environ["GRYPE_VERSION"].removeprefix("v") or not source_valid:
+                  raise SystemExit(f"invalid vulnerability report: {name}")
+              bindings["payloads"][name] = {
+                  "path": payload.relative_to(root).as_posix(), "sha256": digest(payload),
+                  "spdx": f"sbom/{name}.spdx.json", "cyclonedx": f"sbom/{name}.cyclonedx.json",
+                  "vulnerability_report": f"vulnerabilities/{name}.json", "severity_threshold": "high",
+                  "scan_configuration": {"fail_on_severity": "high"},
+                  "spdx_package_count": len(spdx["packages"]), "cyclonedx_component_count": len(cdx["components"]),
+                  "spdx_root": spdx["name"], "cyclonedx_root": cdx_root["name"],
+              }
+          if sdist.name != f"tracebed-{os.environ['RELEASE_VERSION']}.tar.gz":
+              raise SystemExit("Python sdist filename/version is not exact")
+          bindings["payloads"]["python"]["equivalent_sdist"] = {"path": f"python/tracebed-{os.environ['RELEASE_VERSION']}.tar.gz", "sha256": digest(sdist), "offline_smoke": "passed"}
+          (root / "tool-metadata" / "sbom-bindings.json").write_text(json.dumps(bindings, indent=2, sort_keys=True) + "\n")
+          grype_db = json.loads((root / "tool-metadata" / "grype-db.json").read_text())
+          from urllib.parse import parse_qs, urlparse
+          if not isinstance(grype_db, dict) or grype_db.get("valid") is not True or not all(grype_db.get(key) for key in ("schemaVersion", "from", "built", "path")):
+              raise SystemExit("Grype DB status is missing valid/schemaVersion/from/built/path")
+          checksums = parse_qs(urlparse(str(grype_db["from"])).query).get("checksum", [])
+          archive_sha256 = checksums[0].removeprefix("sha256:") if len(checksums) == 1 else ""
+          db_path = Path(str(grype_db["path"]))
+          if len(archive_sha256) != 64 or any(char not in "0123456789abcdef" for char in archive_sha256) or not db_path.is_file():
+              raise SystemExit("Grype DB from checksum or database path is invalid")
+          bundled_db = root / "tool-metadata" / "grype-db.sqlite"
+          bundled_db.write_bytes(db_path.read_bytes())
+          sqlite_sha256 = digest(bundled_db)
+          build_python = subprocess.check_output([".venv/bin/python", "--version"], text=True).strip()
+          npm = subprocess.check_output(["npm", "--version"], text=True).strip()
+          docker = subprocess.check_output(["docker", "--version"], text=True).strip()
+          if build_python != f"Python {os.environ['BUILD_PYTHON_VERSION']}" or npm != os.environ["NPM_VERSION"] or docker != os.environ["DOCKER_IDENTITY"]:
+              raise SystemExit("observed build Python/npm/docker does not match the locked identity")
+          versions = {
+              "uv": subprocess.check_output(["uv", "--version"], text=True).strip(), "node": subprocess.check_output(["node", "--version"], text=True).strip(),
+              "syft": Path(os.environ["RUNNER_TEMP"]).joinpath("syft-version.txt").read_text().strip(), "grype": Path(os.environ["RUNNER_TEMP"]).joinpath("grype-version.txt").read_text().strip(),
+              "npm": npm, "docker": docker,
+              "pip": subprocess.check_output([".venv/bin/python", "-m", "pip", "--version"], text=True).strip(), "build_python": build_python,
+              "hatchling": subprocess.check_output([".venv/bin/python", "-c", "from importlib.metadata import version; print(version('hatchling'))"], text=True).strip(),
+              "actionlint": Path("/tmp/actionlint-version.txt").read_text().strip(),
+              "grype_db_sha256": digest(root / "tool-metadata" / "grype-db.json"),
+              "grype_db": {"valid": True, "from": grype_db["from"], "archive_sha256": archive_sha256, "sqlite_sha256": sqlite_sha256, "built": grype_db["built"], "schemaVersion": grype_db["schemaVersion"], "path": "tool-metadata/grype-db.sqlite", "status": "verified"},
+          }
+          (root / "tool-metadata" / "tools.json").write_text(json.dumps(versions, indent=2, sort_keys=True) + "\n")
+          PY
+      - name: Bind every payload and report to exact source bytes
+        run: |
+          args=(); while IFS= read -r -d '' artifact; do args+=(--artifact "$artifact"); done < <(find release-candidate -type f -print0 | sort -z)
+          .venv/bin/python scripts/release_manifest.py write --tag "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" --ref "$RELEASE_REF" --commit "$RELEASE_COMMIT" --candidate-root release-candidate --output release-candidate/release-manifest.json "${args[@]}"
+          .venv/bin/python scripts/release_verifier.py evidence --root release-candidate --repository "$RELEASE_REPOSITORY" --ref "$RELEASE_REF" --commit "$RELEASE_COMMIT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tracebed-candidate-${{ env.RELEASE_COMMIT }}
+          path: release-candidate
+          if-no-files-found: error
+          retention-days: 14
+
+  attest-sign-verify:
+    needs: [policy, build-test-scan]
+    runs-on: ubuntu-24.04
+    environment: tracebed-release-signing
+    permissions:
+      id-token: write
+      attestations: write
+      actions: read
+    env:
+      RELEASE_REF: ${{ needs.policy.outputs.ref }}
+      RELEASE_COMMIT: ${{ needs.policy.outputs.commit }}
+      RELEASE_REPOSITORY: ${{ needs.policy.outputs.repository }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: tracebed-candidate-${{ env.RELEASE_COMMIT }}
+          path: release-candidate
+      - name: Independently validate manifest inventory before attestation
+        run: |
+          mkdir -p verification
+          python3 - <<'PY'
+          import hashlib, json, os, re
+          from pathlib import Path
+          root = Path("release-candidate")
+          manifest = json.loads((root / "release-manifest.json").read_text())
+          expected = {"repository": os.environ["RELEASE_REPOSITORY"], "ref": os.environ["RELEASE_REF"], "commit": os.environ["RELEASE_COMMIT"]}
+          if manifest.get("source") != expected: raise SystemExit("manifest source tuple mismatch")
+          expected_tag = os.environ["RELEASE_REF"].removeprefix("refs/tags/")
+          if not os.environ["RELEASE_REF"].startswith("refs/tags/") or expected_tag != f"v{manifest.get('version')}" or manifest.get("tag") != expected_tag: raise SystemExit("manifest tag/version must be exactly bound to RELEASE_REF")
+          if set(manifest) != {"schema_version", "project", "version", "tag", "source", "artifacts"} or manifest.get("schema_version") != 1 or manifest.get("project") != "tracebed" or not isinstance(manifest.get("version"), str) or not isinstance(manifest.get("artifacts"), list) or not manifest["artifacts"]: raise SystemExit("manifest schema mismatch")
+          subjects = []
+          for item in manifest.get("artifacts", []):
+              name, digest = item.get("path"), item.get("sha256")
+              path = root / str(name)
+              if not isinstance(name, str) or name in {".", ".."} or "/../" in name or name != Path(name).as_posix() or name.startswith("/") or not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest) or not path.resolve().is_relative_to(root.resolve()) or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest: raise SystemExit("manifest inventory mismatch")
+              subjects.append(path.as_posix())
+          regular = {path.as_posix() for path in root.rglob("*") if path.is_file() and path.name != "release-manifest.json"}
+          if set(subjects) != regular: raise SystemExit("manifest candidate closure mismatch")
+          subjects.append((root / "release-manifest.json").as_posix())
+          if len(subjects) != len(set(subjects)): raise SystemExit("duplicate manifest subject")
+          expected_sbom_roots = {"image": ("tracebed-api", "container"), "python": ("tracebed-python-runtime", "file"), "dashboard": ("tracebed-dashboard-runtime", "file")}
+          for payload in ("image", "python", "dashboard"):
+              spdx = json.loads((root / "sbom" / f"{payload}.spdx.json").read_text()); cdx = json.loads((root / "sbom" / f"{payload}.cyclonedx.json").read_text())
+              component = cdx.get("metadata", {}).get("component") if isinstance(cdx.get("metadata"), dict) else None
+              if spdx.get("SPDXID") != "SPDXRef-DOCUMENT" or not isinstance(spdx.get("name"), str) or not isinstance(spdx.get("documentNamespace"), str) or not isinstance(spdx.get("packages"), list) or not spdx["packages"] or not isinstance(spdx.get("relationships"), list) or not spdx["relationships"] or cdx.get("bomFormat") != "CycloneDX" or cdx.get("specVersion") != "1.6" or not isinstance(cdx.get("metadata"), dict) or not isinstance(component, dict) or set(component) < {"name", "version", "type"} or not all(isinstance(component.get(key), str) and component[key] for key in ("name", "version", "type")) or not isinstance(cdx.get("components"), list) or not cdx["components"]: raise SystemExit("SBOM schema/component mismatch")
+              expected_name, expected_type = expected_sbom_roots[payload]
+              if spdx["name"] != expected_name or component["name"] != expected_name or component["version"] != manifest["version"] or component["type"] != expected_type: raise SystemExit("Syft SBOM root identity/version/type mismatch")
+              names = {(item.get("name"), item.get("versionInfo")) for item in spdx.get("packages", []) if isinstance(item, dict)}; components = {(item.get("name"), item.get("version")) for item in cdx.get("components", []) if isinstance(item, dict)}
+              if payload in {"image", "python"} and (("tracebed", manifest["version"]) not in names or ("tracebed", manifest["version"]) not in components): raise SystemExit("Tracebed SBOM identity mismatch")
+              if payload == "dashboard" and not {"react", "react-dom", "react-router-dom"}.issubset({name for name, _ in names}): raise SystemExit("dashboard SPDX identities missing")
+              if payload == "dashboard" and not {"react", "react-dom", "react-router-dom"}.issubset({name for name, _ in components}): raise SystemExit("dashboard CycloneDX identities missing")
+              if payload == "dashboard":
+                  lock = json.loads((root / "package-lock.json").read_text()); versions = {name: lock["packages"][f"node_modules/{name}"]["version"] for name in ("react", "react-dom", "react-router-dom")}
+                  if any((name, version) not in names or (name, version) not in components for name, version in versions.items()): raise SystemExit("dashboard locked dependency versions mismatch")
+          reports = {path.name for path in (root / "vulnerabilities").glob("*.json")}
+          bindings = json.loads((root / "tool-metadata" / "sbom-bindings.json").read_text())
+          if set(bindings) != {"schema_version", "version", "payloads"} or bindings.get("schema_version") != 1 or bindings.get("version") != manifest["version"] or set(bindings.get("payloads", {})) != {"image", "python", "dashboard"}: raise SystemExit("SBOM binding schema mismatch")
+          for payload in ("image", "python", "dashboard"):
+              binding = bindings["payloads"][payload]
+              spdx = json.loads((root / "sbom" / f"{payload}.spdx.json").read_text()); cdx = json.loads((root / "sbom" / f"{payload}.cyclonedx.json").read_text())
+              expected_path = f"tracebed-api-{manifest['version']}.tar" if payload == "image" else (f"tracebed-dashboard-{manifest['version']}.tar.gz" if payload == "dashboard" else None)
+              fields = {"path", "sha256", "spdx", "cyclonedx", "vulnerability_report", "severity_threshold", "scan_configuration", "spdx_package_count", "cyclonedx_component_count", "spdx_root", "cyclonedx_root"}
+              if not isinstance(binding, dict) or set(binding) != (fields | ({"equivalent_sdist"} if payload == "python" else set())) or (expected_path is not None and binding.get("path") != expected_path) or (payload == "python" and (not isinstance(binding.get("path"), str) or not binding["path"].startswith("python/") or not binding["path"].endswith(".whl"))): raise SystemExit("SBOM binding exact schema/path mismatch")
+              report = json.loads((root / "vulnerabilities" / f"{payload}.json").read_text()); source = report.get("source", {})
+              expected = f"tracebed-api:{manifest['version']}" if payload == "image" else ("release-runtime/python" if payload == "python" else "release-runtime/dashboard")
+              source_ok = isinstance(source.get("target"), dict) and source["target"].get("userInput") == expected if payload == "image" else source.get("type") == "directory" and source.get("target") == expected
+              configuration = report.get("descriptor", {}).get("configuration") if isinstance(report.get("descriptor"), dict) else None
+              if report.get("descriptor", {}).get("name") != "grype" or report.get("descriptor", {}).get("version") != "0.104.0" or not isinstance(configuration, dict) or configuration.get("fail-on-severity") != "high" or not source_ok: raise SystemExit("Grype report semantics/configuration mismatch")
+              known_severities = {"negligible", "low", "medium", "high", "critical", "unknown"}
+              if not isinstance(report.get("matches"), list) or any(not isinstance(match, dict) or not isinstance(match.get("vulnerability"), dict) or not isinstance(match["vulnerability"].get("severity"), str) or match["vulnerability"]["severity"].lower() not in known_severities or match["vulnerability"]["severity"].lower() in {"high", "critical"} for match in report["matches"]): raise SystemExit("Grype match schema/severity blocker mismatch")
+              artifact = root / str(binding.get("path", ""))
+              if binding.get("spdx") != f"sbom/{payload}.spdx.json" or binding.get("cyclonedx") != f"sbom/{payload}.cyclonedx.json" or binding.get("vulnerability_report") != f"vulnerabilities/{payload}.json" or binding.get("severity_threshold") != "high" or binding.get("scan_configuration") != {"fail_on_severity": "high"} or not artifact.is_file() or binding.get("sha256") != hashlib.sha256(artifact.read_bytes()).hexdigest() or (binding.get("spdx_package_count"), binding.get("cyclonedx_component_count"), binding.get("spdx_root"), binding.get("cyclonedx_root")) != (len(spdx["packages"]), len(cdx["components"]), spdx["name"], cdx["metadata"]["component"]["name"]): raise SystemExit("SBOM binding payload/count/root mismatch")
+          python_binding = bindings["payloads"]["python"]
+          sdist = python_binding.get("equivalent_sdist") if isinstance(python_binding, dict) else None
+          expected_wheel = f"python/tracebed-{manifest['version']}-py3-none-any.whl"
+          expected_sdist = f"python/tracebed-{manifest['version']}.tar.gz"
+          if not isinstance(python_binding, dict) or python_binding.get("path") != expected_wheel or not isinstance(sdist, dict) or set(sdist) != {"path", "sha256", "offline_smoke"} or sdist.get("path") != expected_sdist or sdist.get("offline_smoke") != "passed" or not (root / expected_sdist).is_file() or sdist.get("sha256") != hashlib.sha256((root / expected_sdist).read_bytes()).hexdigest(): raise SystemExit("Python wheel/sdist equivalence binding mismatch")
+          tools = json.loads((root / "tool-metadata" / "tools.json").read_text()); db = tools.get("grype_db", {})
+          pinned = {"uv":r"^uv 0\.11\.21 \(x86_64-unknown-linux-gnu\)$", "node":r"^v20\.19\.0$", "syft":r"(?m)^Version:\s+1\.38\.0$", "grype":r"(?m)^Version:\s+0\.104\.0$", "pip":r"^pip 26\.2 \([^\n]+\)$", "hatchling":r"^1\.29\.0$", "actionlint":r"(?m)^1\.7\.7(?:\s|$)"}
+          from urllib.parse import parse_qs, urlparse
+          raw_db_path = root / "tool-metadata" / "grype-db.json"
+          raw_db = json.loads(raw_db_path.read_text())
+          raw_fields = ("schemaVersion", "from", "built", "path")
+          if not isinstance(raw_db, dict) or raw_db.get("valid") is not True or not all(isinstance(raw_db.get(key), str) and raw_db[key] for key in raw_fields) or tools.get("grype_db_sha256") != hashlib.sha256(raw_db_path.read_bytes()).hexdigest() or not isinstance(db, dict) or db.get("status") != "verified" or db.get("valid") is not True or any(db.get(key) != raw_db.get(key) for key in ("schemaVersion", "from", "built")) or db.get("path") != "tool-metadata/grype-db.sqlite": raise SystemExit("raw Grype DB/status reconciliation mismatch")
+          archive = parse_qs(urlparse(raw_db["from"]).query).get("checksum", [])
+          if len(archive) != 1 or not re.fullmatch(r"sha256:[0-9a-f]{64}", archive[0]) or db.get("archive_sha256") != archive[0].removeprefix("sha256:"): raise SystemExit("Grype DB archive checksum mismatch")
+          sqlite = (root / db["path"]).resolve()
+          if sqlite.parent != (root / "tool-metadata").resolve() or sqlite.name != "grype-db.sqlite" or not sqlite.is_file() or db.get("sqlite_sha256") != hashlib.sha256(sqlite.read_bytes()).hexdigest(): raise SystemExit("Grype DB SQLite digest/path mismatch")
+          if reports != {"image.json", "python.json", "dashboard.json"} or any(not re.search(pattern, str(tools.get(key, ""))) for key, pattern in pinned.items()) or tools.get("build_python") != f"Python {os.environ['BUILD_PYTHON_VERSION']}" or tools.get("npm") != os.environ["NPM_VERSION"] or tools.get("docker") != os.environ["DOCKER_IDENTITY"]: raise SystemExit("locked tool identity evidence mismatch")
+          Path("verification/subjects.sha256").write_text("".join(f"{hashlib.sha256(Path(name).read_bytes()).hexdigest()}  {name}\n" for name in sorted(subjects)))
+          PY
+      - id: provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-checksums: verification/subjects.sha256
+      - name: Retain the exact current-run provenance bundle
+        run: |
+          mkdir -p verification
+          test -n "${{ steps.provenance.outputs.bundle-path }}"
+          cp "${{ steps.provenance.outputs.bundle-path }}" verification/current-run.intoto.jsonl
+      - uses: sigstore/cosign-installer@2e2f661cd4be3a4b891a882064e49d0fed4b7b88 # v3.9.0
+        with:
+          cosign-release: v2.5.0
+      - name: Install exact GitHub CLI
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-gh"
+          curl --fail --location --output "$RUNNER_TEMP/gh.tar.gz" "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+          echo "${GH_CHECKSUM_LINUX_X64}  $RUNNER_TEMP/gh.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP/release-gh" --strip-components=1
+          "$RUNNER_TEMP/release-gh/bin/gh" --version | tee "$RUNNER_TEMP/gh-version.txt"
+      - name: Sign and verify exact source-bound evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p verification/attestations
+          python3 - <<'PY'
+          import hashlib, json, os, re
+          from pathlib import Path
+          root = Path("release-candidate")
+          manifest = json.loads((root / "release-manifest.json").read_text())
+          expected = {"repository": os.environ["RELEASE_REPOSITORY"], "ref": os.environ["RELEASE_REF"], "commit": os.environ["RELEASE_COMMIT"]}
+          if manifest.get("source") != expected:
+              raise SystemExit("manifest source tuple mismatch")
+          paths = []
+          for item in manifest.get("artifacts", []):
+              name, digest = item.get("path"), item.get("sha256")
+              path = root / str(name)
+              if not isinstance(name, str) or not path.resolve().is_relative_to(root.resolve()) or not path.is_file():
+                  raise SystemExit("unsafe or absent manifest subject")
+              if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                  raise SystemExit("manifest subject digest mismatch")
+              paths.append(path.as_posix())
+          paths.append((root / "release-manifest.json").as_posix())
+          if not paths or len(paths) != len(set(paths)):
+              raise SystemExit("empty or duplicate manifest subjects")
+          Path("verification/subjects.txt").write_text("\n".join(sorted(paths)) + "\n")
+          PY
+          while IFS= read -r artifact; do test ! -e "${artifact}.bundle"; cosign sign-blob --yes --bundle "${artifact}.bundle" "$artifact"; done < verification/subjects.txt
+          identity="https://github.com/${RELEASE_REPOSITORY}/.github/workflows/release.yml@${RELEASE_REF}"
+          while IFS= read -r artifact; do
+            cosign verify-blob --bundle "${artifact}.bundle" --certificate-identity "$identity" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$artifact"
+            stem="$(printf '%s' "$artifact" | sha256sum | cut -d' ' -f1)"
+            "$RUNNER_TEMP/release-gh/bin/gh" attestation verify "$artifact" --bundle verification/current-run.intoto.jsonl --repo "$RELEASE_REPOSITORY" --cert-identity "$identity" --source-ref "$RELEASE_REF" --source-digest "$RELEASE_COMMIT" --format json > "verification/attestations/${stem}.verified.json"
+          done < verification/subjects.txt
+          test "$(find verification/attestations -maxdepth 1 -name '*.verified.json' | wc -l | tr -d ' ')" = "$(wc -l < verification/subjects.txt | tr -d ' ')"
+          python3 - <<'PY'
+          import hashlib, json, os, re
+          from pathlib import Path
+          root, reports = Path("release-candidate"), Path("verification/attestations")
+          identity = f"https://github.com/{os.environ['RELEASE_REPOSITORY']}/.github/workflows/release.yml@{os.environ['RELEASE_REF']}"
+          inventory = Path("verification/subjects.txt").read_text().splitlines()
+          expected_subjects = sorted(({"name": artifact, "digest": {"sha256": hashlib.sha256(Path(artifact).read_bytes()).hexdigest()}} for artifact in inventory), key=lambda value: value["name"])
+          workflow = {"ref": os.environ["RELEASE_REF"], "repository": f"https://github.com/{os.environ['RELEASE_REPOSITORY']}", "path": ".github/workflows/release.yml"}
+          dependency_uri = f"git+https://github.com/{os.environ['RELEASE_REPOSITORY']}@{os.environ['RELEASE_REF']}"
+          for artifact in inventory:
+              stem = hashlib.sha256(artifact.encode()).hexdigest()
+              data = json.loads((reports / f"{stem}.verified.json").read_text())
+              if not isinstance(data, list): raise SystemExit("GH verify must return a structured result array")
+              matched = []
+              for entry in data:
+                  result = entry.get("verificationResult") if isinstance(entry, dict) else None
+                  certificate = result.get("signature", {}).get("certificate") if isinstance(result, dict) and isinstance(result.get("signature"), dict) else None
+                  statement = result.get("statement") if isinstance(result, dict) else None
+                  if isinstance(certificate, dict) and certificate.get("subjectAlternativeName") == identity and isinstance(statement, dict): matched.append(statement)
+              if not matched: raise SystemExit("missing current-run certificate-bound verification result")
+              for statement in matched:
+                  if sorted(statement.get("subject", []), key=lambda value: value.get("name", "") if isinstance(value, dict) else "") != expected_subjects: raise SystemExit("attestation subject inventory mismatch")
+                  build = statement.get("predicate", {}).get("buildDefinition", {}) if isinstance(statement.get("predicate"), dict) else {}
+                  if build.get("externalParameters", {}).get("workflow") != workflow: raise SystemExit("buildDefinition workflow mismatch")
+                  dependencies = build.get("resolvedDependencies")
+                  if not isinstance(dependencies, list) or not any(isinstance(dep, dict) and dep.get("uri") == dependency_uri and dep.get("digest", {}).get("gitCommit") == os.environ["RELEASE_COMMIT"] for dep in dependencies): raise SystemExit("buildDefinition resolved commit mismatch")
+          PY
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          tools = {"gh": Path(os.environ["RUNNER_TEMP"]).joinpath("gh-version.txt").read_text().strip(), "cosign": subprocess.check_output(["cosign", "version"], text=True).strip()}
+          Path("verification/signing-tools.json").write_text(json.dumps(tools, indent=2, sort_keys=True) + "\n")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tracebed-release-evidence-${{ env.RELEASE_COMMIT }}
+          path: |
+            release-candidate
+            verification
+          if-no-files-found: error
+          retention-days: 14
+
+  human-publication-gate:
+    needs: [policy, attest-sign-verify]
+    runs-on: ubuntu-24.04
+    environment: tracebed-release
+    permissions:
+      attestations: read
+      actions: read
+    env:
+      RELEASE_REF: ${{ needs.policy.outputs.ref }}
+      RELEASE_COMMIT: ${{ needs.policy.outputs.commit }}
+      RELEASE_REPOSITORY: ${{ needs.policy.outputs.repository }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: tracebed-release-evidence-${{ env.RELEASE_COMMIT }}
+          path: .
+      - uses: sigstore/cosign-installer@2e2f661cd4be3a4b891a882064e49d0fed4b7b88 # v3.9.0
+        with:
+          cosign-release: v2.5.0
+      - name: Install exact GitHub CLI
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-gh"
+          curl --fail --location --output "$RUNNER_TEMP/gh.tar.gz" "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
+          echo "${GH_CHECKSUM_LINUX_X64}  $RUNNER_TEMP/gh.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gh.tar.gz" -C "$RUNNER_TEMP/release-gh" --strip-components=1
+          "$RUNNER_TEMP/release-gh/bin/gh" --version | tee "$RUNNER_TEMP/gh-version.txt"
+      - name: Fresh-runner stdlib verification before human stop gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          identity="https://github.com/${RELEASE_REPOSITORY}/.github/workflows/release.yml@${RELEASE_REF}"
+          python3 - <<'PY'
+          import hashlib, json, os, re
+          from pathlib import Path
+          root = Path("release-candidate")
+          manifest = json.loads((root / "release-manifest.json").read_text())
+          expected = {"repository": os.environ["RELEASE_REPOSITORY"], "ref": os.environ["RELEASE_REF"], "commit": os.environ["RELEASE_COMMIT"]}
+          if manifest.get("source") != expected:
+              raise SystemExit("fresh manifest source tuple mismatch")
+          expected_tag = os.environ["RELEASE_REF"].removeprefix("refs/tags/")
+          if not os.environ["RELEASE_REF"].startswith("refs/tags/") or expected_tag != f"v{manifest.get('version')}" or manifest.get("tag") != expected_tag:
+              raise SystemExit("fresh manifest tag/version must be exactly bound to RELEASE_REF")
+          if set(manifest) != {"schema_version", "project", "version", "tag", "source", "artifacts"} or manifest.get("schema_version") != 1 or manifest.get("project") != "tracebed" or not isinstance(manifest.get("version"), str) or not isinstance(manifest.get("artifacts"), list) or not manifest["artifacts"]:
+              raise SystemExit("fresh manifest schema mismatch")
+          paths = []
+          for item in manifest.get("artifacts", []):
+              name, digest = item.get("path"), item.get("sha256")
+              path = root / str(name)
+              if not isinstance(name, str) or name in {".", ".."} or "/../" in name or name != Path(name).as_posix() or name.startswith("/") or not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest) or not path.resolve().is_relative_to(root.resolve()) or not path.is_file():
+                  raise SystemExit("fresh unsafe or absent manifest subject")
+              if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                  raise SystemExit("fresh manifest subject digest mismatch")
+              paths.append(path.as_posix())
+          regular = {path.as_posix() for path in root.rglob("*") if path.is_file() and path.name != "release-manifest.json" and not path.name.endswith(".bundle")}
+          if set(paths) != regular: raise SystemExit("fresh manifest candidate closure mismatch")
+          paths.append((root / "release-manifest.json").as_posix())
+          if not paths or len(paths) != len(set(paths)):
+              raise SystemExit("fresh empty or duplicate manifest subjects")
+          expected_bundles = {f"{path}.bundle" for path in paths}
+          actual_bundles = {path.as_posix() for path in root.rglob("*.bundle") if path.is_file()}
+          if actual_bundles != expected_bundles: raise SystemExit("fresh human bundle closure mismatch")
+          expected_sbom_roots = {"image": ("tracebed-api", "container"), "python": ("tracebed-python-runtime", "file"), "dashboard": ("tracebed-dashboard-runtime", "file")}
+          for payload in ("image", "python", "dashboard"):
+              spdx = json.loads((root / "sbom" / f"{payload}.spdx.json").read_text()); cdx = json.loads((root / "sbom" / f"{payload}.cyclonedx.json").read_text())
+              component = cdx.get("metadata", {}).get("component") if isinstance(cdx.get("metadata"), dict) else None
+              if spdx.get("SPDXID") != "SPDXRef-DOCUMENT" or not isinstance(spdx.get("name"), str) or not isinstance(spdx.get("documentNamespace"), str) or not isinstance(spdx.get("packages"), list) or not spdx["packages"] or not isinstance(spdx.get("relationships"), list) or not spdx["relationships"] or cdx.get("bomFormat") != "CycloneDX" or cdx.get("specVersion") != "1.6" or not isinstance(cdx.get("metadata"), dict) or not isinstance(component, dict) or set(component) < {"name", "version", "type"} or not all(isinstance(component.get(key), str) and component[key] for key in ("name", "version", "type")) or not isinstance(cdx.get("components"), list) or not cdx["components"]: raise SystemExit("fresh SBOM schema/component mismatch")
+              expected_name, expected_type = expected_sbom_roots[payload]
+              if spdx["name"] != expected_name or component["name"] != expected_name or component["version"] != manifest["version"] or component["type"] != expected_type: raise SystemExit("fresh Syft SBOM root identity/version/type mismatch")
+              names = {(item.get("name"), item.get("versionInfo")) for item in spdx.get("packages", []) if isinstance(item, dict)}; components = {(item.get("name"), item.get("version")) for item in cdx.get("components", []) if isinstance(item, dict)}
+              if payload in {"image", "python"} and (("tracebed", manifest["version"]) not in names or ("tracebed", manifest["version"]) not in components): raise SystemExit("fresh Tracebed SBOM identity mismatch")
+              if payload == "dashboard" and (not {"react", "react-dom", "react-router-dom"}.issubset({name for name, _ in names}) or not {"react", "react-dom", "react-router-dom"}.issubset({name for name, _ in components})): raise SystemExit("fresh dashboard SBOM identities missing")
+              if payload == "dashboard":
+                  lock = json.loads((root / "package-lock.json").read_text()); versions = {name: lock["packages"][f"node_modules/{name}"]["version"] for name in ("react", "react-dom", "react-router-dom")}
+                  if any((name, version) not in names or (name, version) not in components for name, version in versions.items()): raise SystemExit("fresh dashboard locked dependency versions mismatch")
+          reports = {path.name for path in (root / "vulnerabilities").glob("*.json")}
+          bindings = json.loads((root / "tool-metadata" / "sbom-bindings.json").read_text())
+          if set(bindings) != {"schema_version", "version", "payloads"} or bindings.get("schema_version") != 1 or bindings.get("version") != manifest["version"] or set(bindings.get("payloads", {})) != {"image", "python", "dashboard"}: raise SystemExit("fresh SBOM binding schema mismatch")
+          for payload in ("image", "python", "dashboard"):
+              binding = bindings["payloads"][payload]
+              spdx = json.loads((root / "sbom" / f"{payload}.spdx.json").read_text()); cdx = json.loads((root / "sbom" / f"{payload}.cyclonedx.json").read_text())
+              expected_path = f"tracebed-api-{manifest['version']}.tar" if payload == "image" else (f"tracebed-dashboard-{manifest['version']}.tar.gz" if payload == "dashboard" else None)
+              fields = {"path", "sha256", "spdx", "cyclonedx", "vulnerability_report", "severity_threshold", "scan_configuration", "spdx_package_count", "cyclonedx_component_count", "spdx_root", "cyclonedx_root"}
+              if not isinstance(binding, dict) or set(binding) != (fields | ({"equivalent_sdist"} if payload == "python" else set())) or (expected_path is not None and binding.get("path") != expected_path) or (payload == "python" and (not isinstance(binding.get("path"), str) or not binding["path"].startswith("python/") or not binding["path"].endswith(".whl"))): raise SystemExit("fresh SBOM binding exact schema/path mismatch")
+              report = json.loads((root / "vulnerabilities" / f"{payload}.json").read_text()); source = report.get("source", {})
+              expected = f"tracebed-api:{manifest['version']}" if payload == "image" else ("release-runtime/python" if payload == "python" else "release-runtime/dashboard")
+              source_ok = isinstance(source.get("target"), dict) and source["target"].get("userInput") == expected if payload == "image" else source.get("type") == "directory" and source.get("target") == expected
+              configuration = report.get("descriptor", {}).get("configuration") if isinstance(report.get("descriptor"), dict) else None
+              if report.get("descriptor", {}).get("name") != "grype" or report.get("descriptor", {}).get("version") != "0.104.0" or not isinstance(configuration, dict) or configuration.get("fail-on-severity") != "high" or not source_ok: raise SystemExit("fresh Grype report semantics/configuration mismatch")
+              known_severities = {"negligible", "low", "medium", "high", "critical", "unknown"}
+              if not isinstance(report.get("matches"), list) or any(not isinstance(match, dict) or not isinstance(match.get("vulnerability"), dict) or not isinstance(match["vulnerability"].get("severity"), str) or match["vulnerability"]["severity"].lower() not in known_severities or match["vulnerability"]["severity"].lower() in {"high", "critical"} for match in report["matches"]): raise SystemExit("fresh Grype match schema/severity blocker mismatch")
+              artifact = root / str(binding.get("path", ""))
+              if binding.get("spdx") != f"sbom/{payload}.spdx.json" or binding.get("cyclonedx") != f"sbom/{payload}.cyclonedx.json" or binding.get("vulnerability_report") != f"vulnerabilities/{payload}.json" or binding.get("severity_threshold") != "high" or binding.get("scan_configuration") != {"fail_on_severity": "high"} or not artifact.is_file() or binding.get("sha256") != hashlib.sha256(artifact.read_bytes()).hexdigest() or (binding.get("spdx_package_count"), binding.get("cyclonedx_component_count"), binding.get("spdx_root"), binding.get("cyclonedx_root")) != (len(spdx["packages"]), len(cdx["components"]), spdx["name"], cdx["metadata"]["component"]["name"]): raise SystemExit("fresh SBOM binding payload/count/root mismatch")
+          python_binding = bindings["payloads"]["python"]
+          sdist = python_binding.get("equivalent_sdist") if isinstance(python_binding, dict) else None
+          expected_wheel = f"python/tracebed-{manifest['version']}-py3-none-any.whl"
+          expected_sdist = f"python/tracebed-{manifest['version']}.tar.gz"
+          if not isinstance(python_binding, dict) or python_binding.get("path") != expected_wheel or not isinstance(sdist, dict) or set(sdist) != {"path", "sha256", "offline_smoke"} or sdist.get("path") != expected_sdist or sdist.get("offline_smoke") != "passed" or not (root / expected_sdist).is_file() or sdist.get("sha256") != hashlib.sha256((root / expected_sdist).read_bytes()).hexdigest(): raise SystemExit("fresh Python wheel/sdist equivalence binding mismatch")
+          tools = json.loads((root / "tool-metadata" / "tools.json").read_text()); db = tools.get("grype_db", {})
+          pinned = {"uv":r"^uv 0\.11\.21 \(x86_64-unknown-linux-gnu\)$", "node":r"^v20\.19\.0$", "syft":r"(?m)^Version:\s+1\.38\.0$", "grype":r"(?m)^Version:\s+0\.104\.0$", "pip":r"^pip 26\.2 \([^\n]+\)$", "hatchling":r"^1\.29\.0$", "actionlint":r"(?m)^1\.7\.7(?:\s|$)"}
+          from urllib.parse import parse_qs, urlparse
+          raw_db_path = root / "tool-metadata" / "grype-db.json"
+          raw_db = json.loads(raw_db_path.read_text())
+          raw_fields = ("schemaVersion", "from", "built", "path")
+          if not isinstance(raw_db, dict) or raw_db.get("valid") is not True or not all(isinstance(raw_db.get(key), str) and raw_db[key] for key in raw_fields) or tools.get("grype_db_sha256") != hashlib.sha256(raw_db_path.read_bytes()).hexdigest() or not isinstance(db, dict) or db.get("status") != "verified" or db.get("valid") is not True or any(db.get(key) != raw_db.get(key) for key in ("schemaVersion", "from", "built")) or db.get("path") != "tool-metadata/grype-db.sqlite": raise SystemExit("fresh raw Grype DB/status reconciliation mismatch")
+          archive = parse_qs(urlparse(raw_db["from"]).query).get("checksum", [])
+          if len(archive) != 1 or not re.fullmatch(r"sha256:[0-9a-f]{64}", archive[0]) or db.get("archive_sha256") != archive[0].removeprefix("sha256:"): raise SystemExit("fresh Grype DB archive checksum mismatch")
+          sqlite = (root / db["path"]).resolve()
+          if sqlite.parent != (root / "tool-metadata").resolve() or sqlite.name != "grype-db.sqlite" or not sqlite.is_file() or db.get("sqlite_sha256") != hashlib.sha256(sqlite.read_bytes()).hexdigest(): raise SystemExit("fresh Grype DB SQLite digest/path mismatch")
+          if reports != {"image.json", "python.json", "dashboard.json"} or any(not re.search(pattern, str(tools.get(key, ""))) for key, pattern in pinned.items()) or tools.get("build_python") != f"Python {os.environ['BUILD_PYTHON_VERSION']}" or tools.get("npm") != os.environ["NPM_VERSION"] or tools.get("docker") != os.environ["DOCKER_IDENTITY"]: raise SystemExit("fresh locked tool identity evidence mismatch")
+          Path("verification/fresh-subjects.txt").write_text("\n".join(sorted(paths)) + "\n")
+          PY
+          while IFS= read -r artifact; do
+            cosign verify-blob --bundle "${artifact}.bundle" --certificate-identity "$identity" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$artifact"
+            stem="$(printf '%s' "$artifact" | sha256sum | cut -d' ' -f1)"
+            "$RUNNER_TEMP/release-gh/bin/gh" attestation verify "$artifact" --bundle verification/current-run.intoto.jsonl --repo "$RELEASE_REPOSITORY" --cert-identity "$identity" --source-ref "$RELEASE_REF" --source-digest "$RELEASE_COMMIT" --format json > "verification/attestations/${stem}.human-verified.json"
+          done < verification/fresh-subjects.txt
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          identity = f"https://github.com/{os.environ['RELEASE_REPOSITORY']}/.github/workflows/release.yml@{os.environ['RELEASE_REF']}"
+          subjects = Path("verification/fresh-subjects.txt").read_text().splitlines()
+          expected_subjects = sorted(({"name": artifact, "digest": {"sha256": hashlib.sha256(Path(artifact).read_bytes()).hexdigest()}} for artifact in subjects), key=lambda value: value["name"])
+          workflow = {"ref": os.environ["RELEASE_REF"], "repository": f"https://github.com/{os.environ['RELEASE_REPOSITORY']}", "path": ".github/workflows/release.yml"}
+          dependency_uri = f"git+https://github.com/{os.environ['RELEASE_REPOSITORY']}@{os.environ['RELEASE_REF']}"
+          for artifact in subjects:
+              stem = hashlib.sha256(artifact.encode()).hexdigest()
+              data = json.loads((Path("verification/attestations") / f"{stem}.human-verified.json").read_text())
+              if not isinstance(data, list): raise SystemExit("fresh GH verification must be a result array")
+              matched = []
+              for entry in data:
+                  result = entry.get("verificationResult") if isinstance(entry, dict) else None
+                  certificate = result.get("signature", {}).get("certificate") if isinstance(result, dict) and isinstance(result.get("signature"), dict) else None
+                  statement = result.get("statement") if isinstance(result, dict) else None
+                  if isinstance(certificate, dict) and certificate.get("subjectAlternativeName") == identity and isinstance(statement, dict): matched.append(statement)
+              if not matched: raise SystemExit("fresh current-run certificate-bound verification missing")
+              for statement in matched:
+                  if sorted(statement.get("subject", []), key=lambda value: value.get("name", "") if isinstance(value, dict) else "") != expected_subjects: raise SystemExit("fresh attestation subject inventory mismatch")
+                  build = statement.get("predicate", {}).get("buildDefinition", {}) if isinstance(statement.get("predicate"), dict) else {}
+                  if build.get("externalParameters", {}).get("workflow") != workflow: raise SystemExit("fresh buildDefinition workflow mismatch")
+                  dependencies = build.get("resolvedDependencies")
+                  if not isinstance(dependencies, list) or not any(isinstance(dep, dict) and dep.get("uri") == dependency_uri and dep.get("digest", {}).get("gitCommit") == os.environ["RELEASE_COMMIT"] for dep in dependencies): raise SystemExit("fresh buildDefinition resolved commit mismatch")
+          signing_tools = json.loads(Path("verification/signing-tools.json").read_text())
+          if os.environ["GH_VERSION"] not in str(signing_tools.get("gh", "")) or os.environ["COSIGN_VERSION"] not in str(signing_tools.get("cosign", "")):
+              raise SystemExit("signing tool metadata does not record exact GH and cosign versions")
+          PY
+      - name: Stop before publication
+        run: printf '%s\n' "Verified immutable release evidence; no publication destination or authority is configured."

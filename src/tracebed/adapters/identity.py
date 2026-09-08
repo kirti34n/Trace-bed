@@ -17,16 +17,19 @@ import hmac
 import json
 import threading
 from dataclasses import dataclass
-from typing import Any, Final, Literal, Protocol, runtime_checkable
+from typing import Any, Final, Literal, Protocol, cast, runtime_checkable
+from urllib.parse import urlsplit
 
 import httpx
 import jwt
+from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt import PyJWTError
 from jwt.algorithms import RSAAlgorithm
 
 from tracebed.domain.canonical import sha256_hex
 from tracebed.domain.clock import Clock, SystemClock
-from tracebed.domain.errors import AuthenticationFailed
+from tracebed.domain.deadline import RemainingBudget
+from tracebed.domain.errors import AuthenticationFailed, RequestDeadlineExceeded
 from tracebed.domain.ids import PrincipalId
 
 __all__ = [
@@ -77,7 +80,11 @@ class PrincipalLookup(Protocol):
     """
 
     def get_principal_by_external_ref(
-        self, kind: PrincipalKind, external_ref: str
+        self,
+        kind: PrincipalKind,
+        external_ref: str,
+        *,
+        deadline: RemainingBudget | None = None,
     ) -> PrincipalRecord | None:
         """Returns None for unknown or revoked. Must not raise on a miss —
         a distinguishable exception is a principal-enumeration oracle."""
@@ -90,8 +97,9 @@ class PrincipalLookup(Protocol):
 # Format: ``tb_sk_<key_id>.<secret>`` — key_id is a server-minted UUID hex
 # (the public half, stored as `principal.external_ref`), secret is the
 # high-entropy half whose sha256 is stored as `principal.key_hash`. Only the
-# hash is ever persisted; the plaintext secret is returned exactly once, at
-# mint time (`POST /admin/agents/register`), and never again.
+# hash is ever persisted; the plaintext secret is returned exactly once by the
+# owner-side onboarding/provisioning path, and never again. There is no HTTP
+# agent-registration route in this runtime.
 # --------------------------------------------------------------------------- #
 
 _API_KEY_PREFIX: Literal["tb_sk_"] = "tb_sk_"
@@ -132,12 +140,24 @@ class ApiKeyVerifier:
     def __init__(self, principals: PrincipalLookup) -> None:
         self._principals = principals
 
-    def authenticate(self, *, authorization: str | None, api_key: str | None) -> Principal:
+    def authenticate(
+        self,
+        *,
+        authorization: str | None,
+        api_key: str | None,
+        deadline: RemainingBudget | None = None,
+    ) -> Principal:
         if not api_key:
             raise AuthenticationFailed("missing API key")
         key_id, secret = _parse_api_key(api_key)
         presented_hash = sha256_hex(secret.encode("utf-8"))
-        record = self._principals.get_principal_by_external_ref("api_key", key_id)
+        _require_remaining(deadline)
+        if deadline is None:
+            record = self._principals.get_principal_by_external_ref("api_key", key_id)
+        else:
+            record = self._principals.get_principal_by_external_ref(
+                "api_key", key_id, deadline=deadline
+            )
         if record is None or record.revoked or record.key_hash is None:
             # Miss (or a revoked/keyless row masquerading as one, to the caller):
             # still spend exactly one compare_digest against a same-length hash.
@@ -179,6 +199,46 @@ class ApiKeyVerifier:
 # `kid`s an attacker invents, while still picking up a genuine IdP key rotation
 # within one window without a restart.
 _JWKS_REFRESH_COOLDOWN_MS: Final = 10_000.0
+_MAX_BEARER_BYTES: Final = 16 * 1024
+_MAX_JWKS_BYTES: Final = 256 * 1024
+_MAX_JWKS_KEYS: Final = 16
+_MAX_KID_CHARS: Final = 128
+_MIN_RSA_BITS: Final = 2048
+
+
+def _require_remaining(deadline: RemainingBudget | None) -> None:
+    """Refuse a new request-bound stage after its shared budget expires."""
+
+    if deadline is not None and deadline.remaining_ms() <= 0:
+        raise RequestDeadlineExceeded()
+
+
+def _clamp_timeout(timeout: httpx.Timeout, deadline: RemainingBudget | None) -> httpx.Timeout:
+    """Return a per-request HTTPX timeout without changing the shared client.
+
+    HTTPX applies these phase limits when a request starts.  It cannot safely replace an active
+    stream's read timeout after that point, so callers also check ``deadline`` before every body
+    iterator advance.
+    """
+
+    if deadline is None:
+        # Passing ``timeout=None`` to ``Client.stream`` disables every timeout.  Keep the
+        # configured object instead, without mutating the shared client.
+        return timeout
+    remaining_ms = deadline.remaining_ms()
+    if remaining_ms <= 0:
+        raise RequestDeadlineExceeded()
+    remaining_s = remaining_ms / 1000.0
+
+    def clamp(value: float | None) -> float:
+        return remaining_s if value is None else min(value, remaining_s)
+
+    return httpx.Timeout(
+        connect=clamp(timeout.connect),
+        read=clamp(timeout.read),
+        write=clamp(timeout.write),
+        pool=clamp(timeout.pool),
+    )
 
 
 class OidcJwksVerifier:
@@ -189,15 +249,23 @@ class OidcJwksVerifier:
         jwks_url: str,
         issuer: str,
         *,
-        audience: str = "tracebed",
+        audience: str | None = "tracebed",
         http: httpx.Client | None = None,
         principals: PrincipalLookup,
         clock: Clock | None = None,
     ) -> None:
+        _require_controlled_https_url(jwks_url)
+        _require_controlled_https_url(issuer)
+        if type(audience) is not str or not audience or len(audience) > 255:
+            raise ValueError("OIDC audience is invalid")
         self._jwks_url = jwks_url
         self._issuer = issuer
         self._audience = audience
-        self._http = http if http is not None else httpx.Client(timeout=5.0)
+        self._http = (
+            http
+            if http is not None
+            else httpx.Client(timeout=httpx.Timeout(2.0), follow_redirects=False, trust_env=False)
+        )
         self._principals = principals
         self._clock: Clock = clock if clock is not None else SystemClock()
         self._jwk_cache: dict[str, Any] = {}
@@ -208,25 +276,111 @@ class OidcJwksVerifier:
         self._refresh_lock = threading.Lock()
         self._last_refresh_ms: float | None = None
 
-    def authenticate(self, *, authorization: str | None, api_key: str | None) -> Principal:
+    def authenticate(
+        self,
+        *,
+        authorization: str | None,
+        api_key: str | None,
+        deadline: RemainingBudget | None = None,
+    ) -> Principal:
         token = self._extract_bearer(authorization)
-        try:
-            header = jwt.get_unverified_header(token)
-        except PyJWTError as exc:
-            raise AuthenticationFailed("malformed bearer token") from exc
-
-        claims = self._decode(token, self._candidate_keys(header.get("kid")))
+        # The private API consumes credentials, never browser identity
+        # assertions.  Keycloak marks its access tokens with ``typ=Bearer``
+        # and its ID tokens with ``typ=ID``; checking that authenticated claim
+        # prevents a dashboard ID token from becoming an API bearer token.
+        claims = self.verify_access_token(token, deadline=deadline)
 
         sub = claims.get("sub")
-        if not isinstance(sub, str) or not sub:
+        if not isinstance(sub, str) or not sub or len(sub) > 255:
             raise AuthenticationFailed("bearer token has no subject")
 
-        record = self._principals.get_principal_by_external_ref("oidc_sub", sub)
+        _require_remaining(deadline)
+        if deadline is None:
+            record = self._principals.get_principal_by_external_ref("oidc_sub", sub)
+        else:
+            record = self._principals.get_principal_by_external_ref(
+                "oidc_sub", sub, deadline=deadline
+            )
         if record is None or record.revoked:
             raise AuthenticationFailed("unknown principal")
         return Principal(
             principal_id=record.principal_id, kind="oidc_sub", external_ref=record.external_ref
         )
+
+    def preflight(self) -> None:
+        """Fetch and validate the configured JWKS before serving credentials."""
+        if not self._refresh_jwks() or not self._jwk_cache:
+            raise AuthenticationFailed("JWKS document unavailable")
+
+    def verify_access_token(
+        self, token: str, *, deadline: RemainingBudget | None = None
+    ) -> dict[str, Any]:
+        """Validate a Keycloak-compatible access token without assigning scope."""
+        return self._verify_token(token, purpose="access", nonce=None, deadline=deadline)
+
+    def verify_id_token(self, token: str, *, nonce: str) -> dict[str, Any]:
+        """Validate an ID token for the browser authorization-code callback.
+
+        An ID token is an authentication assertion for the OIDC client, not a
+        bearer credential for this API.  The callback always has a freshly
+        generated nonce, so make it mandatory here rather than leaving a
+        second permissive verification entry point around.
+        """
+        if not isinstance(nonce, str) or not nonce:
+            raise AuthenticationFailed("OIDC nonce is invalid")
+        return self._verify_token(token, purpose="id", nonce=nonce)
+
+    def verify_token(self, token: str, *, nonce: str | None = None) -> dict[str, Any]:
+        """Backward-compatible explicit-ID-token entry point.
+
+        New callers must use :meth:`verify_access_token` or
+        :meth:`verify_id_token`; retaining this name avoids turning an upgrade
+        into an accidental permissive path.  A nonce is required, therefore it
+        can only validate an ID token and cannot authenticate an API request.
+        """
+        if nonce is None:
+            raise AuthenticationFailed("OIDC nonce is invalid")
+        return self.verify_id_token(token, nonce=nonce)
+
+    def _verify_token(
+        self,
+        token: str,
+        *,
+        purpose: Literal["access", "id"],
+        nonce: str | None,
+        deadline: RemainingBudget | None = None,
+    ) -> dict[str, Any]:
+        if type(token) is not str or not token:
+            raise AuthenticationFailed("malformed bearer token")
+        try:
+            if len(token.encode("ascii")) > _MAX_BEARER_BYTES:
+                raise AuthenticationFailed("bearer token is too large")
+        except UnicodeEncodeError as exc:
+            raise AuthenticationFailed("malformed bearer token") from exc
+        try:
+            header = jwt.get_unverified_header(token)
+        except PyJWTError as exc:
+            raise AuthenticationFailed("malformed bearer token") from exc
+        # RFC 9068 access-token JWTs use ``at+jwt``.  Keycloak's default
+        # access and ID tokens both use ``JWT``.  No other presentation type is
+        # accepted, and purpose is then separated by Keycloak's signed claim.
+        allowed_headers = {"JWT", "at+jwt"} if purpose == "access" else {"JWT"}
+        if header.get("alg") != "RS256" or header.get("typ") not in allowed_headers:
+            raise AuthenticationFailed("bearer token failed verification")
+        kid = header.get("kid")
+        if not _valid_kid(kid):
+            raise AuthenticationFailed("bearer token failed verification")
+        claims = self._decode(token, self._candidate_keys(cast(str, kid), deadline=deadline))
+        token_type = claims.get("typ")
+        expected_type = "Bearer" if purpose == "access" else "ID"
+        if not isinstance(token_type, str) or not hmac.compare_digest(token_type, expected_type):
+            raise AuthenticationFailed("bearer token failed verification")
+        if purpose == "id":
+            assert nonce is not None
+            received = claims.get("nonce")
+            if not isinstance(received, str) or not hmac.compare_digest(received, nonce):
+                raise AuthenticationFailed("OIDC nonce is invalid")
+        return claims
 
     @staticmethod
     def _extract_bearer(authorization: str | None) -> str:
@@ -235,6 +389,8 @@ class OidcJwksVerifier:
         scheme, _, token = authorization.partition(" ")
         if scheme.lower() != "bearer" or not token:
             raise AuthenticationFailed("missing bearer token")
+        if len(token.encode("ascii", errors="ignore")) > _MAX_BEARER_BYTES:
+            raise AuthenticationFailed("bearer token is too large")
         return token
 
     def _decode(self, token: str, keys: list[Any]) -> dict[str, Any]:
@@ -254,37 +410,43 @@ class OidcJwksVerifier:
                     algorithms=["RS256"],
                     audience=self._audience,
                     issuer=self._issuer,
-                    options={"require": ["sub", "iss", "aud", "exp"]},
+                    options={"require": ["sub", "iss", "aud", "exp", "iat"]},
                 )
             except PyJWTError:
                 continue
             return dict(claims)
         raise AuthenticationFailed("bearer token failed verification")
 
-    def _candidate_keys(self, kid: object) -> list[Any]:
+    def _candidate_keys(self, kid: str, *, deadline: RemainingBudget | None = None) -> list[Any]:
         """The keys this token may legitimately have been signed by.
 
-        A named `kid` resolves to exactly one key. A token with NO `kid` is
-        checked against every key the IdP currently advertises rather than an
-        arbitrary one: picking `next(iter(cache))` silently rejects valid
-        tokens whenever the IdP publishes more than one key (i.e. throughout
-        every key rotation), and trying all of them is safe because every key
-        in the set is one the configured issuer vouches for.
+        A named ``kid`` resolves to exactly one key.  Strict verification does
+        not try every key when the attacker omits a key id: that turns one
+        malformed token into a bounded-but-avoidable signature work multiplier
+        and accepts an ambiguous issuer key selection policy.
         """
-        if isinstance(kid, str) and kid:
+        _require_remaining(deadline)
+        key = self._jwk_cache.get(kid)
+        if key is None and self._refresh_jwks(deadline=deadline):
             key = self._jwk_cache.get(kid)
-            if key is None and self._refresh_jwks():
-                key = self._jwk_cache.get(kid)
-            return [] if key is None else [key]
-        if not self._jwk_cache:
-            self._refresh_jwks()
-        return list(self._jwk_cache.values())
+        return [] if key is None else [key]
 
-    def _refresh_jwks(self) -> bool:
+    def _refresh_jwks(self, *, deadline: RemainingBudget | None = None) -> bool:
         """Returns True if a fetch actually happened, False if the cooldown
         suppressed it. Raises `AuthenticationFailed` if the fetch itself
         failed — a caller cannot be authenticated without a usable key set."""
-        with self._refresh_lock:
+        if deadline is None:
+            self._refresh_lock.acquire()
+            acquired = True
+        else:
+            remaining_ms = deadline.remaining_ms()
+            if remaining_ms <= 0:
+                raise RequestDeadlineExceeded()
+            acquired = self._refresh_lock.acquire(timeout=remaining_ms / 1000.0)
+            if not acquired:
+                raise RequestDeadlineExceeded()
+        try:
+            _require_remaining(deadline)
             now_ms = self._clock.monotonic_ms()
             if (
                 self._last_refresh_ms is not None
@@ -294,35 +456,112 @@ class OidcJwksVerifier:
             # Stamped BEFORE the fetch, so a hanging or erroring IdP cannot be
             # used to reopen the amplification window on every retry.
             self._last_refresh_ms = now_ms
-            self._jwk_cache = self._fetch_jwks()
+            self._jwk_cache = self._fetch_jwks(deadline=deadline)
             return True
+        finally:
+            if acquired:
+                self._refresh_lock.release()
 
-    def _fetch_jwks(self) -> dict[str, Any]:
+    def _fetch_jwks(self, *, deadline: RemainingBudget | None = None) -> dict[str, Any]:
         try:
-            response = self._http.get(self._jwks_url)
-            response.raise_for_status()
-            document = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
+            _require_remaining(deadline)
+            timeout = _clamp_timeout(self._http.timeout, deadline)
+            with self._http.stream(
+                "GET", self._jwks_url, headers={"Accept": "application/json"}, timeout=timeout
+            ) as response:
+                response.raise_for_status()
+                if response.history:
+                    raise ValueError
+                body = _bounded_sync_body(response, _MAX_JWKS_BYTES, deadline=deadline)
+            _require_remaining(deadline)
+            document = json.loads(body)
+            _require_remaining(deadline)
+        except RequestDeadlineExceeded:
+            raise
+        except httpx.TimeoutException as exc:
+            if deadline is not None and deadline.remaining_ms() <= 0:
+                raise RequestDeadlineExceeded() from exc
+            raise AuthenticationFailed("JWKS document unavailable") from exc
+        except (httpx.HTTPError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
             raise AuthenticationFailed("JWKS document unavailable") from exc
 
         keys = document.get("keys") if isinstance(document, dict) else None
-        if not isinstance(keys, list):
+        if not isinstance(keys, list) or not keys or len(keys) > _MAX_JWKS_KEYS:
             raise AuthenticationFailed("JWKS document malformed")
 
         cache: dict[str, Any] = {}
         for jwk in keys:
+            _require_remaining(deadline)
             if not isinstance(jwk, dict):
-                continue
+                raise AuthenticationFailed("JWKS document malformed")
             kid = jwk.get("kid")
-            if not isinstance(kid, str) or not kid:
+            if not _valid_kid(kid) or kid in cache:
+                raise AuthenticationFailed("JWKS document malformed")
+            kid = cast(str, kid)
+            if (
+                jwk.get("kty") != "RSA"
+                or jwk.get("use") != "sig"
+                or jwk.get("alg") != "RS256"
+                or (
+                    "key_ops" in jwk
+                    and (not isinstance(jwk["key_ops"], list) or jwk["key_ops"] != ["verify"])
+                )
+            ):
                 continue
             try:
-                cache[kid] = RSAAlgorithm.from_jwk(json.dumps(jwk))
-            except (ValueError, TypeError, KeyError):
-                # A malformed individual JWK must not blind the whole set —
-                # skip it and keep the rest usable.
+                key = RSAAlgorithm.from_jwk(json.dumps(jwk))
+            except (ValueError, TypeError, KeyError, jwt.InvalidKeyError):
                 continue
+            if not isinstance(key, rsa.RSAPublicKey) or key.key_size < _MIN_RSA_BITS:
+                continue
+            cache[kid] = key
+        if not cache:
+            raise AuthenticationFailed("JWKS document malformed")
+        _require_remaining(deadline)
         return cache
+
+
+def _require_controlled_https_url(value: object) -> None:
+    if type(value) is not str:
+        raise ValueError("OIDC URL is invalid")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("OIDC URL is invalid")
+
+
+def _valid_kid(value: object) -> bool:
+    return (
+        type(value) is str
+        and 0 < len(value) <= _MAX_KID_CHARS
+        and all(
+            character.isascii() and (character.isalnum() or character in "._-")
+            for character in value
+        )
+    )
+
+
+def _bounded_sync_body(
+    response: httpx.Response, limit: int, *, deadline: RemainingBudget | None = None
+) -> bytes:
+    body = bytearray()
+    chunks = iter(response.iter_bytes())
+    while True:
+        _require_remaining(deadline)
+        try:
+            chunk = next(chunks)
+        except StopIteration:
+            break
+        body.extend(chunk)
+        if len(body) > limit:
+            raise ValueError("response exceeds the configured bound")
+    return bytes(body)
 
 
 class ChainVerifier:
@@ -342,7 +581,13 @@ class ChainVerifier:
         self._api_key = api_key
         self._api_key_mode = api_key_mode
 
-    def authenticate(self, *, authorization: str | None, api_key: str | None) -> Principal:
+    def authenticate(
+        self,
+        *,
+        authorization: str | None,
+        api_key: str | None,
+        deadline: RemainingBudget | None = None,
+    ) -> Principal:
         # Dispatch on the SCHEME, not on the header's mere presence: an empty
         # `Authorization:` header (proxies and some HTTP clients add one) or a
         # non-Bearer scheme would otherwise be routed to OIDC and rejected
@@ -350,9 +595,17 @@ class ChainVerifier:
         # `X-API-Key`. Presence-based dispatch turns a stray header into an
         # outage, not into a security property.
         if self._oidc is not None and _is_bearer(authorization):
-            return self._oidc.authenticate(authorization=authorization, api_key=api_key)
+            if deadline is None:
+                return self._oidc.authenticate(authorization=authorization, api_key=api_key)
+            return self._oidc.authenticate(
+                authorization=authorization, api_key=api_key, deadline=deadline
+            )
         if api_key and self._api_key_mode and self._api_key is not None:
-            return self._api_key.authenticate(authorization=authorization, api_key=api_key)
+            if deadline is None:
+                return self._api_key.authenticate(authorization=authorization, api_key=api_key)
+            return self._api_key.authenticate(
+                authorization=authorization, api_key=api_key, deadline=deadline
+            )
         raise AuthenticationFailed("no credential presented")
 
 

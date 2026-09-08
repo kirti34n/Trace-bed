@@ -14,12 +14,14 @@ split or duplicated. §1 gained a row for this module at integration (C-28).
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator
 
-from tracebed.domain.events import FeedbackEvent, MemoryProposal, TraceEvent
+from tracebed.domain.events import MAX_TRACE_SEQ, FeedbackEvent, MemoryProposal, TraceEvent
+from tracebed.domain.subject_tags import validate_subject_tag
 
 __all__ = [
     "MAX_NAME_CHARS",
@@ -31,6 +33,8 @@ __all__ = [
     "AgentRegisteredOut",
     "ApiKeyPrincipalIn",
     "ConfigOut",
+    "ErasureRequestIn",
+    "ErasureRequestOut",
     "FeedbackIn",
     "InvalidationEventOut",
     "InvalidationIn",
@@ -69,11 +73,9 @@ MAX_NAME_CHARS = 256
 # (C-33): a seq above it is refused by the ingest consumer, so accepting one
 # here means answering 202 "accepted" and dead-lettering the event later, out of
 # the caller's sight. Rejecting at the wire makes it a 422 the caller can act on.
-# The value is mirrored rather than imported because `api` must not depend on
-# `ingest` (§14 keeps the request plane and the consumer plane apart);
-# `tests/phase0/test_integration_seams.py` asserts the two constants agree, so
-# they cannot drift silently.
-MAX_SEQ = 1_000_000
+# The pure event contract owns this shared bound, so `api` and `ingest` agree
+# without introducing an API-to-consumer dependency.
+MAX_SEQ = MAX_TRACE_SEQ
 
 
 # --------------------------------------------------------------------------- #
@@ -94,6 +96,11 @@ class RunCtxIn(BaseModel):
     user_ref: str | None = Field(default=None, max_length=MAX_NAME_CHARS)
     session_id: str | None = Field(default=None, max_length=MAX_NAME_CHARS)
     prefetch_for: str | None = Field(default=None, max_length=MAX_NAME_CHARS)
+
+    @field_validator("user_ref")
+    @classmethod
+    def _user_ref_is_canonical(cls, value: str | None) -> str | None:
+        return None if value is None else validate_subject_tag(value)
 
 
 class RetrieveIn(BaseModel):
@@ -182,6 +189,69 @@ class AcceptedOut(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Erasure request/fence publication.  This surface names a subject only in the
+# request body; scope and every authority fact come from the authenticated
+# access context.  The raw tag is never reflected by the response model.
+# --------------------------------------------------------------------------- #
+
+
+class _SubjectErasureRequestIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: Literal["subject"]
+    subject_tag: StrictStr
+
+    @field_validator("subject_tag")
+    @classmethod
+    def _subject_tag_is_canonical(cls, value: str) -> str:
+        # ``validate_subject_tag`` returns its argument byte-for-byte.  Do not
+        # trim, normalize, case-fold, or include it in the validation error.
+        return validate_subject_tag(value)
+
+
+class _ProjectErasureRequestIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: Literal["project"]
+
+
+ErasureRequestIn = Annotated[
+    _SubjectErasureRequestIn | _ProjectErasureRequestIn,
+    Field(discriminator="scope"),
+]
+
+
+class ErasureRequestOut(BaseModel):
+    """Bounded public state for POST replay and GET status alike.
+
+    In particular this never reports target attribution, the raw tag/digest,
+    actor/session/grant, worker lease/retry state, receipt data, or closure
+    membership/counts.  A replay is intentionally not distinguishable from a
+    first acceptance on the wire.
+    """
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    request_id: UUID
+    scope: Literal["subject", "project"]
+    phase: Literal[
+        "requested",
+        "fenced",
+        "crypto_erased",
+        "primary_purged",
+        "external_purged",
+        "verified",
+        "scope_complete",
+    ]
+    disposition: Literal["active", "retry_wait", "operator_blocked", "scope_complete"]
+    last_code: str | None
+    limitation_codes: tuple[str, ...]
+    requested_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+
+
+# --------------------------------------------------------------------------- #
 # Admin / registry bodies (contract §9.3). These, and ONLY these, may name
 # `project_id` — the admin is naming the project being provisioned, which is
 # the registry write path, not a data route (§14 api-auth DO-NOT list).
@@ -227,9 +297,7 @@ class ApiKeyPrincipalIn(BaseModel):
 # needs no runtime `assert` (which `python -O` strips) to hand a non-None
 # external_ref to the registry. Pydantic tags errors by the `kind` value, so
 # the 422 still names the offending field rather than "no matching variant".
-AgentPrincipalIn = Annotated[
-    OidcPrincipalIn | ApiKeyPrincipalIn, Field(discriminator="kind")
-]
+AgentPrincipalIn = Annotated[OidcPrincipalIn | ApiKeyPrincipalIn, Field(discriminator="kind")]
 
 
 class RegisterAgentIn(BaseModel):
@@ -308,19 +376,12 @@ class ScopeOut(BaseModel):
 
 
 class MemoryListOut(BaseModel):
-    """`GET /admin/memory` — a bounded page of `memory_item` rows.
-
-    `limit` and `returned` are both present on purpose: `returned == limit` is
-    the only signal a caller has that the vault is larger than what it got, and
-    a list route that reported neither would let a dashboard present a truncated
-    count as a total (which is what the export-backed views had to work around).
-    """
+    """`GET /admin/memory` — a tenant- and filter-bound keyset page."""
 
     model_config = ConfigDict(extra="forbid")
 
     items: list[MemoryItemOut]
-    limit: int
-    returned: int
+    next_cursor: str | None
 
 
 class ReviewItemOut(BaseModel):

@@ -1,3 +1,10 @@
+# Historical Phase 0 build plan
+
+> **Archived implementation record; non-normative for current capability, deployment, security,
+> or release status.** It describes a past intended build sequence. For current claims, use
+> [`docs/capabilities.toml`](docs/capabilities.toml) and
+> [`docs/CAPABILITIES.md`](docs/CAPABILITIES.md).
+
 # PHASE-0.md — Trace substrate, isolation, and structural security
 
 Execution order is dependency order; a task may start when its listed dependencies are green. No design decisions remain in this phase — where a choice appears below, it is the decision (cross-referenced to DECISIONS.md). All paths relative to repo root. Python 3.13, package `tracebed`, src layout (`src/tracebed/...`).

@@ -622,41 +622,11 @@ def test_insert_memory_item_is_delegated_to_the_real_repo() -> None:
     assert pool.log == []
 
 
-def test_select_by_subject_tag_binds_the_tag_and_carries_the_project_predicate() -> None:
-    """The one genuinely new statement on this class, and the one whose input is
-    caller-derived: `subject_tag` reaches it from an erasure request."""
+def test_memory_edit_repo_has_no_raw_subject_selector() -> None:
+    """E2 erasure closure is a profiled digest/fence operation, not a repo tag scan."""
     edit, pool, _, _ = _edit_repo([])
-    edit.select_by_subject_tag(PROJECT, "subject-42")
-    assert _GUC_FRAGMENT in pool.log[0][0]
-    sql, params = _memory_statements(pool.log)[0]
-    assert "project_id = %(project_id)s" in sql
-    assert "subject_tag = %(subject_tag)s" in sql
-    assert "subject-42" not in sql, "the tag must be bound, never interpolated"
-    assert params["subject_tag"] == "subject-42"
-    assert params["project_id"] == PROJECT
-
-
-def test_select_by_subject_tag_refuses_a_row_from_another_project() -> None:
-    """This read feeds `EditOps.delete_by_subject`, so a row that crossed the project wall is a
-    memory this caller is about to tombstone and crypto-shred."""
-    from datetime import UTC, datetime
-
-    edit, _, _, _ = _edit_repo(
-        [
-            {
-                "id": MEMORY.value,
-                "project_id": OTHER_PROJECT.value,
-                "status": Status.VALIDATED.value,
-                "trust_tier": "B",
-                "mem_type": "lesson",
-                "provenance": {"class": ProvenanceClass.DISTILLER.value},
-                "status_changed_at": datetime(2026, 7, 27, tzinfo=UTC),
-                "subject_tag": "subject-42",
-            }
-        ]
-    )
-    with pytest.raises(TracebedError, match="invariant 4"):
-        edit.select_by_subject_tag(PROJECT, "subject-42")
+    assert not hasattr(edit, "select_by_subject_tag")
+    assert pool.log == []
 
 
 def test_the_forensics_reads_carry_the_project_predicate_and_the_guc() -> None:

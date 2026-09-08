@@ -15,16 +15,12 @@ independently because this class does not subclass or wrap `Repo`.
 
 CONTRACT GAPS THIS FILE DOES NOT PAPER OVER (read before trusting a wide response):
 
-1. **Q-value trajectory has no history table.** `migrations/0002_partitioned.sql`'s
-   `memory_item` stores `q_value`/`confidence`/`last_scored_at` as CURRENT values only --
-   `workers.contribution_judge`'s own module docstring records that no column exists to persist
-   a scored artifact's `scoring_epoch_id`, and `workers.scorer.QUpdate.epoch_id` is carried only
-   in-memory, never durably. `q_trajectory()` therefore returns exactly one point per scored
-   memory (its current value), and the `scoring_epoch_id` on that point is INFERRED -- the
-   latest `scoring_epoch.started_at` at or before `last_scored_at` -- never read off a stored
-   foreign key, because there is no such column to read. A population of memories, ordered by
-   when each was last scored, is a real (if coarse) trend; it is not a per-memory multi-point
-   trajectory, because the database has never persisted more than one point per memory.
+1. **Q-value trajectory has no history table.** `memory_item` stores
+   `q_value`/`confidence`/`last_scored_at` as CURRENT values only. It does persist the exact
+   scorer-selected `epoch_id`, so `q_trajectory()` reads that stored foreign key rather than
+   inferring an epoch from wall-clock time. It still returns exactly one point per scored memory:
+   a population ordered by when each was last scored is a real (if coarse) trend, not a
+   per-memory multi-point trajectory.
 2. **Consolidation sweeps are not durable anywhere.** `workers.consolidator`/`workers.deltas`
    both document, verbatim, that `DeltaRecord` (one ADD/AMEND/REMOVE per sweep) has no store --
    "no separate snapshot table this chunk owns". `derived_state` (migrations/0001) is the only
@@ -60,6 +56,7 @@ from tracebed.stores.pg.pool import scoped
 __all__ = [
     "MAX_LIFT_OBSERVATIONS",
     "MAX_REPORT_LIMIT",
+    "MAX_REPORT_OFFSET",
     "MAX_STALE_FOR_MATCHING",
     "ConsolidationDiffRow",
     "InjectionFeedRow",
@@ -77,6 +74,10 @@ __all__ = [
 # value is repeated in this module's own docstring-worthy comment rather than assumed identical
 # by name alone).
 MAX_REPORT_LIMIT: Final[int] = 1_000
+# Offset pagination is retained for historical report shapes, but an unbounded
+# offset makes PostgreSQL walk and discard an attacker-selected prefix.  A
+# finite ceiling keeps the legacy routes bounded until they move to keysets.
+MAX_REPORT_OFFSET: Final[int] = 10_000
 
 # Cap on the lift-observation join: a report computes ONE pooled stratified estimate over its
 # whole window, not a day-bucketed sustained check (that is `workers.killswitch`'s job, over its
@@ -97,16 +98,54 @@ MAX_LIFT_OBSERVATIONS: Final[int] = 50_000
 # bounded somewhere too.
 MAX_STALE_FOR_MATCHING: Final[int] = 5_000
 
+# E2 report disclosure predicates.  Runtime reports have no direct ACL on
+# erasure ledgers/fences/sets; the profiled boolean functions retain the same
+# durable predicate while binding every call to the RLS project GUC.  Each
+# helper receives only a fixed SQL alias selected in this module.
+_ERASURE_PROJECT_TEMPLATE: Final[str] = """
+AND public.tracebed_runtime_project_readable(@TABLE@project_id)
+""".strip()
+
+_ERASURE_RUN_TEMPLATE: Final[str] = """
+AND public.tracebed_runtime_run_visible(@TABLE@project_id, @TABLE@run_id)
+""".strip()
+
+_ERASURE_MEMORY_TEMPLATE: Final[str] = """
+AND public.tracebed_runtime_memory_visible(@TABLE@project_id, @TABLE@id)
+""".strip()
+
+_ERASURE_INVALIDATION_TEMPLATE: Final[str] = """
+AND public.tracebed_runtime_subjects_visible(
+    @TABLE@project_id, @TABLE@subject_digests
+)
+""".strip()
+
+
+def _erasure_project_readable(table_alias: str) -> str:
+    return _ERASURE_PROJECT_TEMPLATE.replace("@TABLE@", table_alias)
+
+
+def _erasure_run_visible(table_alias: str) -> str:
+    return _ERASURE_RUN_TEMPLATE.replace("@TABLE@", table_alias)
+
+
+def _erasure_memory_visible(table_alias: str) -> str:
+    return _ERASURE_MEMORY_TEMPLATE.replace("@TABLE@", table_alias)
+
+
+def _erasure_invalidation_visible(table_alias: str) -> str:
+    return _ERASURE_INVALIDATION_TEMPLATE.replace("@TABLE@", table_alias)
+
 
 def _bounded(limit: int, offset: int) -> tuple[int, int]:
-    """Clamp caller-supplied paging into `[1, MAX_REPORT_LIMIT]` / `[0, inf)`.
+    """Clamp caller-supplied paging into finite report bounds.
 
     Callers here are always FastAPI `Query(ge=..., le=...)` parameters (already bounded at the
     wire, `api/reports.py`), so this is defence in depth, not the primary control -- the same
     layering `stores.pg.repo._bounded_limit` documents for `MAX_ROW_LIMIT`.
     """
     lim = max(1, min(limit, MAX_REPORT_LIMIT))
-    off = max(0, offset)
+    off = max(0, min(offset, MAX_REPORT_OFFSET))
     return lim, off
 
 
@@ -137,8 +176,7 @@ class LiftRunObservationRow:
 
 @dataclass(frozen=True, slots=True)
 class QTrajectoryPointRow:
-    """One point of the Q-value trajectory (module docstring, gap 1). `scoring_epoch_id` is
-    the newest `scoring_epoch.started_at <= observed_at` -- an inference, never a stored FK."""
+    """One point of the Q-value trajectory with its stored scorer epoch."""
 
     memory_id: MemoryId
     agent_type_id: AgentTypeId
@@ -261,11 +299,13 @@ class ReportsRepo:
             conn.cursor(row_factory=dict_row) as cur,
         ):
             cur.execute(
-                """
+                (
+                    """
                 WITH run_outcomes AS (
                     SELECT run_id, AVG(r)::double precision AS outcome_r
                     FROM outcome_event
                     WHERE project_id = %(project_id)s
+                    @OUTCOME_FENCE@
                     GROUP BY run_id
                 ),
                 run_mem_types AS (
@@ -274,6 +314,8 @@ class ReportsRepo:
                     JOIN memory_item mi
                         ON mi.project_id = ij.project_id AND mi.id = ij.memory_id
                     WHERE ij.project_id = %(project_id)s
+                    @INJECTION_FENCE@
+                    @MEMORY_FENCE@
                 )
                 SELECT
                     ti.run_id AS run_id,
@@ -298,9 +340,14 @@ class ReportsRepo:
                 WHERE ti.project_id = %(project_id)s
                   AND re.project_id = %(project_id)s
                   AND ti.started_at >= %(since)s
+                  @TRACE_FENCE@
                 ORDER BY ti.started_at ASC, ti.run_id ASC, rmt.mem_type ASC NULLS LAST
                 LIMIT %(limit)s
-                """,
+                    """.replace("@OUTCOME_FENCE@", _erasure_run_visible("outcome_event."))
+                    .replace("@INJECTION_FENCE@", _erasure_run_visible("ij."))
+                    .replace("@MEMORY_FENCE@", _erasure_memory_visible("mi."))
+                    .replace("@TRACE_FENCE@", _erasure_run_visible("ti."))
+                ),
                 {"project_id": project_id, "since": since, "limit": lim},
             )
             rows = cur.fetchall()
@@ -342,7 +389,8 @@ class ReportsRepo:
             conn.cursor(row_factory=dict_row) as cur,
         ):
             cur.execute(
-                """
+                (
+                    """
                 SELECT
                     mi.id AS memory_id,
                     mi.scope_id AS agent_type_id,
@@ -351,21 +399,17 @@ class ReportsRepo:
                     mi.confidence AS confidence,
                     mi.scored_use_count AS scored_use_count,
                     mi.last_scored_at AS observed_at,
-                    (
-                        SELECT se.epoch_id
-                        FROM scoring_epoch se
-                        WHERE se.started_at <= mi.last_scored_at
-                        ORDER BY se.started_at DESC
-                        LIMIT 1
-                    ) AS scoring_epoch_id
+                    mi.epoch_id AS scoring_epoch_id
                 FROM memory_item mi
                 WHERE mi.project_id = %(project_id)s
                   AND mi.scope_type = 'agent_type'
                   AND mi.scope_id IS NOT NULL
                   AND mi.last_scored_at IS NOT NULL
+                  @MEMORY_FENCE@
                 ORDER BY mi.last_scored_at ASC, mi.id ASC
                 LIMIT %(limit)s OFFSET %(offset)s
-                """,
+                    """.replace("@MEMORY_FENCE@", _erasure_memory_visible("mi."))
+                ),
                 {"project_id": project_id, "limit": lim, "offset": off},
             )
             rows = cur.fetchall()
@@ -397,13 +441,18 @@ class ReportsRepo:
             conn.cursor(row_factory=dict_row) as cur,
         ):
             cur.execute(
-                """
+                (
+                    """
                 SELECT event_id, event_type, selector, fired_at
                 FROM invalidation_event
                 WHERE project_id = %(project_id)s
+                @INVALIDATION_FENCE@
                 ORDER BY fired_at DESC, event_id DESC
                 LIMIT %(limit)s OFFSET %(offset)s
-                """,
+                    """.replace(
+                        "@INVALIDATION_FENCE@", _erasure_invalidation_visible("invalidation_event.")
+                    )
+                ),
                 {"project_id": project_id, "limit": lim, "offset": off},
             )
             rows = cur.fetchall()
@@ -430,14 +479,17 @@ class ReportsRepo:
             conn.cursor(row_factory=dict_row) as cur,
         ):
             cur.execute(
-                """
+                (
+                    """
                 SELECT id AS memory_id, mem_type, strike_count, status_changed_at,
                        last_revalidated_at, provenance
                 FROM memory_item
                 WHERE project_id = %(project_id)s AND status = 'stale'
+                @MEMORY_FENCE@
                 ORDER BY status_changed_at DESC NULLS LAST, id ASC
                 LIMIT %(limit)s
-                """,
+                    """.replace("@MEMORY_FENCE@", _erasure_memory_visible("memory_item."))
+                ),
                 {"project_id": project_id, "limit": lim},
             )
             rows = cur.fetchall()
@@ -473,7 +525,8 @@ class ReportsRepo:
             conn.cursor(row_factory=dict_row) as cur,
         ):
             cur.execute(
-                """
+                (
+                    """
                 SELECT id AS memory_id, mem_type,
                        COALESCE(last_retrieved_at, created_at) AS reference_at,
                        last_revalidated_at
@@ -481,10 +534,17 @@ class ReportsRepo:
                 WHERE project_id = %(project_id)s
                   AND status = 'validated'
                   AND COALESCE(last_retrieved_at, created_at) <= %(threshold_at)s
+                  @MEMORY_FENCE@
                 ORDER BY COALESCE(last_retrieved_at, created_at) ASC, id ASC
                 LIMIT %(limit)s OFFSET %(offset)s
-                """,
-                {"project_id": project_id, "threshold_at": threshold_at, "limit": lim, "offset": off},
+                    """.replace("@MEMORY_FENCE@", _erasure_memory_visible("memory_item."))
+                ),
+                {
+                    "project_id": project_id,
+                    "threshold_at": threshold_at,
+                    "limit": lim,
+                    "offset": off,
+                },
             )
             rows = cur.fetchall()
         results: list[RevalidationCandidateRow] = []
@@ -515,13 +575,16 @@ class ReportsRepo:
             conn.cursor(row_factory=dict_row) as cur,
         ):
             cur.execute(
-                """
+                (
+                    """
                 SELECT agent_type_id, key, version, value, delta_pct, clamped, computed_at
                 FROM derived_state
                 WHERE project_id = %(project_id)s
+                @DERIVED_FENCE@
                 ORDER BY computed_at DESC, agent_type_id ASC, key ASC, version DESC
                 LIMIT %(limit)s OFFSET %(offset)s
-                """,
+                    """.replace("@DERIVED_FENCE@", _erasure_project_readable("derived_state."))
+                ),
                 {"project_id": project_id, "limit": lim, "offset": off},
             )
             rows = cur.fetchall()
@@ -551,13 +614,24 @@ class ReportsRepo:
             conn.cursor(row_factory=dict_row) as cur,
         ):
             cur.execute(
-                """
+                (
+                    """
                 SELECT run_id, memory_id, slot, score, tokens, injected_at
                 FROM injection_log
                 WHERE project_id = %(project_id)s
+                @INJECTION_FENCE@
+                AND EXISTS (
+                    SELECT 1 FROM memory_item AS memory_item
+                    WHERE memory_item.project_id = injection_log.project_id
+                      AND memory_item.id = injection_log.memory_id
+                      @MEMORY_FENCE@
+                )
                 ORDER BY injected_at DESC, run_id ASC, memory_id ASC
                 LIMIT %(limit)s OFFSET %(offset)s
-                """,
+                    """.replace(
+                        "@INJECTION_FENCE@", _erasure_run_visible("injection_log.")
+                    ).replace("@MEMORY_FENCE@", _erasure_memory_visible("memory_item."))
+                ),
                 {"project_id": project_id, "limit": lim, "offset": off},
             )
             rows = cur.fetchall()
@@ -572,4 +646,3 @@ class ReportsRepo:
             )
             for row in rows
         ]
-

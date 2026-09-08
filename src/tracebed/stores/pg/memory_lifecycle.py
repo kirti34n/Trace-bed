@@ -78,6 +78,11 @@ SELECT id, project_id, status, trust_tier, mem_type, provenance,
        status_changed_at, strike_count, last_retrieved_at, created_at, q_value
 FROM memory_item
 WHERE project_id = %(project_id)s
+  -- E2 disclosure/write boundary: lifecycle workers must never select a
+  -- fenced memory for a later transition.  ``persist`` repeats these
+  -- predicates in its actual UPDATE, so a request that commits after this
+  -- read still wins without a stale worker write.
+  AND public.tracebed_runtime_memory_visible(memory_item.project_id, memory_item.id)
   AND (
       provenance->'tool_refs' ?| %(tool_refs)s::text[]
       OR provenance->'trace_ids' ?| %(trace_ids)s::text[]
@@ -93,6 +98,7 @@ SELECT id, project_id, status, trust_tier, mem_type, provenance,
        status_changed_at, strike_count, last_retrieved_at, created_at, q_value
 FROM memory_item
 WHERE project_id = %(project_id)s AND status = ANY(%(statuses)s)
+  AND public.tracebed_runtime_memory_visible(memory_item.project_id, memory_item.id)
 ORDER BY id
 LIMIT %(limit)s
 """.strip()
@@ -106,6 +112,7 @@ FROM memory_item
 WHERE project_id = %(project_id)s
   AND status = %(validated)s
   AND COALESCE(last_retrieved_at, created_at) <= %(older_than)s
+  AND public.tracebed_runtime_memory_visible(memory_item.project_id, memory_item.id)
 ORDER BY id
 LIMIT %(limit)s
 """.strip()
@@ -129,6 +136,10 @@ UPDATE memory_item
  WHERE project_id = %(project_id)s
    AND id = %(memory_id)s
    AND status = %(expected_from)s
+   -- Recheck at the actual write boundary.  A caller can hold a shared
+   -- ActivityGate for the usual case, but this is the durable proof after it
+   -- releases and protects a direct lifecycle-store invocation as well.
+   AND public.tracebed_runtime_memory_visible(memory_item.project_id, memory_item.id)
 """.strip()
 
 

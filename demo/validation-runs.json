@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "mode": "local_demo",
+  "title": "Tracebed validation evidence",
+  "provenance": "Imported after execution for the local demo. These are evidence labels, not native agent telemetry.",
+  "runs": [
+    {"run_id": "969d57a1-0e2e-55cc-bd77-db46dc0eb14c", "label": "Python repository suite", "status": "passed", "facts": "5,230 passed; 311 skipped."},
+    {"run_id": "43df23df-8b88-5b7d-8471-b8d5db4f6794", "label": "Dashboard suite", "status": "passed", "facts": "45 tests passed; lint, build, and license checks passed."},
+    {"run_id": "c8c17816-5d18-5f2e-be38-28793f32a53b", "label": "Compose acceptance", "status": "passed", "facts": "Full Compose acceptance passed with zero residue."},
+    {"run_id": "f080e6cb-0e4f-56d0-a85f-380d0779e7ad", "label": "Candidate release/source audit", "status": "passed", "facts": "Release audit passed; image scan reported 4 Medium, 0 High, 0 Critical."},
+    {"run_id": "73ae429c-ec32-5eee-bbb6-3815d8e4bc05", "label": "Live browser and health verification", "status": "passed", "facts": "Browser UI and all declared service health checks verified."}
+  ]
+}

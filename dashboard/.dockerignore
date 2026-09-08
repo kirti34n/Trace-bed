@@ -1,0 +1,16 @@
+# Dashboard builds do not need Python, test, local-editor, or runtime secrets.
+.git/
+.github/
+.claude/
+.serena/
+.tracebed-demo/
+output/
+.playwright-cli/
+graphify-out/
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+*.log
+*.tsbuildinfo

@@ -77,7 +77,9 @@ def _cfg(
     *, total_budget_ms: int = 300, embed_timeout_ms: int = 200, holdout_pct: float = 0.0
 ) -> EffectiveConfig:
     return EffectiveConfig(
-        retrieval=RetrievalConfig(total_budget_ms=total_budget_ms, embed_timeout_ms=embed_timeout_ms),
+        retrieval=RetrievalConfig(
+            total_budget_ms=total_budget_ms, embed_timeout_ms=embed_timeout_ms
+        ),
         abstention=AbstentionConfig(),
         score=ScoreConfig(),
         budget=BudgetConfig(),
@@ -200,7 +202,7 @@ class _FakeRetriever:
         self.received_cfg: RetrievalConfig | None = None
 
     def retrieve(
-        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig
+        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig, deadline: object
     ) -> _Outcome:
         self.calls += 1
         self.received_cfg = cfg
@@ -252,6 +254,7 @@ class _FakeAssembly:
         query_text: str,
         candidates: Sequence[FusedCandidate],
         cfg: EffectiveConfig,
+        deadline: object,
     ) -> CandidateSetResult:
         self.calls += 1
         self.received_cfg = cfg
@@ -318,9 +321,7 @@ def test_happy_path_injected_no_exceptions() -> None:
     retriever = _FakeRetriever(clock)
     pipeline, telemetry, assembly, _ = _pipeline(clock, retriever=retriever)
 
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="what happened"), session_id="s-1"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="what happened"), session_id="s-1")
 
     assert result.outcome_code is OutcomeCode.INJECTED
     assert result.context_block.slots  # rendered from the fake assembly's slots
@@ -339,9 +340,7 @@ def test_failing_retriever_returns_store_error_and_nothing() -> None:
     retriever = _FakeRetriever(clock, raises=True)
     pipeline, telemetry, assembly, _ = _pipeline(clock, retriever=retriever)
 
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="q"), session_id="s-2"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s-2")
 
     assert result.outcome_code is OutcomeCode.STORE_ERROR
     assert result.context_block.slots == []
@@ -356,9 +355,7 @@ def test_failing_assembly_also_returns_store_error() -> None:
     assembly = _FakeAssembly(raises=True)
     pipeline, _, _, _ = _pipeline(clock, assembly=assembly)
 
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="q"), session_id="s-2b"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s-2b")
 
     assert result.outcome_code is OutcomeCode.STORE_ERROR
     assert result.context_block.slots == []
@@ -370,9 +367,7 @@ def test_config_resolution_failure_also_returns_store_error() -> None:
     config = _FakeConfigProvider(raises=True)
     pipeline, telemetry, _, retriever = _pipeline(clock, config=config)
 
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="q"), session_id="s-3"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s-3")
 
     assert result.outcome_code is OutcomeCode.STORE_ERROR
     assert result.arm is Arm.MEMORY_ON  # safe default; holdout never even ran
@@ -393,9 +388,7 @@ def test_degraded_retriever_reports_degraded_lexical() -> None:
     assembly = _FakeAssembly(outcome_code=OutcomeCode.INJECTED)
     pipeline, telemetry, _, _ = _pipeline(clock, retriever=retriever, assembly=assembly)
 
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="q"), session_id="s-4"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s-4")
 
     assert result.outcome_code is OutcomeCode.DEGRADED_LEXICAL
     assert retriever.calls == 1
@@ -412,9 +405,7 @@ def test_embed_degradation_that_also_blows_total_budget_reports_timeout_not_degr
     assembly = _FakeAssembly()
     pipeline, telemetry, _, _ = _pipeline(clock, retriever=retriever, assembly=assembly)
 
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="q"), session_id="s-5"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s-5")
 
     assert result.outcome_code is OutcomeCode.TIMEOUT_PREFIX_ONLY
     assert assembly.calls == 0  # never reached: budget was already blown
@@ -434,9 +425,7 @@ def test_total_stall_returns_timeout_prefix_only_before_assembly() -> None:
     assembly = _FakeAssembly()
     pipeline, telemetry, _, _ = _pipeline(clock, retriever=retriever, assembly=assembly)
 
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="q"), session_id="s-6"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s-6")
 
     assert result.outcome_code is OutcomeCode.TIMEOUT_PREFIX_ONLY
     assert result.context_block.slots == []  # no static-prefix port wired in this build
@@ -448,7 +437,9 @@ def test_total_stall_returns_timeout_prefix_only_before_assembly() -> None:
 def test_total_stall_uses_injected_static_prefix_when_available() -> None:
     clock = FakeClock()
     retriever = _FakeRetriever(clock, stall_ms=350.0)
-    prefix_block = ContextBlock(slots=[], rendered="MEMORY (recalled data, verify against current state)")
+    prefix_block = ContextBlock(
+        slots=[], rendered="MEMORY (recalled data, verify against current state)"
+    )
 
     class _Prefix:
         def get(self, scope: ProjectScope) -> ContextBlock:
@@ -464,9 +455,7 @@ def test_total_stall_uses_injected_static_prefix_when_available() -> None:
         holdout_salt="test-salt",
     )
 
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="q"), session_id="s-7"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s-7")
 
     assert result.outcome_code is OutcomeCode.TIMEOUT_PREFIX_ONLY
     assert result.context_block is prefix_block
@@ -490,9 +479,7 @@ def test_total_stall_with_failing_static_prefix_still_degrades_cleanly() -> None
         holdout_salt="test-salt",
     )
 
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="q"), session_id="s-8"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s-8")
 
     assert result.outcome_code is OutcomeCode.TIMEOUT_PREFIX_ONLY
     assert result.context_block.slots == []
@@ -510,9 +497,7 @@ def test_failing_telemetry_writer_never_propagates() -> None:
     retriever = _FakeRetriever(clock)  # succeeds, so this is a genuine non-degraded run
     pipeline, _, _, _ = _pipeline(clock, telemetry=telemetry, retriever=retriever)
 
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="q"), session_id="s-9"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s-9")
 
     # The retrieval itself succeeded; only the recording of it failed.
     assert result.outcome_code is OutcomeCode.INJECTED
@@ -527,9 +512,7 @@ def test_failing_telemetry_writer_during_a_degraded_outcome_never_propagates() -
     retriever = _FakeRetriever(clock, raises=True)
     pipeline, _, _, _ = _pipeline(clock, telemetry=telemetry, retriever=retriever)
 
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="q"), session_id="s-10"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s-10")
 
     assert result.outcome_code is OutcomeCode.STORE_ERROR
     assert len(telemetry.calls) == 1
@@ -893,9 +876,7 @@ def test_real_time_wall_clock_path_completes_fast() -> None:
     )
 
     start = clock.monotonic_ms()
-    result = pipeline.retrieve(
-        _scope(), RunContext(query_text="q"), session_id="s-12"
-    )
+    result = pipeline.retrieve(_scope(), RunContext(query_text="q"), session_id="s-12")
     elapsed = clock.monotonic_ms() - start
 
     assert result.outcome_code is OutcomeCode.INJECTED
@@ -907,7 +888,7 @@ class _FakeRetriever_RealTime:
     """Instant success against a real `SystemClock` — no stalling."""
 
     def retrieve(
-        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig
+        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig, deadline: object
     ) -> _Outcome:
         return _Outcome()
 

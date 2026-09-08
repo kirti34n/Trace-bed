@@ -1,3 +1,11 @@
+# Historical Phase 0 build contract
+
+> **Archived implementation record; non-normative for current capability, deployment, security,
+> or release status.** This file records a past parallel-build contract and may describe intended
+> behavior that has not been independently established in a deployed environment. For current
+> claims, use [`capabilities.toml`](capabilities.toml) and
+> [`CAPABILITIES.md`](CAPABILITIES.md).
+
 # PHASE0-CONTRACT.md — the binding cross-module contract
 
 Eight coders build Phase 0 in parallel without seeing each other's work. This document is the
@@ -809,8 +817,8 @@ class Repo:
     def find_runs_missing_sentinel(self, project_id: ProjectId,
                                    older_than: datetime) -> list[RunId]: ...
     def mark_run_incomplete(self, project_id: ProjectId, run_id: RunId) -> None: ...
-    def append_trace_subject(self, project_id: ProjectId, run_id: RunId,
-                             subject_tags: Sequence[str]) -> None: ...   # idempotent (PK upsert)
+    # E2 has no raw trace-subject append. Typed ingress uses the authenticated
+    # authority routine to derive and bind canonical digests atomically.
 
     # -- outcomes
     def insert_outcome_event(self, project_id: ProjectId, row: OutcomeEventInsert) -> bool: ...
@@ -828,8 +836,8 @@ class Repo:
     def get_subject_key(self, project_id: ProjectId, subject_tag: str) -> SubjectKeyRow | None: ...
     def insert_subject_key(self, project_id: ProjectId, subject_tag: str,
                            key_id: UUID, wrapped_kek: bytes) -> None: ...
-    def destroy_subject_key(self, project_id: ProjectId, subject_tag: str) -> bool: ...
-        # sets destroyed_at = clock.now(), overwrites wrapped_kek with b"" ; False if absent
+    # E2 deliberately exposes no destruction operation here.  A future
+    # authenticated saga owns its private key-execution seam.
 
     # -- review queue + config store (satisfies ConfigStorePort structurally)
     def insert_review_item(self, project_id: ProjectId, reason: str,
@@ -1002,7 +1010,7 @@ class SubjectKeyStore(Protocol):                # Repo satisfies structurally; f
     def get_subject_key(self, project_id: ProjectId, subject_tag: str) -> SubjectKeyRow | None: ...
     def insert_subject_key(self, project_id: ProjectId, subject_tag: str,
                            key_id: UUID, wrapped_kek: bytes) -> None: ...
-    def destroy_subject_key(self, project_id: ProjectId, subject_tag: str) -> bool: ...
+    # No public destruction operation; E2 is request/fence only.
 
 @dataclass(frozen=True, slots=True)
 class PlainSection:
@@ -1027,7 +1035,7 @@ class SubjectKeyManager:
     def __init__(self, store: SubjectKeyStore, master: MasterKeyProvider, clock: Clock) -> None: ...
     def ensure_project_kek(self, project_id: ProjectId) -> None: ...
     def get_or_create_subject_kek(self, project_id: ProjectId, subject_tag: str) -> bytes: ...
-    def destroy_subject(self, project_id: ProjectId, subject_tag: str) -> bool: ...
+    # No public erasure executor in E2.
     def encrypt(self, project_id: ProjectId, run_id: RunId,
                 sections: Sequence[PlainSection]) -> EncryptedPayload: ...
     def decrypt(self, project_id: ProjectId,
@@ -1339,7 +1347,7 @@ class TraceWriter:
         """Claim -> group by (project_id, run_id) -> order by seq, drop exact (run_id, seq)
         duplicates (idempotency) -> build PlainSections (section boundary: consecutive events
         with the same subject_tags set, C-24) -> keys.encrypt -> EncryptedPayload.to_bytes ->
-        store.put -> repo.tx(project_id): upsert_trace_index + append_trace_subject.
+        store.put -> authority-bound transaction: upsert_trace_index + canonical digest bind.
         run_start populates started_at, input_signature_hash (§3.8 from C-05 payload keys,
         ABSENT_SIGNATURE if the run never had a run_start), arm, submitter_principal (from the
         envelope), instrumentation_source=SDK. run_end sets ended_at + outcome_status.
@@ -1605,10 +1613,10 @@ modules still disagreed. The originals are preserved above; these amend them.
   a route.
 - **C-31** `POST /v1/invalidation` persists. PLAN.md §3 lists the route and PLAN.md §5 defines
   `invalidation_event`; §9.3's route table does neither, and the route shipped returning 202
-  "accepted" while discarding the body. Now `Repo.insert_invalidation_event(project_id,
-  event_type, selector)` — a synchronous scoped insert, not a queue write, because §14 forbids
-  a fourth topic and §14's "do NOT write synchronously" names trace/outcome rows specifically.
-  `event_id` is server-generated, per the column's own DDL comment.
+  "accepted" while discarding the body. Now the authority-gated invalidation writer calls the
+  API-only database admission routine — a synchronous scoped insert, not a queue write, because
+  §14 forbids a fourth topic and §14's "do NOT write synchronously" names trace/outcome rows
+  specifically. `event_id` is server-generated, per the column's own DDL comment.
 - **C-32** `ScopedRepo.get_trace_index(run_id, *, for_update=False)`; `ingest.trace_writer`
   always passes `True`. `_TRACE_INDEX_UPSERT_SQL` replaces `path` wholesale (jsonb cannot be
   per-key merged by ON CONFLICT), so two workers holding different batches of one run each read

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling==1.29.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -10,6 +10,17 @@ readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Tracebed" }]
+urls = { Homepage = "https://github.com/kirti34n/Trace-bed", Repository = "https://github.com/kirti34n/Trace-bed", Documentation = "https://github.com/kirti34n/Trace-bed/tree/main/docs", Changelog = "https://github.com/kirti34n/Trace-bed/blob/main/CHANGELOG.md", Issues = "https://github.com/kirti34n/Trace-bed/issues" }
+keywords = ["agents", "execution-traces", "memory", "project-isolation"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
 
 # Every runtime dependency must clear scripts/license_policy.toml.
 # psycopg is LGPL-3.0-only and is allowed only via the `lgpl_rationale` table there.
@@ -19,7 +30,7 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     "psycopg[binary,pool]>=3.2",
-    "yoyo-migrations>=9.0",
+    "yoyo-migrations==9.0.0",
     "valkey>=6.0",
     "httpx>=0.28",
     "cryptography>=44.0",
@@ -29,19 +40,59 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "hatchling==1.29.0",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "mypy>=1.14",
+    "pip==26.2",
     "ruff>=0.9",
     "types-pyyaml",
+    "PyYAML==6.0.3",
 ]
 
 [project.scripts]
 tracebed-api = "tracebed.api.main:run"
+tracebed-edge = "tracebed.edge.main:run"
+tracebed-local-demo-edge = "tracebed.edge.local_demo:run"
+tracebed-local-demo-provision = "tracebed.local_demo_provision:owner_main"
+tracebed-local-demo-seed = "tracebed.local_demo_provision:seed_main"
+tracebed-db-bootstrap = "tracebed.stores.pg.bootstrap:main"
+tracebed-s3-init = "tracebed.stores.tracestore.provision:main"
 tracebed-worker = "tracebed.workers.runner:run"
+tracebed-onboard-agent = "tracebed.stores.pg.onboarding:main"
+tracebed-compose-api = "tracebed.compose_runtime:api_main"
+tracebed-compose-api-ready = "tracebed.compose_runtime:api_ready_main"
+tracebed-compose-api-health = "tracebed.compose_runtime:api_health_main"
+tracebed-compose-api-prepublication-ready = "tracebed.compose_runtime:api_prepublication_ready_main"
+tracebed-compose-bootstrap = "tracebed.compose_runtime:bootstrap_main"
+tracebed-compose-onboard = "tracebed.compose_runtime:onboarding_main"
+tracebed-compose-s3-init = "tracebed.compose_runtime:s3_init_main"
+tracebed-compose-worker = "tracebed.compose_runtime:worker_main"
+tracebed-compose-worker-drain = "tracebed.compose_runtime:worker_drain_main"
+tracebed-compose-worker-ready = "tracebed.compose_runtime:worker_ready_main"
+tracebed-compose-worker-prepublication-ready = "tracebed.compose_runtime:worker_prepublication_ready_main"
+tracebed-compose-erasure = "tracebed.compose_runtime:erasure_main"
+tracebed-compose-erasure-once = "tracebed.compose_runtime:erasure_once_main"
+tracebed-compose-erasure-resume = "tracebed.compose_runtime:erasure_resume_main"
+tracebed-compose-erasure-ready = "tracebed.compose_runtime:erasure_ready_main"
+tracebed-compose-erasure-prepublication-ready = "tracebed.compose_runtime:erasure_prepublication_ready_main"
+tracebed-api-ready = "tracebed.runtime_ready:api_main"
+tracebed-worker-ready = "tracebed.workers.ready:main"
+tracebed-worker-drain = "tracebed.workers.drain:main"
+tracebed-erasure-worker = "tracebed.erasure.runner:run"
+tracebed-erasure-once = "tracebed.erasure.cli:once_main"
+tracebed-erasure-status = "tracebed.erasure.cli:status_main"
+tracebed-erasure-resume = "tracebed.erasure.cli:resume_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tracebed"]
+
+# SQL migrations are runtime assets.  Hatch copies them into the installed
+# package so the migration runner works from a wheel, while source checkouts
+# continue to use the top-level directory as a fallback.
+[tool.hatch.build.targets.wheel.force-include]
+"migrations" = "tracebed/_migrations"
+"demo" = "tracebed/_demo"
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "harness"]

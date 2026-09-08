@@ -4,14 +4,15 @@ Four extractors turn structural facts already present in a run's trace events
 into Tier A candidate memories: repeated tool errors, output-schema
 violations, per-tool latency outliers, and recurring call sequences that
 precede a failure. Every one of them emits `TierANote`s only (template +
-closed-vocabulary enum, D-019) and runs `core.scans.scan` before anything
-reaches `state_machine.apply` -- see `base.py` for the shared emission path.
+closed-vocabulary enum, D-019). `TierALane` owns scanning, state
+construction, and shared cap enforcement after the extractors return their
+pure proposals.
 
 Two cross-cutting behaviours all four share, both documented in `base.py`:
 every tool identity that reaches a note must have been declared in the run's
 own `run_start` `tool_manifest` (`require_declared_tools`, default True), and
-all four accept a shared `cap_tracker` so one `tier_a.candidate_cap_per_run`
-budget can span the whole Tier A lane for a run rather than one per extractor.
+the lane applies one `tier_a.candidate_cap_per_run` budget across all four
+extractors rather than one budget per extractor.
 """
 
 from __future__ import annotations
@@ -19,15 +20,16 @@ from __future__ import annotations
 from tracebed.workers.extractors.base import (
     IDENTIFIER_RE,
     MAX_DURATION_MS,
+    TIER_A_KIND_MEM_TYPES,
     CandidateCapTracker,
     ExtractionOutcome,
     Extractor,
-    MemoryWriterPort,
+    TierACandidateProposal,
     ToolEventRecord,
-    emit_candidate,
+    build_candidate_item,
+    estimate_tier_a_token_count,
     mean_duration_ms,
     read_tool_events,
-    resolve_cap_tracker,
     structural_hash,
     try_build_note,
 )
@@ -39,19 +41,20 @@ from tracebed.workers.extractors.tool_failure import ToolFailureExtractor
 __all__ = [
     "IDENTIFIER_RE",
     "MAX_DURATION_MS",
+    "TIER_A_KIND_MEM_TYPES",
     "CandidateCapTracker",
     "ExtractionOutcome",
     "Extractor",
     "LatencyOutlierExtractor",
-    "MemoryWriterPort",
     "SchemaFailureExtractor",
     "SequencePatternExtractor",
+    "TierACandidateProposal",
     "ToolEventRecord",
     "ToolFailureExtractor",
-    "emit_candidate",
+    "build_candidate_item",
+    "estimate_tier_a_token_count",
     "mean_duration_ms",
     "read_tool_events",
-    "resolve_cap_tracker",
     "structural_hash",
     "try_build_note",
 ]

@@ -117,7 +117,9 @@ def test_generic_common_terms_probes_abstain_on_rarity_not_cold_start() -> None:
         if probe.probe_class != ProbeClass.GENERIC_COMMON_TERMS:
             continue
         for candidate in probe.candidates:
-            assert candidate.signals.rarity.corpus_doc_count >= cfg_abstention.rarity_min_corpus_docs
+            assert (
+                candidate.signals.rarity.corpus_doc_count >= cfg_abstention.rarity_min_corpus_docs
+            )
         result = run_probe(probe)
         assert result.outcome_code is OutcomeCode.ABSTAINED_RARITY, probe.name
 
@@ -151,6 +153,7 @@ def test_every_probe_never_injects_through_the_real_pipeline() -> None:
     for probe in build_probes():
         result = run_probe_through_pipeline(probe)
         assert result.outcome_code is not OutcomeCode.INJECTED, probe.name
+        assert result.outcome_code is run_probe(probe).outcome_code, probe.name
         assert list(result.context_block.slots) == []
         assert result.context_block.rendered == ""
 

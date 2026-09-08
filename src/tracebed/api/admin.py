@@ -1,34 +1,28 @@
-"""`/admin/*` and `/export/project` (PHASE0-CONTRACT.md §9.3).
-
-Two different auth planes on purpose (C-02/C-20):
-
-- `POST /admin/projects` and `POST /admin/agents/register` are the registry
-  WRITE path — they authenticate with the static bootstrap `X-Admin-Key`
-  (`api.deps.require_admin_key`) because no `agent_registration` row can
-  exist yet for the caller they are about to create one for.
-- `GET /admin/memory/{memory_id}` and `GET /export/project` are ordinary
-  project-scoped READS — they authenticate like every `/v1/*` route
-  (`api.deps.get_scope`) and are therefore automatically confined to the
-  caller's own project by the same `ProjectScope` mechanism, which is why
-  leak-suite probe 3 (cross-project admin read) gets the uniform 404, not a
-  privileged bypass.
-"""
+"""Authority-gated project-admin read routes and project export."""
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
-import secrets
 from collections.abc import Iterator
-from datetime import timedelta
-from typing import Annotated, Any, Literal
+from datetime import UTC, datetime, timedelta
+from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from tracebed.api.deps import AppDeps, AppDepsDep, ControlPlaneReadPort, ScopeDep, require_admin_key
+from tracebed.api.deps import (
+    AdminReadDep,
+    AnyRoleDep,
+    AppDeps,
+    AppDepsDep,
+    ControlPlaneReadPort,
+    ExportDep,
+)
 from tracebed.api.models import (
-    AgentRegisteredOut,
     ConfigOut,
     InvalidationEventOut,
     InvalidationListOut,
@@ -36,19 +30,15 @@ from tracebed.api.models import (
     KillswitchStateOut,
     MemoryItemOut,
     MemoryListOut,
-    OidcPrincipalIn,
-    ProjectCreatedOut,
-    ProjectCreateIn,
-    RegisterAgentIn,
     ReviewItemOut,
     ReviewQueueOut,
     ScopeOut,
     SpendCellOut,
     SpendOut,
 )
-from tracebed.domain.canonical import sha256_hex
+from tracebed.domain.enums import ProjectRole
 from tracebed.domain.errors import ConfigError
-from tracebed.domain.ids import MemoryId, ProjectId
+from tracebed.domain.ids import MemoryId
 from tracebed.domain.state_machine import Status
 from tracebed.stores.pg.rows import MemoryItemRow
 
@@ -62,90 +52,35 @@ router = APIRouter()
 # author they asked for more than the route will ever give, instead of silently
 # handing back a smaller page they might read as "that is all there is".
 _MAX_LIST_LIMIT = 1_000
+_MAX_MEMORY_LIMIT = 200
 _MAX_SPEND_DAYS = 365
-
-# C-19: key_id is a server-minted UUID hex (32 lowercase hex chars, no
-# dashes) — distinct in shape from an OIDC `sub`, which an IdP controls.
-_API_KEY_PREFIX = "tb_sk_"
-_API_KEY_SECRET_BYTES = 32  # secrets.token_urlsafe(32) -> 43 chars (C-19)
+_MEMORY_CURSOR_MAX_BYTES = 1024
 
 
-def _mint_api_key() -> tuple[str, str, str]:
-    """Returns (key_id, secret, key_hash). Only `key_hash` is ever persisted;
-    the caller returns `secret` to the admin exactly once, in the response
-    body, and Tracebed never stores or logs it again."""
-    key_id = secrets.token_hex(16)  # 32 hex chars — a UUIDv4-shaped public id
-    secret = secrets.token_urlsafe(_API_KEY_SECRET_BYTES)
-    return key_id, secret, sha256_hex(secret.encode("utf-8"))
+class MemoryCursorSigner:
+    """Purpose-derived cursor MAC key; never serialises its master material."""
 
+    __slots__ = ("_key",)
 
-@router.post(
-    "/admin/projects",
-    response_model=ProjectCreatedOut,
-    status_code=201,
-    dependencies=[Depends(require_admin_key)],
-)
-def create_project(body: ProjectCreateIn, deps: AppDepsDep) -> ProjectCreatedOut:
-    """Registry row + partitions + the project's `"__project__"` KEK (C-14),
-    composed here rather than inside `Repo` — `Repo` only ever writes the
-    registry row; provisioning storage and crypto material is this route's
-    job (contract §9.3), through `AppDeps.partitions`/`AppDeps.keys`.
-    """
-    project_id = deps.admin.create_project(body.name, body.retention_policy)
-    deps.partitions.create_project_partitions(project_id)
-    deps.keys.ensure_project_kek(project_id)
-    return ProjectCreatedOut(project_id=project_id.value)
+    def __init__(self, master_key: bytes) -> None:
+        if type(master_key) is not bytes or len(master_key) != 32:
+            raise ValueError("memory cursor master key is invalid")
+        self._key = hmac.new(
+            master_key, b"tracebed/admin-memory-cursor/v1", hashlib.sha256
+        ).digest()
 
-
-@router.post(
-    "/admin/agents/register",
-    response_model=AgentRegisteredOut,
-    status_code=201,
-    dependencies=[Depends(require_admin_key)],
-)
-def register_agent(body: RegisterAgentIn, deps: AppDepsDep) -> AgentRegisteredOut:
-    """Creates the agent_type, the principal, and the binding that makes
-    `Repo.resolve_project` possible at all (contract §9.3) — as ONE registry
-    transaction (C-30), not three composed calls.
-
-    The plaintext api key is minted here and never leaves this function except
-    in the response body; if `create_agent_registration` raises, the
-    `key_hash` it would have stored is rolled back with everything else, so a
-    failed registration cannot deposit a credential nobody holds.
-    """
-    project_id = ProjectId(body.project_id)
-
-    if isinstance(body.principal, OidcPrincipalIn):
-        # `sub` is `str` here by the parsed type itself (models.py's
-        # discriminated union) — no runtime assertion stands between a
-        # malformed body and a NULL external_ref in the registry.
-        external_ref = body.principal.sub
-        kind: Literal["oidc_sub", "api_key"] = "oidc_sub"
-        key_hash: str | None = None
-        api_key: str | None = None
-    else:
-        key_id, secret, key_hash = _mint_api_key()
-        external_ref, kind = key_id, "api_key"
-        api_key = f"{_API_KEY_PREFIX}{key_id}.{secret}"
-
-    principal_id, agent_type_id = deps.admin.create_agent_registration(
-        project_id, body.agent_type, kind, external_ref, key_hash
-    )
-    return AgentRegisteredOut(
-        principal_id=principal_id.value,
-        agent_type_id=agent_type_id.value,
-        api_key=api_key,
-    )
+    def sign(self, raw: bytes) -> bytes:
+        return hmac.new(self._key, raw, hashlib.sha256).digest()
 
 
 @router.get("/admin/memory/{memory_id}")
-def get_memory(memory_id: UUID, scope: ScopeDep, deps: AppDepsDep) -> dict[str, Any]:
+def get_memory(memory_id: UUID, access: AdminReadDep, deps: AppDepsDep) -> dict[str, Any]:
     """`NotFound` (raised uniformly for "absent" and "not your project" by
     `Repo.get_memory_by_id`, contract §5.1) is caught by `api/main.py`'s
     single exception handler and turned into the byte-identical 404 body —
     this handler does not special-case either miss reason itself."""
     row: MemoryItemRow = deps.memory_reader.get_memory_by_id(
-        scope.project_id, MemoryId(memory_id)
+        access.project_id, MemoryId(memory_id)
     )
     return _memory_item_out(row).model_dump()
 
@@ -179,11 +114,61 @@ def _memory_item_out(row: MemoryItemRow) -> MemoryItemOut:
     )
 
 
+def _memory_filter(statuses: list[Status] | None) -> tuple[str, ...]:
+    return tuple(sorted({status.value for status in statuses or ()}))
+
+
+def _cursor_encode(
+    signer: MemoryCursorSigner,
+    *,
+    project_id: UUID,
+    statuses: tuple[str, ...],
+    created_at: datetime,
+    memory_id: UUID,
+) -> str:
+    payload = {
+        "v": 1,
+        "p": str(project_id),
+        "s": list(statuses),
+        "c": created_at.astimezone(UTC).isoformat(),
+        "i": str(memory_id),
+    }
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    signature = signer.sign(raw)
+    return base64.urlsafe_b64encode(raw + signature).rstrip(b"=").decode("ascii")
+
+
+def _cursor_decode(
+    value: str, signer: MemoryCursorSigner, *, project_id: UUID, statuses: tuple[str, ...]
+) -> tuple[datetime, MemoryId]:
+    try:
+        if len(value.encode("ascii")) > _MEMORY_CURSOR_MAX_BYTES:
+            raise ValueError
+        padded = value + "=" * (-len(value) % 4)
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        if len(decoded) <= hashlib.sha256().digest_size:
+            raise ValueError
+        raw, supplied_signature = decoded[:-32], decoded[-32:]
+        expected_signature = signer.sign(raw)
+        if not hmac.compare_digest(supplied_signature, expected_signature):
+            raise ValueError
+        payload = json.loads(raw)
+        if not isinstance(payload, dict) or set(payload) != {"v", "p", "s", "c", "i"}:
+            raise ValueError
+        if payload["v"] != 1 or payload["p"] != str(project_id) or payload["s"] != list(statuses):
+            raise ValueError
+        created_at = datetime.fromisoformat(payload["c"])
+        memory_id = UUID(payload["i"])
+        if created_at.tzinfo is None:
+            raise ValueError
+        return created_at, MemoryId(memory_id)
+    except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="invalid memory cursor") from exc
+
+
 # --------------------------------------------------------------------------- #
-# Control-plane reads (D-093). Same auth plane as `GET /admin/memory/{id}`:
-# ordinary project-scoped reads through `ScopeDep`, so leak-suite probe 3
-# (cross-project admin read) covers them by construction — none of them accepts
-# a project id in any position, and none of them can widen its own scope.
+# Control-plane reads require the ADMIN grant. None accepts a project id, so a
+# caller cannot widen the server-resolved access context.
 #
 # All READ-ONLY. `killswitch_state` has no write route here on purpose: PLAN.md
 # §10 forbids changing a memory's status outside the state machine and forbids
@@ -208,7 +193,7 @@ def _control_plane(deps: AppDeps) -> ControlPlaneReadPort:
 
 
 @router.get("/admin/whoami", response_model=ScopeOut)
-def whoami(scope: ScopeDep) -> ScopeOut:
+def whoami(access: AnyRoleDep) -> ScopeOut:
     """The scope the server derived for the presented credential.
 
     Its absence is why the dashboard previously could not name the project it
@@ -217,18 +202,20 @@ def whoami(scope: ScopeDep) -> ScopeOut:
     accepting one (invariant 4) — nothing here is read off the request.
     """
     return ScopeOut(
-        project_id=str(scope.project_id),
-        agent_type_id=str(scope.agent_type_id),
-        principal_id=str(scope.principal_id),
+        project_id=str(access.project_id),
+        agent_type_id=str(access.agent_type_id),
+        principal_id=str(access.principal_id),
     )
 
 
 @router.get("/admin/memory", response_model=MemoryListOut)
 def list_memory(
-    scope: ScopeDep,
+    request: Request,
+    access: AdminReadDep,
     deps: AppDepsDep,
     status: Annotated[list[Status] | None, Query()] = None,
-    limit: Annotated[int, Query(ge=1, le=_MAX_LIST_LIMIT)] = 100,
+    limit: Annotated[int, Query(ge=1, le=_MAX_MEMORY_LIMIT)] = 100,
+    cursor: Annotated[str | None, Query(max_length=_MEMORY_CURSOR_MAX_BYTES)] = None,
 ) -> MemoryListOut:
     """A bounded, status-filtered page of this project's `memory_item` rows.
 
@@ -241,17 +228,43 @@ def list_memory(
     including the non-retrievable ones. That is deliberate: the vault view's job
     is to show what the hot path CANNOT serve as prominently as what it can.
     """
-    rows = _control_plane(deps).list_memories(
-        scope.project_id, statuses=status, limit=limit
+    normalized_statuses = _memory_filter(status)
+    signer = getattr(request.app.state, "memory_cursor_signer", None)
+    if not isinstance(signer, MemoryCursorSigner):
+        raise ConfigError("memory cursor signer is not configured")
+    before_created_at: datetime | None = None
+    before_id: MemoryId | None = None
+    if cursor is not None:
+        before_created_at, before_id = _cursor_decode(
+            cursor, signer, project_id=access.project_id.value, statuses=normalized_statuses
+        )
+    rows = _control_plane(deps).list_memories_page(
+        access.project_id,
+        statuses=status,
+        limit=limit,
+        before_created_at=before_created_at,
+        before_id=before_id,
     )
+    has_more = len(rows) > limit
+    items = rows[:limit]
+    next_cursor = None
+    if has_more:
+        last = items[-1]
+        next_cursor = _cursor_encode(
+            signer,
+            project_id=access.project_id.value,
+            statuses=normalized_statuses,
+            created_at=last.created_at,
+            memory_id=last.id.value,
+        )
     return MemoryListOut(
-        items=[_memory_item_out(r) for r in rows], limit=limit, returned=len(rows)
+        items=[_memory_item_out(row) for row in items], next_cursor=next_cursor
     )
 
 
 @router.get("/admin/review_queue", response_model=ReviewQueueOut)
 def list_review_queue(
-    scope: ScopeDep,
+    access: AdminReadDep,
     deps: AppDepsDep,
     include_resolved: bool = False,
     limit: Annotated[int, Query(ge=1, le=_MAX_LIST_LIMIT)] = 100,
@@ -263,7 +276,7 @@ def list_review_queue(
     resolve endpoint here to hand a dashboard a shortcut around the machine.
     """
     rows = _control_plane(deps).list_review_items(
-        scope.project_id, include_resolved=include_resolved, limit=limit
+        access.project_id, include_resolved=include_resolved, limit=limit
     )
     return ReviewQueueOut(
         items=[
@@ -284,7 +297,7 @@ def list_review_queue(
 
 
 @router.get("/admin/killswitch_state", response_model=KillswitchStateOut)
-def get_killswitch_state(scope: ScopeDep, deps: AppDepsDep) -> KillswitchStateOut:
+def get_killswitch_state(access: AdminReadDep, deps: AppDepsDep) -> KillswitchStateOut:
     """Every recorded kill-switch decision for this project, newest first.
 
     An empty list means no decision has ever been recorded — NOT that everything
@@ -292,7 +305,7 @@ def get_killswitch_state(scope: ScopeDep, deps: AppDepsDep) -> KillswitchStateOu
     §7's Phase 3 note records that no `Repo.write_killswitch_state` exists yet,
     so on this build the list is empty by construction. The dashboard says so.
     """
-    cells = _control_plane(deps).list_killswitch_state(scope.project_id)
+    cells = _control_plane(deps).list_killswitch_state(access.project_id)
     return KillswitchStateOut(
         cells=[
             KillswitchCellOut(
@@ -309,13 +322,13 @@ def get_killswitch_state(scope: ScopeDep, deps: AppDepsDep) -> KillswitchStateOu
 
 @router.get("/admin/invalidations", response_model=InvalidationListOut)
 def list_invalidations(
-    scope: ScopeDep,
+    access: AdminReadDep,
     deps: AppDepsDep,
     limit: Annotated[int, Query(ge=1, le=_MAX_LIST_LIMIT)] = 100,
 ) -> InvalidationListOut:
     """`invalidation_event` rows, newest first — what `POST /v1/invalidation`
     and the platform webhooks have fired."""
-    rows = _control_plane(deps).list_invalidation_events(scope.project_id, limit=limit)
+    rows = _control_plane(deps).list_invalidation_events(access.project_id, limit=limit)
     return InvalidationListOut(
         events=[
             InvalidationEventOut(
@@ -333,7 +346,7 @@ def list_invalidations(
 
 @router.get("/admin/spend", response_model=SpendOut)
 def get_spend(
-    scope: ScopeDep,
+    access: AdminReadDep,
     deps: AppDepsDep,
     days: Annotated[int, Query(ge=1, le=_MAX_SPEND_DAYS)] = 30,
 ) -> SpendOut:
@@ -345,7 +358,7 @@ def get_spend(
     to a route the dashboard calls, so this one does not take it.
     """
     since = (deps.clock.now() - timedelta(days=days - 1)).date()
-    cells = _control_plane(deps).spend_since(scope.project_id, since)
+    cells = _control_plane(deps).spend_since(access.project_id, since)
     return SpendOut(
         since=since.isoformat(),
         days=days,
@@ -364,7 +377,7 @@ def get_spend(
 
 
 @router.get("/admin/config", response_model=ConfigOut)
-def get_config(scope: ScopeDep, deps: AppDepsDep) -> ConfigOut:
+def get_config(access: AdminReadDep, deps: AppDepsDep) -> ConfigOut:
     """The stored `project_config` and `agent_type_config` OVERRIDE layers for
     the caller's own scope (PLAN.md §6's middle two resolution layers).
 
@@ -374,21 +387,42 @@ def get_config(scope: ScopeDep, deps: AppDepsDep) -> ConfigOut:
     """
     port = _control_plane(deps)
     return ConfigOut(
-        agent_type_id=str(scope.agent_type_id),
-        project=dict(port.get_project_config(scope.project_id)),
-        agent_type=dict(port.get_agent_type_config(scope.project_id, scope.agent_type_id)),
+        agent_type_id=str(access.agent_type_id),
+        project=dict(port.get_project_config(access.project_id)),
+        agent_type=dict(port.get_agent_type_config(access.project_id, access.agent_type_id)),
     )
 
 
 @router.get("/export/project")
-def export_project(scope: ScopeDep, deps: AppDepsDep) -> StreamingResponse:
+def export_project(access: ExportDep, deps: AppDepsDep) -> StreamingResponse:
     """NDJSON stream of `iter_export_rows(scope.project_id)` — single-project
     by construction (contract §9.3), since `scope.project_id` is server-
     derived and every row `Repo.iter_export_rows` yields is already scoped
     by the same RLS GUC every other partitioned-table read uses.
     """
     def _lines() -> Iterator[bytes]:
-        for row in deps.exporter.iter_export_rows(scope.project_id):
-            yield json.dumps(row, sort_keys=True).encode("utf-8") + b"\n"
+        # This generator owns the shared advisory lock rather than the route
+        # handler.  A StreamingResponse starts consuming only after the
+        # handler returns; holding it here keeps the exact EXPORT grant,
+        # durable fence filters and byte serialization in one disclosure
+        # lifetime, including exhaustion, errors and client cancellation.
+        if deps.read_gate is None:
+            rows = deps.exporter.iter_export_rows(access.project_id)
+            for row in rows:
+                yield json.dumps(row, sort_keys=True).encode("utf-8") + b"\n"
+            return
+        with deps.read_gate.hold(access, ProjectRole.EXPORT) as connection:
+            # The production repository offers this deliberately private
+            # same-transaction hook.  It keeps the durable grant/project
+            # locks from the read gate through cursor exhaustion and the last
+            # streamed byte; old offline exporters retain the simple port.
+            in_lifetime = getattr(deps.exporter, "_iter_export_rows_on", None)
+            rows = (
+                in_lifetime(connection, access.project_id)
+                if callable(in_lifetime)
+                else deps.exporter.iter_export_rows(access.project_id)
+            )
+            for row in rows:
+                yield json.dumps(row, sort_keys=True).encode("utf-8") + b"\n"
 
     return StreamingResponse(_lines(), media_type="application/x-ndjson")

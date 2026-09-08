@@ -45,6 +45,7 @@ trusted.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, runtime_checkable
@@ -56,6 +57,7 @@ from tracebed.domain.errors import TracebedError
 from tracebed.domain.ids import MemoryId, ProjectId, RunId
 from tracebed.domain.memory import Provenance
 from tracebed.domain.state_machine import Status, TransitionEvidence, TransitionLimits, apply
+from tracebed.stores.pg.activity import ActivityGate
 from tracebed.stores.valkey.flush import CACHE_FLUSH_EVENT_TYPE
 
 __all__ = [
@@ -202,7 +204,7 @@ class MemoryLifecycleRepoPort(Protocol):
 
 # --------------------------------------------------------------------------- #
 # Invalidation events — the raw payload shape shared with adapters/invalidation.py
-# and Repo.insert_invalidation_event's (event_type, selector) columns (D-041).
+# and the authority-gated invalidation writer's (event_type, selector) columns (D-041).
 # --------------------------------------------------------------------------- #
 
 
@@ -247,7 +249,7 @@ class InvalidationEvent:
 
 def parse_invalidation_payload(raw: Mapping[str, object]) -> InvalidationEvent:
     """Turns one raw `{"event_type": ..., "selector": {...}}` payload — the shape both
-    `adapters.invalidation`'s two sources and `Repo.insert_invalidation_event`'s persisted
+    `adapters.invalidation`'s two sources and the authority-gated writer's persisted
     `selector` column use — into a typed `InvalidationEvent`.
 
     Raises `ValueError` on a malformed payload. Deliberately not a `TracebedError` subclass:
@@ -339,12 +341,29 @@ class Invalidator:
         clock: Clock,
         *,
         flush_cache: Callable[[ProjectId], int] | None = None,
+        activity: ActivityGate | None = None,
     ) -> None:
         self._repo = repo
         self._clock = clock
         self._flush_cache = flush_cache
+        self._activity = activity
 
     def process_event(
+        self, project_id: ProjectId, event: InvalidationEvent, cfg: EffectiveConfig
+    ) -> InvalidatorResult:
+        # E2's fast drain must cover the cache flush or every selected-memory
+        # transition, not just selection.  The durable predicates in the
+        # Postgres store then close the post-release race.  ``activity`` is an
+        # optional constructor seam because this worker's offline domain tests
+        # intentionally have no Postgres activity pool.
+        with (
+            self._activity.shared(project_id)
+            if self._activity is not None
+            else nullcontext()
+        ):
+            return self._process_event(project_id, event, cfg)
+
+    def _process_event(
         self, project_id: ProjectId, event: InvalidationEvent, cfg: EffectiveConfig
     ) -> InvalidatorResult:
         if event.event_type == CACHE_FLUSH_EVENT_TYPE:
@@ -475,4 +494,12 @@ class Invalidator:
         exception, had no record of which ones.
         """
         parsed = [parse_invalidation_payload(raw) for raw in raw_events]
-        return tuple(self.process_event(project_id, event, cfg) for event in parsed)
+        # A polled batch is one side-effecting handler.  Hold one shared E2
+        # activity lease through all its writes instead of allowing a request
+        # to fence the project between two already accepted source events.
+        with (
+            self._activity.shared(project_id)
+            if self._activity is not None
+            else nullcontext()
+        ):
+            return tuple(self._process_event(project_id, event, cfg) for event in parsed)

@@ -28,20 +28,31 @@ actually for:
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from dataclasses import dataclass, field, replace
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from tracebed.adapters.identity import Principal
+from tracebed.api.admin import MemoryCursorSigner, _cursor_decode, _cursor_encode
 from tracebed.api.deps import AppDeps
 from tracebed.api.main import create_app
+from tracebed.domain.authority import AccessContext, GrantBinding
 from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import AuthConfig, EmbeddingConfig, StorageConfig, TracebedSettings
-from tracebed.domain.enums import Lane, MemType, ProvenanceClass, ScopeType, TrustTier
+from tracebed.domain.enums import (
+    FeedbackSource,
+    Lane,
+    MemType,
+    ProjectRole,
+    ProvenanceClass,
+    ScopeType,
+    TrustTier,
+)
 from tracebed.domain.errors import AuthenticationFailed, NotFound
 from tracebed.domain.ids import AgentTypeId, MemoryId, PrincipalId, ProjectId
 from tracebed.domain.memory import Provenance
@@ -85,24 +96,29 @@ class _Resolver:
         )
 
 
+class _AccessResolver:
+    def resolve_access(self, principal_id: PrincipalId) -> AccessContext:
+        return AccessContext(
+            project_id=PROJECT,
+            agent_type_id=AGENT_TYPE,
+            principal_id=principal_id,
+            grants=(
+                GrantBinding(uuid4(), ProjectRole.DATA),
+                GrantBinding(uuid4(), ProjectRole.FEEDBACK, FeedbackSource.VERDICT),
+                GrantBinding(uuid4(), ProjectRole.ADMIN),
+                GrantBinding(uuid4(), ProjectRole.EXPORT),
+            ),
+        )
+
+
 class _NeverCalledQueue:
-    def enqueue(self, *args: object, **kwargs: object) -> int:
+    def enqueue_many_authorized(self, *args: object, **kwargs: object) -> tuple[int, ...]:
         raise AssertionError("no control-plane read route enqueues")
 
 
 class _NeverCalledTelemetry:
     def record_retrieval(self, *args: object, **kwargs: object) -> None:
         raise AssertionError("no control-plane read route records telemetry")
-
-
-class _NeverCalledAdmin:
-    def create_project(self, *args: object, **kwargs: object) -> ProjectId:
-        raise AssertionError("no control-plane read route writes the registry")
-
-    def create_agent_registration(
-        self, *args: object, **kwargs: object
-    ) -> tuple[PrincipalId, AgentTypeId]:
-        raise AssertionError("no control-plane read route writes the registry")
 
 
 class _Stubs:
@@ -114,14 +130,11 @@ class _Stubs:
     def iter_export_rows(self, project_id: ProjectId) -> Iterator[dict[str, object]]:
         return iter(())
 
-    def insert_invalidation_event(self, *args: object, **kwargs: object) -> UUID:
+    def insert(self, *args: object, **kwargs: object) -> UUID:
         raise AssertionError("no read route writes")
 
-    def create_project_partitions(self, project_id: ProjectId) -> None:
-        raise AssertionError("no read route provisions partitions")
-
-    def ensure_project_kek(self, project_id: ProjectId) -> None:
-        raise AssertionError("no read route provisions keys")
+    def open(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("no read route opens a run")
 
 
 def _memory_row(status: Status = Status.VALIDATED) -> MemoryItemRow:
@@ -184,6 +197,27 @@ class FakeControlPlane:
         self.last_limit = limit
         return list(self.memories)
 
+    def list_memories_page(
+        self,
+        project_id: ProjectId,
+        *,
+        statuses: Sequence[Status] | None = None,
+        limit: int = 100,
+        before_created_at: datetime | None = None,
+        before_id: MemoryId | None = None,
+    ) -> list[MemoryItemRow]:
+        self.seen_projects.append(project_id)
+        self.last_statuses = statuses
+        self.last_limit = limit
+        rows = sorted(self.memories, key=lambda row: (row.created_at, row.id.value), reverse=True)
+        if before_created_at is not None and before_id is not None:
+            rows = [
+                row
+                for row in rows
+                if (row.created_at, row.id.value) < (before_created_at, before_id.value)
+            ]
+        return rows[: limit + 1]
+
     def list_review_items(
         self, project_id: ProjectId, *, include_resolved: bool = False, limit: int = 100
     ) -> list[ReviewQueueRow]:
@@ -230,9 +264,8 @@ def _build(control_plane: Any) -> tuple[TestClient, FakeControlPlane | None]:
         memory_reader=stubs,
         exporter=stubs,
         invalidations=stubs,
-        admin=_NeverCalledAdmin(),
-        partitions=stubs,
-        keys=stubs,
+        retrieval_opener=stubs,
+        access_resolver=_AccessResolver(),
         clock=FakeClock(EPOCH),
         control_plane=control_plane,
     )
@@ -350,14 +383,13 @@ class TestWhoami:
 
 
 class TestMemoryList:
-    def test_returns_rows_with_the_limit_it_applied(
+    def test_returns_rows_with_a_keyset_cursor(
         self, harness: tuple[TestClient, FakeControlPlane]
     ) -> None:
         client, cp = harness
         cp.memories = [_memory_row()]
         body = client.get("/admin/memory", headers=AUTH).json()
-        assert body["returned"] == 1
-        assert body["limit"] == 100
+        assert body["next_cursor"] is None
         assert body["items"][0]["id"] == str(MEMORY)
         assert body["items"][0]["status"] == "validated"
 
@@ -382,9 +414,71 @@ class TestMemoryList:
         self, harness: tuple[TestClient, FakeControlPlane]
     ) -> None:
         client, cp = harness
-        assert client.get("/admin/memory", params={"limit": 5000}, headers=AUTH).status_code == 422
+        assert client.get("/admin/memory", params={"limit": 201}, headers=AUTH).status_code == 422
         assert client.get("/admin/memory", params={"limit": 0}, headers=AUTH).status_code == 422
         assert cp.seen_projects == []
+
+    def test_cursor_is_stable_and_tamper_and_filter_mismatch_fail_closed(
+        self, harness: tuple[TestClient, FakeControlPlane]
+    ) -> None:
+        client, cp = harness
+        newer = replace(
+            _memory_row(), id=MemoryId(UUID("88888888-8888-8888-8888-888888888888"))
+        )
+        tied = replace(
+            _memory_row(), id=MemoryId(UUID("66666666-6666-6666-6666-666666666666"))
+        )
+        older = replace(
+            _memory_row(),
+            id=MemoryId(UUID("77777777-7777-7777-7777-777777777777")),
+            created_at=EPOCH - timedelta(seconds=1),
+        )
+        cp.memories = [older, tied, newer]
+        first = client.get("/admin/memory", params={"limit": 1, "status": "validated"}, headers=AUTH).json()
+        repeated = client.get("/admin/memory", params={"limit": 1, "status": "validated"}, headers=AUTH).json()
+        assert repeated == first
+        cursor = first["next_cursor"]
+        assert cursor is not None
+        second = client.get("/admin/memory", params={"limit": 1, "status": "validated", "cursor": cursor}, headers=AUTH).json()
+        assert second["items"][0]["id"] == str(tied.id)
+        third = client.get(
+            "/admin/memory",
+            params={"limit": 1, "status": "validated", "cursor": second["next_cursor"]},
+            headers=AUTH,
+        ).json()
+        assert third["items"][0]["id"] == str(older.id)
+        assert client.get("/admin/memory", params={"cursor": cursor[:-1] + "A"}, headers=AUTH).status_code == 422
+        assert client.get("/admin/memory", params={"status": "stale", "cursor": cursor}, headers=AUTH).status_code == 422
+        with pytest.raises(HTTPException):
+            _cursor_decode(
+                cursor,
+                MemoryCursorSigner(b"\x00" * 32),
+                project_id=OTHER_PROJECT.value,
+                statuses=("validated",),
+            )
+
+    def test_cursor_signer_is_shared_master_derived_and_rejects_other_master(self) -> None:
+        master = b"a" * 32
+        cursor = _cursor_encode(
+            MemoryCursorSigner(master),
+            project_id=PROJECT.value,
+            statuses=("validated",),
+            created_at=EPOCH,
+            memory_id=MEMORY.value,
+        )
+        assert _cursor_decode(
+            cursor,
+            MemoryCursorSigner(master),
+            project_id=PROJECT.value,
+            statuses=("validated",),
+        ) == (EPOCH, MEMORY)
+        with pytest.raises(HTTPException):
+            _cursor_decode(
+                cursor,
+                MemoryCursorSigner(b"b" * 32),
+                project_id=PROJECT.value,
+                statuses=("validated",),
+            )
 
 
 class TestReviewQueue:

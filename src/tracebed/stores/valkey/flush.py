@@ -30,7 +30,7 @@ __all__ = ["CACHE_FLUSH_EVENT_TYPE", "delete_project", "flush_project_cache", "i
 CACHE_FLUSH_EVENT_TYPE: Final[str] = "cache_flush"
 """The `invalidation_event.event_type` spelling (PLAN.md §5) that means
 "flush this project's cache namespace". `POST /v1/invalidation` persists an
-arbitrary caller-chosen `kind` string (`Repo.insert_invalidation_event`); a
+bounded caller event type through the authority-gated invalidation writer; a
 future consumer of `invalidation_event` rows recognises this exact spelling
 and calls `flush_project_cache` below. One named constant is what keeps the
 webhook-writer side and the consumer side from drifting into two different

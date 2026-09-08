@@ -26,6 +26,7 @@ from uuid import UUID
 from tracebed.domain.enums import (
     AdapterClass,
     Arm,
+    FeedbackSource,
     InstrumentationSource,
     Lane,
     MemType,
@@ -45,6 +46,7 @@ __all__ = [
     "KillswitchStateRow",
     "MemoryItemRow",
     "OutcomeEventInsert",
+    "OutcomeReplayConflict",
     "PrincipalRow",
     "RetrievalEventInsert",
     "ReviewQueueRow",
@@ -53,6 +55,10 @@ __all__ = [
     "TraceIndexRow",
     "TraceIndexUpsert",
 ]
+
+
+class OutcomeReplayConflict(ValueError):
+    """The durable natural key exists but does not describe this v1 outcome."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +124,9 @@ class TraceIndexUpsert:
     ended_at: datetime | None
     payload_ref: str | None
     outcome_status: TraceOutcomeStatus
+    # E1 deliberately has no database default: every archive writer must
+    # name the wire version(s) it is adding.  The v1 writer passes ``(1,)``.
+    envelope_versions: tuple[int, ...]
     # NO `arm`. `trace_index.arm` is the kill switch's audit column and the stratification key
     # of the governing lift number, and PLAN.md §10 forbids accepting an arm assignment from a
     # caller. It used to arrive here from the caller-supplied `run_start` payload; it is now
@@ -145,6 +154,10 @@ class TraceIndexRow:
     ended_at: datetime | None
     payload_ref: str | None
     outcome_status: TraceOutcomeStatus
+    # ``None`` is only the pre-0012 in-process compatibility shape.  Once
+    # the E1 catalog is active this is the exact sorted observed envelope
+    # version set, never an inferred default.
+    envelope_versions: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +176,24 @@ class OutcomeEventInsert:
     payload: Mapping[str, object]
     occurred_at: datetime
     arrived_at: datetime
+    # A v1 queue item with no caller-supplied occurrence time derives this
+    # value from its immutable queue creation time.  It is deliberately not a
+    # replay-identity field: an HTTP retry creates a new queue row, hence a
+    # different creation time, while the event business payload remains the
+    # same.  Explicit caller times remain part of replay identity.
+    occurred_at_is_derived: bool = False
+    # Version-zero is retained only for historical/offline compatibility.
+    # Every WorkerQueue-produced outcome is an exact version-one envelope.
+    authority_version: int = 0
+    source_agent_type_id: AgentTypeId | None = None
+    source_grant_id: UUID | None = None
+    feedback_source: FeedbackSource | None = None
+    run_owner_principal_id: PrincipalId | None = None
+    run_owner_agent_type_id: AgentTypeId | None = None
+    # WorkerQueue snapshots the full authoritative run union.  It is not
+    # caller payload and it is deliberately excluded from outcome replay
+    # identity because later binding propagation may monotonically enlarge it.
+    subject_digests: tuple[bytes, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,11 +225,15 @@ class SubjectKeyRow:
     that interprets `wrapped_kek`; `Repo` treats it as opaque bytes.
     """
 
-    subject_tag: str
+    subject_tag: str | None
     key_id: UUID
     wrapped_kek: bytes
     created_at: datetime
     destroyed_at: datetime | None
+    # E1 leaves legacy v1 callers readable while v2 archive wraps address
+    # keys only by this opaque project-scoped digest.
+    subject_digest: bytes | None = None
+    wrap_version: int = 1
 
 
 @dataclass(frozen=True, slots=True)

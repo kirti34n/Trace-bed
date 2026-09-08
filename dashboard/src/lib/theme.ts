@@ -1,6 +1,5 @@
-// Theme persistence + toggle. `index.html`'s inline script makes the *first
-// paint* match this; everything after that (a user clicking the toggle) goes
-// through here so the two never disagree about the storage key or its values.
+// Theme persistence + toggle. The same-origin `theme-bootstrap.ts` module runs
+// before the React entrypoint, so CSP can stay free of `unsafe-inline`.
 const STORAGE_KEY = "tb:theme";
 
 export type ThemePreference = "light" | "dark" | "system";
@@ -21,6 +20,19 @@ export function getResolvedTheme(): "light" | "dark" {
 export function getStoredPreference(): ThemePreference {
   const raw = window.localStorage.getItem(STORAGE_KEY);
   return raw === "light" || raw === "dark" ? raw : "system";
+}
+
+/** Applies the saved preference without mutating storage. Kept separate from
+ * `applyTheme` so the CSP-safe bootstrap can run before React mounts. */
+export function initializeTheme(): void {
+  try {
+    const preference = getStoredPreference();
+    const dark = preference === "dark" || (preference === "system" && systemPrefersDark());
+    document.documentElement.classList.toggle("dark", dark);
+    document.documentElement.classList.toggle("light", !dark);
+  } catch {
+    // Storage can be unavailable; CSS media defaults remain safe.
+  }
 }
 
 export function applyTheme(preference: ThemePreference): void {

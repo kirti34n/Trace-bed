@@ -22,22 +22,14 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 
-from tracebed.core.scans import ReviewQueueWriter
 from tracebed.core.scans.tier_a_template import ErrorClassEnum
-from tracebed.domain.clock import Clock
-from tracebed.domain.config import EffectiveConfig
 from tracebed.domain.enums import MemType
 from tracebed.domain.events import TraceEvent
 from tracebed.domain.ids import RunId
-from tracebed.domain.scope import ProjectScope
 from tracebed.workers.extractors.base import (
-    CandidateCapTracker,
-    ExtractionOutcome,
-    MemoryWriterPort,
-    emit_candidate,
+    TierACandidateProposal,
     mean_duration_ms,
     read_tool_events,
-    resolve_cap_tracker,
     structural_hash,
     try_build_note,
 )
@@ -98,18 +90,13 @@ class SequencePatternExtractor:
         self._min_sequence_length = min_sequence_length
         self._min_repeat_count = min_repeat_count
 
-    def extract(
+    def propose(
         self,
-        scope: ProjectScope,
         traces: Mapping[RunId, Sequence[TraceEvent]],
         *,
-        cfg: EffectiveConfig,
-        clock: Clock,
-        writer: MemoryWriterPort,
-        review_writer: ReviewQueueWriter | None = None,
-        cap_tracker: CandidateCapTracker | None = None,
         require_declared_tools: bool = True,
-    ) -> list[ExtractionOutcome]:
+    ) -> list[TierACandidateProposal]:
+        """Return recurring structural findings without scans or I/O."""
         groups: dict[_GroupKey, list[_Occ]] = defaultdict(list)
         for run_id, events in traces.items():
             records = read_tool_events(
@@ -140,8 +127,7 @@ class SequencePatternExtractor:
                     )
                 )
 
-        tracker = resolve_cap_tracker(cap_tracker, cfg)
-        outcomes: list[ExtractionOutcome] = []
+        proposals: list[TierACandidateProposal] = []
         for key in sorted(groups, key=lambda k: (".".join(k[0]), k[1].value)):
             occurrences = groups[key]
             if len(occurrences) < self._min_repeat_count:
@@ -170,19 +156,13 @@ class SequencePatternExtractor:
                 # rendered sequence disagrees with its own hash is not.
                 continue
 
-            outcomes.append(
-                emit_candidate(
-                    scope=scope,
-                    clock=clock,
-                    cfg=cfg,
-                    writer=writer,
+            proposals.append(
+                TierACandidateProposal(
                     note=note,
                     mem_type=_MEM_TYPE,
                     kind=_KIND,
-                    trace_ids=trace_ids,
+                    contributing_run_ids=trace_ids,
                     primary_run_id=primary_run_id,
-                    cap_tracker=tracker,
-                    review_writer=review_writer,
                 )
             )
-        return outcomes
+        return proposals

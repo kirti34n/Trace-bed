@@ -145,7 +145,7 @@ from tracebed.stores.pg.ddl import (
     MEMORY_ITEM_BM25_INDEX_SUFFIX,
     partition_index_name,
 )
-from tracebed.stores.pg.pool import scoped
+from tracebed.stores.pg.pool import RemainingBudget, refresh_deadline_statement_timeout, scoped
 
 __all__ = [
     "ArmHit",
@@ -179,8 +179,34 @@ _MAX_DF_TERMS: Final[int] = 512
 # parameters. `_RETRIEVABLE_STATUS_VALUES` is the single source of truth for both halves of the
 # guarantee: the bound parameter the SQL filters on, and the membership set `_row_to_arm_hit`
 # checks returned rows against — one list, so the query and its post-condition cannot disagree.
-_RETRIEVABLE_STATUS_VALUES: Final[tuple[str, ...]] = (Status.VALIDATED.value, Status.CANDIDATE.value)
+_RETRIEVABLE_STATUS_VALUES: Final[tuple[str, ...]] = (
+    Status.VALIDATED.value,
+    Status.CANDIDATE.value,
+)
 _RETRIEVABLE_STATUSES: Final[frozenset[str]] = frozenset(_RETRIEVABLE_STATUS_VALUES)
+
+
+_ERASURE_DISCLOSURE_TEMPLATE: Final[str] = (
+    "public.tracebed_runtime_memory_visible(@COLUMN@project_id, @COLUMN@id)"
+)
+
+
+def _erasure_disclosure_predicate(column_prefix: str = "") -> str:
+    """Return the durable E2 disclosure fence for one ``memory_item`` alias.
+
+    This is deliberately part of the query predicate rather than a best-effort
+    post-filter.  A request can outlive the process-local ``ActivityGate`` and
+    every retrieval arm (including count/DF support queries and the final
+    content fetch) must therefore ask PostgreSQL whether the project, memory,
+    any attributed subject, or any attributed run has become fenced.
+
+    ``column_prefix`` follows the same small, fixed ``""``/``"m."`` convention
+    as the retrievability predicate below.  It is never caller-controlled.
+    The function is SECURITY DEFINER and validates the caller's project GUC;
+    the runtime role never receives direct ACLs on erasure ledger/fence rows.
+    """
+
+    return _ERASURE_DISCLOSURE_TEMPLATE.replace("@COLUMN@", column_prefix)
 
 
 def _retrievable_predicate(column_prefix: str = "") -> str:
@@ -194,7 +220,8 @@ def _retrievable_predicate(column_prefix: str = "") -> str:
     """
     return (
         f"{column_prefix}status = ANY(%(statuses)s) AND "
-        f"({column_prefix}status <> %(candidate_status)s OR {column_prefix}trust_tier = %(tier_a)s)"
+        f"({column_prefix}status <> %(candidate_status)s OR {column_prefix}trust_tier = %(tier_a)s) "
+        f"AND ({_erasure_disclosure_predicate(column_prefix)})"
     )
 
 
@@ -333,7 +360,9 @@ _LEXICAL_ARM_SCOPED_SQL: Final[str] = (
 # vs latency, PLAN.md §6). Same `set_config(..., true)` idiom as `stores.pg.pool.scoped`'s own RLS
 # GUC (C-09): `SET LOCAL` cannot bind a parameter, and `is_local=true` reverts the setting at
 # COMMIT/ROLLBACK so it never leaks onto a pooled connection's next checkout.
-_HNSW_ITERATIVE_SCAN_GUC_SQL: Final[str] = "SELECT set_config('hnsw.iterative_scan', %(mode)s, true)"
+_HNSW_ITERATIVE_SCAN_GUC_SQL: Final[str] = (
+    "SELECT set_config('hnsw.iterative_scan', %(mode)s, true)"
+)
 _HNSW_MAX_SCAN_TUPLES_GUC_SQL: Final[str] = (
     "SELECT set_config('hnsw.max_scan_tuples', %(max_tuples)s, true)"
 )
@@ -352,9 +381,7 @@ WHERE project_id = %(project_id)s
 ORDER BY embedding <=> %(embedding)s::halfvec
 LIMIT %(top_n)s
 """.strip()
-_VECTOR_ARM_SQL: Final[str] = _VECTOR_ARM_TEMPLATE.replace(
-    "@RETRIEVABLE@", _RETRIEVABLE_PREDICATE
-)
+_VECTOR_ARM_SQL: Final[str] = _VECTOR_ARM_TEMPLATE.replace("@RETRIEVABLE@", _RETRIEVABLE_PREDICATE)
 
 # A raw query term is matched against `lexemes` via `plainto_tsquery('english', term)`. For an
 # English STOPWORD that query is EMPTY and matches zero rows, so a naive COUNT would report df=0 —
@@ -405,7 +432,9 @@ FROM memory_item
 WHERE project_id = %(project_id)s
   AND @RETRIEVABLE@
 """.strip()
-_CORPUS_SIZE_SQL: Final[str] = _CORPUS_SIZE_TEMPLATE.replace("@RETRIEVABLE@", _RETRIEVABLE_PREDICATE)
+_CORPUS_SIZE_SQL: Final[str] = _CORPUS_SIZE_TEMPLATE.replace(
+    "@RETRIEVABLE@", _RETRIEVABLE_PREDICATE
+)
 
 _ALL_STATEMENTS: Final[tuple[str, ...]] = (
     _LEXICAL_ARM_SQL,
@@ -538,7 +567,9 @@ class CandidateRow:
     scope_id: UUID | None
 
 
-def assert_dynamically_retrievable(memory_id: MemoryId, status: Status, trust_tier: TrustTier) -> None:
+def assert_dynamically_retrievable(
+    memory_id: MemoryId, status: Status, trust_tier: TrustTier
+) -> None:
     """Invariant 7's retrieval half, enforced rather than documented — the ONE statement of
     what a dynamic arm may return, exported so no caller has to restate it.
 
@@ -623,6 +654,7 @@ class SearchStore:
         *,
         visibility: RunVisibility | None = None,
         statement_timeout_ms: int | None = None,
+        deadline: RemainingBudget | None = None,
     ) -> list[ArmHit]:
         """True BM25 via `vchord_bm25` (D-003, D-140) — never `ts_rank`, which the audit measured
         at nDCG@10 0.07 on BEIR SciFact against BM25's 0.69. Ranks the per-partition
@@ -669,10 +701,14 @@ class SearchStore:
             sql = _LEXICAL_ARM_SCOPED_SQL
             params.update(_scope_predicate_params(visibility))
         with (
-            scoped(self._pool, project_id, statement_timeout_ms=statement_timeout_ms) as conn,
+            scoped(
+                self._pool, project_id, statement_timeout_ms=statement_timeout_ms, deadline=deadline
+            ) as conn,
             conn.cursor(row_factory=dict_row) as cur,
         ):
             cur.execute(_LEXICAL_SEARCH_PATH_SQL)
+            if deadline is not None:
+                refresh_deadline_statement_timeout(conn, deadline)
             cur.execute(sql, params)
             rows = cur.fetchall()
         return [_row_to_arm_hit(r) for r in rows]
@@ -686,6 +722,7 @@ class SearchStore:
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
         statement_timeout_ms: int | None = None,
+        deadline: RemainingBudget | None = None,
     ) -> list[ArmHit]:
         """HNSW ANN over `halfvec` with cosine ops, honouring `retrieval.hnsw_iterative_scan` and
         `hnsw_max_scan_tuples` (filtered-ANN recall vs latency, PLAN.md §6).
@@ -719,11 +756,15 @@ class SearchStore:
         literal = _embedding_literal(embedding)
         mode = "relaxed_order" if hnsw_iterative_scan else "off"
         with (
-            scoped(self._pool, project_id, statement_timeout_ms=statement_timeout_ms) as conn,
+            scoped(
+                self._pool, project_id, statement_timeout_ms=statement_timeout_ms, deadline=deadline
+            ) as conn,
             conn.cursor(row_factory=dict_row) as cur,
         ):
             cur.execute(_HNSW_ITERATIVE_SCAN_GUC_SQL, {"mode": mode})
             cur.execute(_HNSW_MAX_SCAN_TUPLES_GUC_SQL, {"max_tuples": str(hnsw_max_scan_tuples)})
+            if deadline is not None:
+                refresh_deadline_statement_timeout(conn, deadline)
             cur.execute(
                 _VECTOR_ARM_SQL,
                 {
@@ -742,6 +783,7 @@ class SearchStore:
         memory_ids: Sequence[MemoryId],
         *,
         statement_timeout_ms: int | None = None,
+        deadline: RemainingBudget | None = None,
     ) -> list[CandidateRow]:
         """The content/score columns for already-retrieved candidate ids, in ONE statement.
 
@@ -769,9 +811,13 @@ class SearchStore:
         if not ids:
             return []
         with (
-            scoped(self._pool, project_id, statement_timeout_ms=statement_timeout_ms) as conn,
+            scoped(
+                self._pool, project_id, statement_timeout_ms=statement_timeout_ms, deadline=deadline
+            ) as conn,
             conn.cursor(row_factory=dict_row) as cur,
         ):
+            if deadline is not None:
+                refresh_deadline_statement_timeout(conn, deadline)
             cur.execute(
                 _FETCH_CANDIDATES_SQL,
                 {"project_id": project_id, "ids": ids, **_retrievability_params()},
@@ -785,6 +831,7 @@ class SearchStore:
         terms: Sequence[str],
         *,
         statement_timeout_ms: int | None = None,
+        deadline: RemainingBudget | None = None,
     ) -> dict[str, int]:
         """Per-term document frequency among retrievable rows — the IDF source the rarity gate
         needs (`hotpath.abstention.RarityEvidence`, D-003/D-140). Counted off the `lexemes`
@@ -806,9 +853,13 @@ class SearchStore:
         if not deduped:
             return {}
         with (
-            scoped(self._pool, project_id, statement_timeout_ms=statement_timeout_ms) as conn,
+            scoped(
+                self._pool, project_id, statement_timeout_ms=statement_timeout_ms, deadline=deadline
+            ) as conn,
             conn.cursor(row_factory=dict_row) as cur,
         ):
+            if deadline is not None:
+                refresh_deadline_statement_timeout(conn, deadline)
             cur.execute(
                 _DOCUMENT_FREQUENCY_SQL,
                 {
@@ -821,7 +872,11 @@ class SearchStore:
         return {str(r["term"]): int(r["df"]) for r in rows}
 
     def corpus_size(
-        self, project_id: ProjectId, *, statement_timeout_ms: int | None = None
+        self,
+        project_id: ProjectId,
+        *,
+        statement_timeout_ms: int | None = None,
+        deadline: RemainingBudget | None = None,
     ) -> int:
         """Count of retrievable rows in this project — the cold-start abstention floor's
         denominator (`abstention.rarity_min_corpus_docs`, PLAN.md §6).
@@ -830,9 +885,13 @@ class SearchStore:
         the same hot-path budget, and is bounded server-side by the same D-139 mechanism.
         """
         with (
-            scoped(self._pool, project_id, statement_timeout_ms=statement_timeout_ms) as conn,
+            scoped(
+                self._pool, project_id, statement_timeout_ms=statement_timeout_ms, deadline=deadline
+            ) as conn,
             conn.cursor() as cur,
         ):
+            if deadline is not None:
+                refresh_deadline_statement_timeout(conn, deadline)
             cur.execute(_CORPUS_SIZE_SQL, {"project_id": project_id, **_retrievability_params()})
             row = cur.fetchone()
         return int(row[0]) if row is not None else 0

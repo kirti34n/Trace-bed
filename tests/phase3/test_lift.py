@@ -367,7 +367,12 @@ class TestDegradedLexicalIsAmbiguous:
 
         class _Retriever:
             def retrieve(
-                self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig
+                self,
+                project_id: ProjectId,
+                query_text: str,
+                *,
+                cfg: RetrievalConfig,
+                deadline: object,
             ) -> _DegradedOutcome:
                 return _DegradedOutcome()
 
@@ -379,6 +384,7 @@ class TestDegradedLexicalIsAmbiguous:
                 query_text: str,
                 candidates: Sequence[FusedCandidate],
                 cfg: EffectiveConfig,
+                deadline: object,
             ) -> CandidateSetResult:
                 return CandidateSetResult(
                     outcome_code=OutcomeCode.INJECTED,
@@ -392,9 +398,7 @@ class TestDegradedLexicalIsAmbiguous:
                     ],
                     top_score=0.88,
                     injections=[
-                        InjectionRow(
-                            memory_id=memory_id, slot=Slot.PITFALL, score=0.88, tokens=6
-                        )
+                        InjectionRow(memory_id=memory_id, slot=Slot.PITFALL, score=0.88, tokens=6)
                     ],
                 )
 
@@ -741,7 +745,12 @@ class TestStratification:
     def test_predicates_agree_with_stratify(self) -> None:
         rng = random.Random(2)
         obs = _signal_cell(
-            rng, agent_type_id=AGENT_A, mem_type=MemType.LESSON, p_treatment=0.5, p_control=0.5, n=10
+            rng,
+            agent_type_id=AGENT_A,
+            mem_type=MemType.LESSON,
+            p_treatment=0.5,
+            p_control=0.5,
+            n=10,
         )
         treated = [o for o in obs if is_treatment(o)]
         controlled = [o for o in obs if is_shadow_control(o)]
@@ -755,7 +764,12 @@ class TestStratification:
             rng, agent_type_id=AGENT_A, mem_type=MemType.LESSON, p_treatment=0.1, p_control=0.9, n=8
         )
         obs += _signal_cell(
-            rng, agent_type_id=AGENT_A, mem_type=MemType.SEMANTIC, p_treatment=0.9, p_control=0.1, n=8
+            rng,
+            agent_type_id=AGENT_A,
+            mem_type=MemType.SEMANTIC,
+            p_treatment=0.9,
+            p_control=0.1,
+            n=8,
         )
         report = compute_stratified_lift(obs)
         assert report.estimates[(AGENT_A, MemType.LESSON)].point_estimate < 0.0

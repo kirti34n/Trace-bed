@@ -11,6 +11,7 @@ vector (`assert_pin_matches`).
 from __future__ import annotations
 
 from tracebed.adapters.embedding.gemini import GeminiEmbeddingClient
+from tracebed.adapters.embedding.hash_local import HashLocalEmbeddingClient
 from tracebed.adapters.embedding.onnx_local import (
     OnnxLocalEmbeddingClient,
     OnnxModelIntegrityError,
@@ -31,6 +32,7 @@ __all__ = [
     "EmbeddingPinMismatch",
     "EmbeddingProviderError",
     "GeminiEmbeddingClient",
+    "HashLocalEmbeddingClient",
     "ModelPin",
     "OnnxLocalEmbeddingClient",
     "OnnxModelIntegrityError",

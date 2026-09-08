@@ -27,11 +27,13 @@ derive the hash, it does not derive one itself).
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import threading
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Final, Literal
 
 import httpx
@@ -63,9 +65,10 @@ logger = logging.getLogger("tracebed.sdk")
 # than the server's stated budget would turn "the server took 290ms" into a false
 # degraded result.
 _RETRIEVE_TIMEOUT_S: Final = 1.0
-# Wall-clock budget for one *background* flush pass. A dead/slow server must not
-# wedge the flusher thread: whatever is undrained at the deadline stays buffered
-# for the next wake instead of being drained-then-destroyed (see `_do_flush`).
+# Cooperative scheduling budget for one *background* flush pass.  A dead/slow
+# server cannot cause another attempt after this budget expires, and retained
+# work waits for the next wake.  A synchronous HTTPX operation already in
+# progress cannot be forcibly cancelled at an exact wall-clock instant.
 _FLUSH_SEND_TIMEOUT_S: Final = 5.0
 # C-05: bounded so a long-lived host process's run_id->arm memory cannot grow
 # without limit across a session with millions of runs.
@@ -73,6 +76,19 @@ _ARM_MEMORY_CAPACITY: Final = 4096
 # §9.3 C-21 caps POST /v1/trace/batch at 500 events, so one drain can never
 # produce a batch the route would 422.
 _MAX_DRAIN_BATCH: Final = 500
+
+
+@dataclass(slots=True)
+class _BatchSettlement:
+    """Mutable settlement state that survives a later dispatch helper failure."""
+
+    outcomes: list[Literal["sent", "dropped", "retry"]]
+    replacements: dict[int, BufferedItem]
+    sent: int = 0
+
+
+class _WriteTokenUnavailable(Exception):
+    """A write must wait for a renewable token rather than send anonymously."""
 
 
 class _BoundedArmMemory:
@@ -187,6 +203,7 @@ class TracebedClient:
         # watermark below never interleave across threads. Never held on the
         # trace()/feedback()/propose_memory() hot path.
         self._flush_lock = threading.Lock()
+        self._drop_report_lock = threading.Lock()
         self._last_reported_dropped = 0
         self._flush_errors = 0
 
@@ -205,7 +222,7 @@ class TracebedClient:
 
     # -- headers -------------------------------------------------------------
 
-    def _auth_headers(self) -> dict[str, str]:
+    def _auth_headers(self, *, for_write: bool = False) -> dict[str, str]:
         """Built at send time (background thread) only — never on the hot path."""
         headers: dict[str, str] = {}
         if self._token_provider is not None:
@@ -213,6 +230,8 @@ class TracebedClient:
                 headers["Authorization"] = f"Bearer {self._token_provider()}"
             except Exception:
                 logger.debug("tracebed sdk: token_provider raised", exc_info=True)
+                if for_write:
+                    raise _WriteTokenUnavailable from None
         if self._api_key is not None:
             headers["X-API-Key"] = self._api_key
         return headers
@@ -288,7 +307,9 @@ class TracebedClient:
             if isinstance(event, RunStart) and "arm" not in event.payload:
                 arm = self._arm_memory.get(run_id)
                 if arm is not None:
-                    stamped = event.model_copy(update={"payload": {**event.payload, "arm": arm.value}})
+                    stamped = event.model_copy(
+                        update={"payload": {**event.payload, "arm": arm.value}}
+                    )
             self._buffer.append(run_id, "trace", {"event": stamped})
         except Exception:
             logger.debug("tracebed sdk: trace() suppressed an internal error", exc_info=True)
@@ -305,7 +326,9 @@ class TracebedClient:
         try:
             self._buffer.append(run_id, "proposal", {"proposal": proposal})
         except Exception:
-            logger.debug("tracebed sdk: propose_memory() suppressed an internal error", exc_info=True)
+            logger.debug(
+                "tracebed sdk: propose_memory() suppressed an internal error", exc_info=True
+            )
 
     def on_operational_event(self, run_id: RunId, event: TraceEvent) -> ContextBlock | None:
         """JIT-injection hook. Phase 0/1: always `None` (trigger logic is Phase 2,
@@ -319,9 +342,10 @@ class TracebedClient:
         Unlike `trace()`/`feedback()`, this is documented (PHASE0-CONTRACT.md
         §10) to call `flush()`, i.e. it does synchronous I/O — callers that
         need a non-blocking end-of-run signal should not expect sub-millisecond
-        latency from this specific method. It is still bounded: `flush()`'s
-        `timeout_s` is a wall-clock budget for the whole drain, so a dead
-        server costs the host that budget once, not once per batch.
+        latency from this specific method. Its flush budget governs lock wait,
+        scheduling, and new HTTP attempts across the drain. A synchronous
+        HTTPX request already underway is cooperative rather than forcibly
+        cancellable at that deadline.
         """
         try:
             event = RunEnd(type="run_end", ts=self._clock.now(), payload={"status": status})
@@ -335,19 +359,21 @@ class TracebedClient:
     def flush(self, timeout_s: float = 5.0) -> FlushReport:
         """Force a synchronous drain-and-send. Never raises.
 
-        `timeout_s` is the budget for the WHOLE call, not per request: a host
-        calling `run_end()` at the end of every run must be able to bound what
-        an unreachable Tracebed costs it, and "5s per batch, N batches" is not
-        a bound.
+        ``timeout_s`` is a cooperative budget across lock acquisition and new
+        delivery attempts, not a strict wall-clock cancellation guarantee for
+        a synchronous HTTPX request already in progress. Retained work remains
+        pending for a later explicit or background pass.
         """
         try:
             return self._do_flush(timeout_s, report_drops=True)
         except Exception:
             logger.debug("tracebed sdk: flush() suppressed an internal error", exc_info=True)
-            return FlushReport(sent=0, dropped=0)
+            return FlushReport(
+                sent=0, dropped=self._take_reported_drops(), pending=self._buffer.pending_count
+            )
 
     def _do_flush(self, timeout_s: float, *, report_drops: bool) -> FlushReport:
-        """Drain-and-send until the buffer is empty or the deadline passes.
+        """Drain-and-send until the buffer is empty or the cooperative deadline passes.
 
         `report_drops` is False for background passes: `FlushReport.dropped` is
         specified (§10) as "cumulative drops since last flush() return", and the
@@ -355,59 +381,122 @@ class TracebedClient:
         the host's own `flush()` could ever see one — leaving D-033's data-loss
         counter reading zero precisely when data is being lost.
         """
-        with self._flush_lock:
-            deadline_ms = self._clock.monotonic_ms() + max(timeout_s, 0.0) * 1000.0
-            sent = 0
+        # The budget includes lock contention.  A timed-out caller makes no
+        # new attempt and cannot consume its drop report twice.
+        deadline_ms = self._clock.monotonic_ms() + max(timeout_s, 0.0) * 1000.0
+        remaining_s = max((deadline_ms - self._clock.monotonic_ms()) / 1000.0, 0.0)
+        if not self._flush_lock.acquire(timeout=remaining_s):
+            return self._report(sent=0, report_drops=report_drops)
+        sent = 0
+        try:
             while self._clock.monotonic_ms() < deadline_ms:
-                # The deadline is checked BEFORE draining: items only leave the
-                # ring when there is budget left to send them, so an expired
-                # budget leaves them buffered for the next pass instead of
-                # drained-then-destroyed.
-                items = self._buffer.drain(_MAX_DRAIN_BATCH)
+                items = self._buffer.lease(_MAX_DRAIN_BATCH)
                 if not items:
                     break
-                sent += self._dispatch(items, deadline_ms)
-                if len(items) < _MAX_DRAIN_BATCH:
+                settlement = _BatchSettlement(["retry"] * len(items), {})
+                try:
+                    self._dispatch(items, deadline_ms, settlement)
+                except Exception:
+                    # Keep every unsettled item for a later pass.  This is a
+                    # last-resort guard; normal dispatch classifies all post
+                    # failures itself so successful accounting is retained.
+                    logger.debug("tracebed sdk: dispatch failed", exc_info=True)
+                finally:
+                    # State is owned here, rather than reconstructed by the
+                    # exception path: a later helper failure must not replay an
+                    # already accepted item or discard a frozen retry body.
+                    self._buffer.settle(items, settlement.outcomes, settlement.replacements)
+                sent += settlement.sent
+                if "retry" in settlement.outcomes:
+                    # Do not spin or send a later kind around a failed item.
                     break
-            dropped = 0
-            if report_drops:
-                current_dropped = self._buffer.dropped_total
-                dropped = current_dropped - self._last_reported_dropped
-                self._last_reported_dropped = current_dropped
-            return FlushReport(sent=sent, dropped=dropped)
+        finally:
+            self._flush_lock.release()
+        return self._report(sent=sent, report_drops=report_drops)
 
-    def _dispatch(self, items: Sequence[BufferedItem], deadline_ms: float) -> int:
-        """Group one drained batch by kind and send each group. Never raises."""
-        traces = [item for item in items if item.kind == "trace"]
-        feedbacks = [item for item in items if item.kind == "feedback"]
-        proposals = [item for item in items if item.kind == "proposal"]
+    def _report(self, *, sent: int, report_drops: bool) -> FlushReport:
+        dropped = self._take_reported_drops() if report_drops else 0
+        return FlushReport(sent=sent, dropped=dropped, pending=self._buffer.pending_count)
 
-        sent = 0
-        if traces:
-            sent += self._send_trace_batch(traces, deadline_ms)
-        for item in feedbacks:
-            encoded = self._encode(item, "event")
-            if encoded is None:
+    def _take_reported_drops(self) -> int:
+        with self._drop_report_lock:
+            current_dropped = self._buffer.dropped_total
+            dropped = current_dropped - self._last_reported_dropped
+            self._last_reported_dropped = current_dropped
+            return dropped
+
+    def _dispatch(
+        self,
+        items: Sequence[BufferedItem],
+        deadline_ms: float,
+        settlement: _BatchSettlement,
+    ) -> None:
+        """Send FIFO leased work, batching only adjacent trace items."""
+        index = 0
+        while index < len(items):
+            # An expired budget means no attempt was made.  In particular, do
+            # not serialize a poison payload merely to drop it after expiry.
+            if self._clock.monotonic_ms() >= deadline_ms:
+                return
+            item = items[index]
+            if item.kind == "trace":
+                end = index
+                while end < len(items) and items[end].kind == "trace":
+                    end += 1
+                traces: list[tuple[int, BufferedItem]] = []
+                for trace_index in range(index, end):
+                    # One contiguous trace batch is one delivery group, but a
+                    # later member must still not be serialized after expiry.
+                    if self._clock.monotonic_ms() >= deadline_ms:
+                        return
+                    frozen = self._freeze(items[trace_index], "event")
+                    if frozen is None:
+                        settlement.outcomes[trace_index] = "dropped"
+                    else:
+                        settlement.replacements[trace_index] = frozen
+                        traces.append((trace_index, frozen))
+                if traces:
+                    result = self._post(
+                        "/v1/trace/batch",
+                        {
+                            "events": [
+                                {
+                                    "run_id": str(trace.run_id.value),
+                                    "seq": trace.seq,
+                                    "event": trace.encoded,
+                                }
+                                for _trace_index, trace in traces
+                            ]
+                        },
+                        deadline_ms,
+                    )
+                    if result == "retry":
+                        return
+                    for trace_index, _trace in traces:
+                        settlement.outcomes[trace_index] = result
+                    settlement.sent += len(traces) if result == "sent" else 0
+                index = end
                 continue
-            sent += self._post(
-                "/v1/feedback",
-                {"run_id": str(item.run_id.value), "event": encoded},
-                1,
-                deadline_ms,
-            )
-        for item in proposals:
-            encoded = self._encode(item, "proposal")
-            if encoded is None:
-                continue
-            sent += self._post(
-                "/v1/propose_memory",
-                {"run_id": str(item.run_id.value), "proposal": encoded},
-                1,
-                deadline_ms,
-            )
-        return sent
 
-    def _encode(self, item: BufferedItem, key: str) -> dict[str, object] | None:
+            key = "event" if item.kind == "feedback" else "proposal"
+            frozen = self._freeze(item, key)
+            if frozen is None:
+                settlement.outcomes[index] = "dropped"
+                index += 1
+                continue
+            settlement.replacements[index] = frozen
+            path = "/v1/feedback" if item.kind == "feedback" else "/v1/propose_memory"
+            payload_key = "event" if item.kind == "feedback" else "proposal"
+            result = self._post(
+                path, {"run_id": str(item.run_id.value), payload_key: frozen.encoded}, deadline_ms
+            )
+            if result == "retry":
+                return
+            settlement.outcomes[index] = result
+            settlement.sent += result == "sent"
+            index += 1
+
+    def _freeze(self, item: BufferedItem, key: str) -> BufferedItem | None:
         """JSON-encode one buffered model, or None if it cannot be encoded.
 
         `TraceEvent.payload` / `FeedbackEvent.payload` are `dict[str, Any]`, so
@@ -416,13 +505,26 @@ class TracebedClient:
         event. Batch-level serialisation would let it destroy the other 499 —
         and, uncaught, kill the flusher thread outright.
         """
+        if item.encoded is not None:
+            return item
         model = item.body.get(key)
         if not isinstance(model, BaseModel):
             self._flush_errors += 1
             logger.warning("tracebed sdk: dropped a buffered item with no %r model", key)
             return None
         try:
-            return model.model_dump(mode="json")
+            encoded = model.model_dump(mode="json")
+            # HTTPX performs its own JSON serialization later.  Validate the
+            # same Unicode/NaN constraints now so one wire-poisoned item is a
+            # terminal local drop instead of retrying an entire healthy batch.
+            json.dumps(encoded, ensure_ascii=False, allow_nan=False).encode("utf-8")
+            return BufferedItem(
+                run_id=item.run_id,
+                kind=item.kind,
+                seq=item.seq,
+                body=item.body,
+                encoded=encoded,
+            )
         except Exception:
             self._flush_errors += 1
             # WARNING, not DEBUG: unlike a network failure this is permanent
@@ -435,45 +537,36 @@ class TracebedClient:
             )
             return None
 
-    def _send_trace_batch(self, items: Sequence[BufferedItem], deadline_ms: float) -> int:
-        events: list[dict[str, object]] = []
-        for item in items:
-            encoded = self._encode(item, "event")
-            if encoded is None:
-                continue
-            events.append(
-                {
-                    "run_id": str(item.run_id.value),
-                    "seq": item.seq,
-                    "event": encoded,
-                }
-            )
-        if not events:
-            return 0
-        return self._post("/v1/trace/batch", {"events": events}, len(events), deadline_ms)
-
     def _post(
-        self, path: str, payload: Mapping[str, object], count: int, deadline_ms: float
-    ) -> int:
-        """POST one batch/single. On any failure: swallow, count, return 0 sent.
-
-        Items are already drained from the ring buffer by the time this runs
-        (§10: drain happens before send), so a failed send loses those items —
-        the same fail-open trade-off as an unbuffered fire-and-forget call:
-        Tracebed being down costs Tracebed data, never host application
-        correctness or latency.
-        """
-        remaining_s = (deadline_ms - self._clock.monotonic_ms()) / 1000.0
-        if remaining_s <= 0:
-            self._flush_errors += 1
-            return 0
+        self, path: str, payload: Mapping[str, object], deadline_ms: float
+    ) -> Literal["sent", "dropped", "retry"]:
+        """POST once. HTTPX limits phases cooperatively; it cannot cancel a socket exactly at the deadline."""
+        # Do not invoke a potentially slow token provider when serialization
+        # already consumed the cooperative budget and no request may start.
+        if self._clock.monotonic_ms() >= deadline_ms:
+            return "retry"
         try:
-            response = self._http.post(
-                path, json=payload, headers=self._auth_headers(), timeout=remaining_s
+            headers = self._auth_headers(for_write=True)
+        except _WriteTokenUnavailable:
+            return "retry"
+        try:
+            # Token acquisition may itself consume the remaining cooperative
+            # budget. Recheck before initiating an HTTP request.
+            remaining_s = (deadline_ms - self._clock.monotonic_ms()) / 1000.0
+            if remaining_s <= 0:
+                return "retry"
+            response = self._http.post(path, json=payload, headers=headers, timeout=remaining_s)
+            if 200 <= response.status_code < 300:
+                return "sent"
+            if response.status_code in {408, 429} or response.status_code >= 500:
+                self._flush_errors += 1
+                return "retry"
+            self._flush_errors += 1
+            logger.warning(
+                "tracebed sdk: dropping POST %s with HTTP %s", path, response.status_code
             )
-            response.raise_for_status()
-            return count
+            return "dropped"
         except Exception:
             self._flush_errors += 1
             logger.debug("tracebed sdk: flush POST %s failed", path, exc_info=True)
-            return 0
+            return "retry"

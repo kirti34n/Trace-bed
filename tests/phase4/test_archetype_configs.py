@@ -23,9 +23,6 @@ lies is worse than a doc that is missing — it gets trusted:
   * `TestAdapterGuideMatchesPorts` parses the ```python blocks in `docs/ADAPTER-GUIDE.md` and
     compares each documented `Protocol` method against the live source by AST, so a port
     whose signature changes fails CI here rather than misleading an integrator.
-  * `TestAtomStubs` does the same for `adapters/atom/stubs.py`, and additionally asserts the
-    stubs stay inert (construction raises) — a documentation artifact that can be constructed
-    and satisfies a `@runtime_checkable` Protocol is integration code by accident.
 """
 
 from __future__ import annotations
@@ -58,7 +55,6 @@ REPO_ROOT: Path = Path(__file__).resolve().parents[2]
 ARCHETYPES_DIR: Path = REPO_ROOT / "docs" / "archetypes"
 ARCHETYPE_DOC: Path = REPO_ROOT / "docs" / "ARCHETYPE-CONFIGS.md"
 ADAPTER_GUIDE: Path = REPO_ROOT / "docs" / "ADAPTER-GUIDE.md"
-ATOM_README: Path = REPO_ROOT / "src" / "tracebed" / "adapters" / "atom" / "README.md"
 
 # The three archetypes this chunk ships (docs/ARCHETYPE-CONFIGS.md). Listed explicitly,
 # not discovered by glob, so a stray or misnamed file in the directory fails loudly as
@@ -574,27 +570,12 @@ class TestArchetypeDirectoryIsExactlyTheDocumentedThree:
 
 
 # --------------------------------------------------------------------------- #
-# docs/ADAPTER-GUIDE.md and adapters/atom/ — the other half of this chunk.
+# docs/ADAPTER-GUIDE.md — the adapter-documentation half of this chunk.
 #
-# Both documents quote code. A quoted signature that has drifted from the source is the
-# worst kind of documentation defect, because the integrator who trusts it writes an adapter
+# The document quotes code. A quoted signature that has drifted from the source is the
+# worst kind of documentation defect, because an integrator who trusts it writes an adapter
 # that type-checks against a shape nothing calls.
 # --------------------------------------------------------------------------- #
-
-# stub class -> the ONE `adapters.ports` Protocol it claims to satisfy. Hardcoded here on
-# purpose: this is the mapping `adapters/atom/README.md` publishes to an integrator, so a
-# test that derived it from the stubs themselves could only ever prove the stubs agree with
-# themselves. `test_readme_table_matches_the_exported_stubs` binds the README to this table.
-_ATOM_STUB_PORTS: dict[str, str] = {
-    "AtomKeycloakPrincipalPort": "PrincipalPort",
-    "AtomGateLLMProvider": "LLMProviderPort",
-    "AtomGateEmbeddingProvider": "EmbeddingPort",
-    "AtomBuilderInvalidationSource": "InvalidationPort",
-    "AtomWorkflowFeedbackAdapter": "FeedbackPort",
-    "AtomAgentArmorFeedbackAdapter": "FeedbackPort",
-    "AtomPolicyExecutorVerdictAdapter": "FeedbackPort",
-    "AtomMinioAuditSink": "AuditSinkPort",
-}
 
 
 class TestAdapterGuideMatchesPorts:
@@ -629,10 +610,21 @@ class TestAdapterGuideMatchesPorts:
         from tracebed.adapters import ports
 
         # The guide is the host-implements contract, so it covers the eight PLAN.md §3 ports.
-        # `QueueProducerPort`/`QueueConsumerPort`/`TelemetryPort` are internal seams, not
-        # host-implements ports, and are deliberately out of scope -- named here rather than
-        # silently subtracted.
-        internal = {"QueueProducerPort", "QueueConsumerPort", "TelemetryPort"}
+        # Queue authority carriers and consumers are internal runtime seams,
+        # not host-implements ports. They are deliberately named here rather
+        # than silently subtracted.
+        internal = {
+            "AccessResolverPort",
+            "AuthorizedQueueProducerPort",
+            "AuthorizedQueueWrite",
+            "OutcomeQueuePayload",
+            "ProposalQueuePayload",
+            "QueueProducerPort",
+            "QueueConsumerPort",
+            "TelemetryPort",
+            "TraceQueuePayload",
+            "WorkerQueueConsumerPort",
+        }
         assert set(ports.__all__) - internal == set(documented)
 
     def test_documented_signatures_match_the_live_protocols(
@@ -651,114 +643,3 @@ class TestAdapterGuideMatchesPorts:
                     f"ADAPTER-GUIDE.md's `{class_name}.{method}` is documented as "
                     f"{signature}, source says {live[method]}"
                 )
-
-
-class TestAtomStubs:
-    """`adapters/atom/` is documentation with type signatures attached (PLAN.md §4:
-    "documented interface stubs ONLY -- the human writes the integration").
-
-    Two properties have to hold for that to stay true, and neither is self-evident from
-    reading the file: nothing is constructible, and every declared method still matches the
-    port it documents. The first was genuinely broken -- the three `FeedbackPort` stubs
-    declared no `__init__`, so they inherited `object.__init__`, constructed silently, and
-    (because `FeedbackPort` is `@runtime_checkable`) passed an `isinstance` wiring check,
-    deferring the failure to the first real outcome event.
-    """
-
-    @staticmethod
-    @pytest.fixture(scope="class")
-    def exported() -> dict[str, type]:
-        from tracebed.adapters import atom
-
-        return {name: getattr(atom, name) for name in atom.__all__}
-
-    def test_the_export_set_is_exactly_the_documented_mapping(
-        self, exported: dict[str, type]
-    ) -> None:
-        assert set(exported) == set(_ATOM_STUB_PORTS)
-
-    def test_every_stub_refuses_construction(self, exported: dict[str, type]) -> None:
-        for name, cls in exported.items():
-            signature = inspect.signature(cls.__init__)
-            kwargs = {
-                param.name: "x"
-                for param in signature.parameters.values()
-                if param.name != "self" and param.kind is not inspect.Parameter.VAR_KEYWORD
-            }
-            with pytest.raises(NotImplementedError) as excinfo:
-                cls(**kwargs)
-            # The message must name the port, or an integrator reading a traceback learns
-            # nothing about what to implement instead.
-            assert _ATOM_STUB_PORTS[name] in str(excinfo.value)
-            assert "ADAPTER-GUIDE.md" in str(excinfo.value)
-
-    def test_every_stub_declares_its_ports_methods_with_the_ports_signature(
-        self, exported: dict[str, type]
-    ) -> None:
-        from tracebed.adapters import ports
-
-        for name, cls in exported.items():
-            port = getattr(ports, _ATOM_STUB_PORTS[name])
-            stub_sigs = _live_signatures(cls)
-            for method, signature in _live_signatures(port).items():
-                assert method in stub_sigs, f"{name} does not declare {port.__name__}.{method}"
-                assert stub_sigs[method] == signature, (
-                    f"{name}.{method} is {stub_sigs[method]}, "
-                    f"{port.__name__}.{method} is {signature}"
-                )
-
-    def test_readme_table_matches_the_exported_stubs(self, exported: dict[str, type]) -> None:
-        """The README's "What is stubbed, and what is not" table is what an integrator reads
-        to decide which port they have to write themselves.
-
-        Parsed as a TABLE, not by scanning the whole file for backticked `Atom*` names: the
-        first version of this assertion did the latter and survived its own mutation, because
-        renaming a row's class still left the correct name mentioned in the prose two sections
-        down. The mapping column is checked too, so a row cannot point at the wrong port.
-        """
-        rows: dict[str, str] = {}
-        for line in ATOM_README.read_text(encoding="utf-8").splitlines():
-            match = _TABLE_ROW.match(line)
-            if not match:
-                continue
-            cells = [c.strip().strip("`") for c in match.group("cells").split("|")]
-            if len(cells) != 3 or cells[0] in {"Atom component", ""} or set(cells[0]) <= {"-"}:
-                continue
-            rows[cells[2]] = cells[1]
-        assert set(rows) == set(exported)
-        # "`FeedbackPort` (downstream)" / "`FeedbackPort` (verdict)": the Protocol is the
-        # first token, and the qualifier after it is the adapter CLASS, not a second port.
-        assert {
-            stub: port.split()[0].strip("`") for stub, port in rows.items()
-        } == _ATOM_STUB_PORTS
-
-    def test_the_audit_sink_gap_is_still_real(self) -> None:
-        """`docs/ADAPTER-GUIDE.md` and `adapters/atom/README.md` both state, as a reported
-        contract gap, that no concrete `AuditSinkPort` implementation exists anywhere in
-        `src/tracebed/`. That claim ages: the day someone writes one, both documents become
-        wrong in the direction that matters (an integrator re-implements a port that ships).
-
-        So the claim is pinned. A failure here is not a defect in the sink -- it means the gap
-        closed and the two documents need updating.
-        """
-        implementors: list[str] = []
-        for path in (REPO_ROOT / "src" / "tracebed").rglob("*.py"):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.ClassDef):
-                    continue
-                bases = {ast.unparse(base) for base in node.bases}
-                if "Protocol" in bases:  # the port itself, or a locally-declared twin
-                    continue
-                if path.parts[-2:] == ("atom", "stubs.py"):  # the documented stub
-                    continue
-                if any(
-                    isinstance(item, ast.FunctionDef) and item.name == "emit"
-                    for item in node.body
-                ):
-                    implementors.append(f"{path.relative_to(REPO_ROOT)}::{node.name}")
-        assert not implementors, (
-            "an AuditSinkPort-shaped implementation now exists "
-            f"({implementors}); update docs/ADAPTER-GUIDE.md and adapters/atom/README.md, "
-            "both of which still report this as an open contract gap"
-        )

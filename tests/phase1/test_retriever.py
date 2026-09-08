@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Sequence
 
 import pytest
+from psycopg.errors import QueryCanceled
 
 from tracebed.adapters.ports import EmbeddingPort
 from tracebed.domain.clock import FakeClock
@@ -33,7 +34,9 @@ MEM_B = MemoryId(uuid.UUID(int=2))
 
 
 def _hit(memory_id: MemoryId, raw_score: float) -> ArmHit:
-    return ArmHit(memory_id=memory_id, raw_score=raw_score, trust_tier=TrustTier.A, status=Status.VALIDATED)
+    return ArmHit(
+        memory_id=memory_id, raw_score=raw_score, trust_tier=TrustTier.A, status=Status.VALIDATED
+    )
 
 
 class _FakeSearch:
@@ -54,6 +57,7 @@ class _FakeSearch:
         top_n: int,
         *,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         self.lexical_calls.append((project_id, query, top_n))
         return self._lexical
@@ -67,6 +71,7 @@ class _FakeSearch:
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[ArmHit]:
         self.vector_calls.append(
             (project_id, embedding, top_n, hnsw_iterative_scan, hnsw_max_scan_tuples)
@@ -214,6 +219,7 @@ def test_both_arms_run_concurrently() -> None:
             top_n: int,
             *,
             statement_timeout_ms: int | None = None,
+            deadline: object | None = None,
         ) -> list[ArmHit]:
             barrier.wait()
             with lock:
@@ -229,6 +235,7 @@ def test_both_arms_run_concurrently() -> None:
             hnsw_iterative_scan: bool,
             hnsw_max_scan_tuples: int,
             statement_timeout_ms: int | None = None,
+            deadline: object | None = None,
         ) -> list[ArmHit]:
             barrier.wait()
             with lock:
@@ -263,6 +270,7 @@ def test_lexical_arm_starts_before_the_embed_call_returns() -> None:
             top_n: int,
             *,
             statement_timeout_ms: int | None = None,
+            deadline: object | None = None,
         ) -> list[ArmHit]:
             lexical_started.set()
             return []
@@ -276,6 +284,7 @@ def test_lexical_arm_starts_before_the_embed_call_returns() -> None:
             hnsw_iterative_scan: bool,
             hnsw_max_scan_tuples: int,
             statement_timeout_ms: int | None = None,
+            deadline: object | None = None,
         ) -> list[ArmHit]:
             return []
 
@@ -334,9 +343,7 @@ def test_fused_top_n_comes_from_config_and_is_not_a_hardcoded_number() -> None:
 
     # Default is 20 (PLAN.md §6) -- above the ten available hits, so nothing is cut.
     assert len(retriever.retrieve(PROJECT, "q", cfg=RetrievalConfig()).candidates) == 10
-    assert len(
-        retriever.retrieve(PROJECT, "q", cfg=RetrievalConfig(fused_top_n=7)).candidates
-    ) == 7
+    assert len(retriever.retrieve(PROJECT, "q", cfg=RetrievalConfig(fused_top_n=7)).candidates) == 7
 
 
 @pytest.mark.parametrize("bad_top_n", [0, -5])
@@ -427,6 +434,24 @@ def test_embed_latency_is_measured_from_the_injected_clock() -> None:
 # --------------------------------------------------------------------------- #
 
 
+def test_expired_search_arm_query_canceled_degrades_instead_of_raising_store_error() -> None:
+    clock = FakeClock()
+
+    class _CanceledSearch(_FakeSearch):
+        def lexical_arm(
+            self, *args: object, deadline: object | None = None, **kwargs: object
+        ) -> list[ArmHit]:
+            clock.advance(ms=300)
+            raise QueryCanceled("statement timeout")
+
+    retriever = Retriever(_CanceledSearch(), _FakeEmbeddingPort(), clock)
+    try:
+        outcome = retriever.retrieve(PROJECT, "query", cfg=RetrievalConfig(total_budget_ms=300))
+    finally:
+        retriever.close()
+    assert outcome.degraded is True
+
+
 def test_concurrent_arms_complete_faster_than_the_sum_of_their_latencies() -> None:
     class _SlowSearch:
         def lexical_arm(
@@ -436,6 +461,7 @@ def test_concurrent_arms_complete_faster_than_the_sum_of_their_latencies() -> No
             top_n: int,
             *,
             statement_timeout_ms: int | None = None,
+            deadline: object | None = None,
         ) -> list[ArmHit]:
             time.sleep(0.05)
             return []
@@ -449,6 +475,7 @@ def test_concurrent_arms_complete_faster_than_the_sum_of_their_latencies() -> No
             hnsw_iterative_scan: bool,
             hnsw_max_scan_tuples: int,
             statement_timeout_ms: int | None = None,
+            deadline: object | None = None,
         ) -> list[ArmHit]:
             time.sleep(0.05)
             return []

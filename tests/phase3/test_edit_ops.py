@@ -1,9 +1,6 @@
-"""`workers.edit_ops` — pin, delete-by-subject, merge, operator_edit (PLAN.md §7 Phase 3).
+"""`workers.edit_ops` — pin, merge, operator_edit (PLAN.md §7 Phase 3).
 
-Fully offline. `_FakeEditRepo` is an in-memory `MemoryEditRepoPort`; `FakeSubjectKeyStore`/
-`FakeMasterKeyProvider` mirror `tests/phase0/test_crypto_shred.py`'s own fakes exactly
-(the crypto-shredding mechanics themselves are already proven there — this suite proves
-`EditOps.delete_by_subject` composes with them correctly, not that AES-GCM works).
+Fully offline. `_FakeEditRepo` is an in-memory `MemoryEditRepoPort`.
 
 Every assertion that a write happened checks it went through `domain.state_machine.apply`
 by checking the actual TRANSITIONS the machine allows: an "illegal" attempt (an
@@ -14,20 +11,12 @@ manufactured status.
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
 from datetime import UTC, datetime
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 
-from tracebed.crypto.shred import (
-    EncryptedPayload,
-    PlainSection,
-    SubjectKeyManager,
-    TombstonedSection,
-)
-from tracebed.domain.clock import Clock, FakeClock
+from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import (
     AbstentionConfig,
     BudgetConfig,
@@ -123,9 +112,6 @@ class _FakeEditRepo:
     def get_memory_by_id(self, project_id: ProjectId, memory_id: MemoryId) -> EditableMemory:
         return self._rows[memory_id]
 
-    def select_by_subject_tag(self, project_id: ProjectId, subject_tag: str) -> list[EditableMemory]:
-        return [r for r in self._rows.values() if r.subject_tag == subject_tag]
-
     def persist_status(self, project_id: ProjectId, write: MemoryStatusWrite) -> None:
         self.persisted.append(write)
         old = self._rows[write.memory_id]
@@ -158,68 +144,11 @@ class _FakeEditRepo:
         return memory_id
 
 
-@dataclass(frozen=True, slots=True)
-class _FakeSubjectKeyRow:
-    """Structurally identical to `stores.pg.rows.SubjectKeyRow` — mirrors
-    `tests/phase0/test_crypto_shred.py::_FakeSubjectKeyRow` exactly."""
-
-    subject_tag: str
-    key_id: UUID
-    wrapped_kek: bytes
-    created_at: datetime
-    destroyed_at: datetime | None
-
-
-class FakeSubjectKeyStore:
-    """Mirrors `tests/phase0/test_crypto_shred.py::FakeSubjectKeyStore` exactly."""
-
-    def __init__(self, clock: Clock) -> None:
-        self._clock = clock
-        self._rows: dict[tuple[ProjectId, str], _FakeSubjectKeyRow] = {}
-
-    def get_subject_key(self, project_id: ProjectId, subject_tag: str) -> _FakeSubjectKeyRow | None:
-        return self._rows.get((project_id, subject_tag))
-
-    def insert_subject_key(
-        self, project_id: ProjectId, subject_tag: str, key_id: UUID, wrapped_kek: bytes
-    ) -> None:
-        self._rows[(project_id, subject_tag)] = _FakeSubjectKeyRow(
-            subject_tag=subject_tag,
-            key_id=key_id,
-            wrapped_kek=wrapped_kek,
-            created_at=self._clock.now(),
-            destroyed_at=None,
-        )
-
-    def destroy_subject_key(self, project_id: ProjectId, subject_tag: str) -> bool:
-        row = self._rows.get((project_id, subject_tag))
-        if row is None:
-            return False
-        self._rows[(project_id, subject_tag)] = _FakeSubjectKeyRow(
-            subject_tag=row.subject_tag,
-            key_id=row.key_id,
-            wrapped_kek=b"",
-            created_at=row.created_at,
-            destroyed_at=self._clock.now(),
-        )
-        return True
-
-
-class FakeMasterKeyProvider:
-    def __init__(self, key: bytes | None = None) -> None:
-        self._key = key if key is not None else os.urandom(32)
-
-    def master_key(self) -> bytes:
-        return self._key
-
-
-def _edit_ops(rows: list[EditableMemory] | None = None) -> tuple[EditOps, _FakeEditRepo, FakeClock, SubjectKeyManager]:
+def _edit_ops(rows: list[EditableMemory] | None = None) -> tuple[EditOps, _FakeEditRepo, FakeClock, None]:
     clock = FakeClock(EPOCH)
     repo = _FakeEditRepo(rows)
-    key_store = FakeSubjectKeyStore(clock)
-    key_manager = SubjectKeyManager(key_store, FakeMasterKeyProvider(), clock)
-    ops = EditOps(repo, key_manager, clock)
-    return ops, repo, clock, key_manager
+    ops = EditOps(repo, clock)
+    return ops, repo, clock, None
 
 
 # --------------------------------------------------------------------------- #
@@ -270,30 +199,10 @@ def test_pin_refuses_content_the_scan_suite_rejects() -> None:
     assert repo.inserted == []
 
 
-def test_pinned_preference_carries_its_subject_tag_and_is_erasable_by_subject() -> None:
-    """The round trip that makes the erasure path reach this module's own output: a
-    pinned preference ABOUT a person is subject data, `delete_by_subject` finds rows only
-    through `memory_item.subject_tag`, so a `pin()` that could not record one created
-    permanently un-erasable content."""
-    ops, repo, _clock, _km = _edit_ops()
-    cfg = _effective_config()
-
-    result = ops.pin(
-        PROJECT,
-        content="Prefers metric units in every summary.",
-        principal_id=PRINCIPAL,
-        scope_type=ScopeType.USER,
-        scope_id=uuid4(),
-        cfg=cfg,
-        subject_tag="user:alice",
-    )
-
-    item, _verdict = repo.inserted[0]
-    assert item.subject_tag == "user:alice"
-
-    deleted = ops.delete_by_subject(PROJECT, "user:alice", cfg=cfg)
-    assert deleted.tombstoned_memory_ids == (result.memory_id,)
-    assert repo.get_memory_by_id(PROJECT, result.memory_id).status is Status.TOMBSTONED
+def test_edit_ops_exposes_no_erasure_operation() -> None:
+    """E2 publishes/fences requests only; an ordinary edit worker cannot erase data."""
+    ops, _repo, _clock, _unused = _edit_ops()
+    assert not hasattr(ops, "delete_by_subject")
 
 
 def test_pin_derives_the_token_count_from_the_content_it_actually_stores() -> None:
@@ -362,140 +271,6 @@ def test_a_status_write_refuses_a_non_transition() -> None:
             to_status=Status.VALIDATED,
             now=EPOCH,
         )
-
-
-# --------------------------------------------------------------------------- #
-# delete_by_subject
-# --------------------------------------------------------------------------- #
-
-
-def test_delete_by_subject_tombstones_matching_memories_and_leaves_others_alone() -> None:
-    tagged_a = _row(_mid(), status=Status.VALIDATED, subject_tag="user:alice")
-    tagged_a_candidate = _row(_mid(), status=Status.CANDIDATE, subject_tag="user:alice")
-    tagged_b = _row(_mid(), status=Status.VALIDATED, subject_tag="user:bob")
-    untagged = _row(_mid(), status=Status.VALIDATED, subject_tag=None)
-    already_gone = _row(_mid(), status=Status.TOMBSTONED, subject_tag="user:alice")
-
-    ops, repo, _clock, key_manager = _edit_ops(
-        [tagged_a, tagged_a_candidate, tagged_b, untagged, already_gone]
-    )
-    key_manager.get_or_create_subject_kek(PROJECT, "user:alice")  # seed a real KEK to destroy
-    cfg = _effective_config()
-
-    result = ops.delete_by_subject(PROJECT, "user:alice", cfg=cfg)
-
-    assert result.key_destroyed is True
-    assert set(result.tombstoned_memory_ids) == {tagged_a.id, tagged_a_candidate.id}
-    assert result.already_tombstoned_memory_ids == (already_gone.id,)
-    assert repo.get_memory_by_id(PROJECT, tagged_a.id).status is Status.TOMBSTONED
-    assert repo.get_memory_by_id(PROJECT, tagged_a_candidate.id).status is Status.TOMBSTONED
-    # Untouched: different subject, or no subject at all.
-    assert repo.get_memory_by_id(PROJECT, tagged_b.id).status is Status.VALIDATED
-    assert repo.get_memory_by_id(PROJECT, untagged.id).status is Status.VALIDATED
-    # Every write is exactly what apply() authorised: from the row's own live status.
-    by_id = {w.memory_id: w for w in repo.persisted}
-    assert by_id[tagged_a.id].from_status is Status.VALIDATED
-    assert by_id[tagged_a.id].to_status is Status.TOMBSTONED
-    assert by_id[tagged_a_candidate.id].from_status is Status.CANDIDATE
-    assert by_id[tagged_a_candidate.id].to_status is Status.TOMBSTONED
-
-
-def test_delete_by_subject_destroys_the_kek_and_leaves_trace_object_bytes_intact() -> None:
-    """The literal task assertion: the subject's sections become unreadable while the
-    stored object's bytes never change, composed through `EditOps.delete_by_subject`
-    rather than calling `SubjectKeyManager` directly (the crypto mechanics themselves are
-    already proven in `tests/phase0/test_crypto_shred.py`)."""
-    ops, _repo, _clock, key_manager = _edit_ops([])
-    run_id = mint_run_id()
-
-    alice_section = PlainSection(
-        seq_from=0, seq_to=0, subject_tags=("user:alice",), lines=(b'{"seq":0}',)
-    )
-    bob_section = PlainSection(
-        seq_from=1, seq_to=1, subject_tags=("user:bob",), lines=(b'{"seq":1}',)
-    )
-    payload = key_manager.encrypt(PROJECT, run_id, [alice_section, bob_section])
-    object_bytes_before = payload.to_bytes()
-
-    cfg = _effective_config()
-    result = ops.delete_by_subject(PROJECT, "user:alice", cfg=cfg)
-    assert result.key_destroyed is True
-
-    object_bytes_after = payload.to_bytes()
-    assert object_bytes_after == object_bytes_before  # stored object bytes never change
-
-    reparsed = EncryptedPayload.from_bytes(object_bytes_after)
-    sections = key_manager.decrypt(PROJECT, reparsed)
-    assert isinstance(sections[0], TombstonedSection)  # alice: unreadable
-    assert isinstance(sections[1], PlainSection)  # bob: untouched
-    assert sections[1].lines == bob_section.lines
-
-
-def test_delete_by_subject_refuses_a_row_the_store_tagged_with_another_subject() -> None:
-    """A store that returns a row outside the requested subject must stop the erasure
-    BEFORE anything is tombstoned — a subject-scoped delete that half-erases an
-    unknown-correct row set is worse than one that refuses."""
-    wanted = _row(_mid(), status=Status.VALIDATED, subject_tag="user:alice")
-    lied_about = _row(_mid(), status=Status.VALIDATED, subject_tag="user:bob")
-
-    class _LyingRepo(_FakeEditRepo):
-        def select_by_subject_tag(
-            self, project_id: ProjectId, subject_tag: str
-        ) -> list[EditableMemory]:
-            return list(self._rows.values())  # ignores the filter entirely
-
-    clock = FakeClock(EPOCH)
-    repo = _LyingRepo([wanted, lied_about])
-    key_manager = SubjectKeyManager(FakeSubjectKeyStore(clock), FakeMasterKeyProvider(), clock)
-    ops = EditOps(repo, key_manager, clock)
-
-    with pytest.raises(TracebedError, match="outside the requested subject"):
-        ops.delete_by_subject(PROJECT, "user:alice", cfg=_effective_config())
-
-    assert repo.persisted == []
-    assert repo.get_memory_by_id(PROJECT, wanted.id).status is Status.VALIDATED
-
-
-def test_delete_by_subject_refuses_a_foreign_project_row_before_writing_anything() -> None:
-    mine = _row(_mid(), status=Status.VALIDATED, subject_tag="user:alice")
-    foreign = EditableMemory(
-        id=_mid(),
-        project_id=ProjectId(uuid4()),
-        status=Status.VALIDATED,
-        trust_tier=TrustTier.B,
-        mem_type=MemType.LESSON,
-        provenance=Provenance(cls=ProvenanceClass.DISTILLER, trace_ids=(mint_run_id(),)),
-        status_changed_at=EPOCH,
-        subject_tag="user:alice",
-    )
-    ops, repo, _clock, _km = _edit_ops([mine, foreign])
-
-    with pytest.raises(TracebedError, match="invariant 4"):
-        ops.delete_by_subject(PROJECT, "user:alice", cfg=_effective_config())
-
-    assert repo.persisted == []
-
-
-def test_delete_by_subject_refuses_an_empty_subject_tag() -> None:
-    """`SubjectKeyManager._get_or_create_kek` refuses an empty tag on the create side;
-    the delete side must not accept one either, or `""` becomes a wildcard that destroys
-    no key and selects whatever rows happen to carry an empty tag."""
-    ops, repo, _clock, _km = _edit_ops([])
-    with pytest.raises(ValueError, match="non-empty subject_tag"):
-        ops.delete_by_subject(PROJECT, "", cfg=_effective_config())
-    assert repo.persisted == []
-
-
-def test_delete_by_subject_with_no_matching_memories_and_no_kek_is_a_clean_no_op() -> None:
-    ops, repo, _clock, _km = _edit_ops([])
-    cfg = _effective_config()
-
-    result = ops.delete_by_subject(PROJECT, "user:nobody", cfg=cfg)
-
-    assert result.key_destroyed is False
-    assert result.tombstoned_memory_ids == ()
-    assert result.already_tombstoned_memory_ids == ()
-    assert repo.persisted == []
 
 
 # --------------------------------------------------------------------------- #

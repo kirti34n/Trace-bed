@@ -37,12 +37,11 @@ in this module exists to keep that true at the one place a bypass would matter:
    legal edge means: the row stops being permanently exempt from the state machine's own
    handling the instant `apply()` is asked to judge its fate again, via
    `pinned -> tombstoned` with `erasure_or_approved_delete=True` -- the SAME governed
-   transition every other terminal exit in this codebase uses (`workers.edit_ops
-   .EditOps.delete_by_subject`, `workers.invalidator`'s stale->retired path, and so on).
+   transition lifecycle workers use for approved retirement.
    `unpin()` calls `apply()` for that edge and persists exactly what it returns, like every
    other write in this module: it never computes a status of its own. Content is preserved on
-   the tombstoned row; crypto-shredding a subject's KEK is a SEPARATE, unrelated act
-   (`workers.edit_ops.EditOps.delete_by_subject`) that this module does not perform, and
+   the tombstoned row; key destruction is reserved for a future, separately-authorized
+   erasure saga and this module does not perform it, and
    re-admitting the same content under governed provenance (e.g. a fresh `propose_memory`
    submission, or distiller output) is a distinct, later operation, not something `unpin`
    does on the caller's behalf.

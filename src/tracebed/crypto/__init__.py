@@ -16,20 +16,27 @@ from tracebed.crypto.shred import (
     PROJECT_SUBJECT_TAG,
     EncryptedPayload,
     EnvMasterKeyProvider,
+    KeyBindingMismatch,
+    KeyMaterialUnavailable,
     MasterKeyProvider,
     PlainSection,
     SubjectKeyManager,
     SubjectKeyStore,
     TombstonedSection,
 )
+from tracebed.crypto.subject_digest import SUBJECT_DIGEST_DOMAIN, subject_digest
 
 __all__ = [
     "PROJECT_SUBJECT_TAG",
+    "SUBJECT_DIGEST_DOMAIN",
     "EncryptedPayload",
     "EnvMasterKeyProvider",
+    "KeyBindingMismatch",
+    "KeyMaterialUnavailable",
     "MasterKeyProvider",
     "PlainSection",
     "SubjectKeyManager",
     "SubjectKeyStore",
     "TombstonedSection",
+    "subject_digest",
 ]

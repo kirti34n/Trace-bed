@@ -64,8 +64,8 @@ matching this chunk's own test list exactly:
    i.e. a caller's list ordering decides whether the gate applies at all.
 4. **Scan** (`core.scans.scan`, D-024): runs on the LLM's PARSED `content` field before any
    state-machine call and before any write -- "scan wired on the parser path" applies to the
-   quality lane exactly as it does to Tier A's extractors (`workers.extractors.base.emit_candidate`
-   follows the identical order: render -> scan -> mint verdict -> `apply` -> insert).
+   quality lane exactly as it does to Tier A's fenced finalizer path: parse ->
+   scan -> mint verdict -> `apply` -> insert.
 
 PROMPT SIZING: the trace is the caller's raw, attacker-shaped data (unlike Tier A's
 zero-byte-passthrough rule, D-019, which does not apply to the quality lane's *input* -- the
@@ -135,17 +135,18 @@ from tracebed.domain.errors import NotFound, TracebedError
 from tracebed.domain.events import TraceEvent
 from tracebed.domain.ids import MemoryId, ProjectId, RunId
 from tracebed.domain.memory import NewMemoryItem, Provenance
+from tracebed.domain.scan import ScanVerdict
 from tracebed.domain.scope import ProjectScope
 from tracebed.domain.signatures import SIG_HASH_LEN, same_cluster
 from tracebed.domain.state_machine import Status, TransitionEvidence, TransitionLimits, apply
 from tracebed.stores.pg.rows import TraceIndexRow
 from tracebed.workers.epochs import EpochStorePort, JudgePin, ScoringEpoch, resolve_epoch
-from tracebed.workers.extractors import MemoryWriterPort
 
 __all__ = [
     "DISTILLABLE_OUTCOME_STATUSES",
     "KIND_RE",
     "DistillationOutcome",
+    "DistillationStorePort",
     "Distiller",
     "ExistingDistillation",
     "KnownDistillationPort",
@@ -159,6 +160,23 @@ __all__ = [
 # (D-019) and preference is operator-only (`state_machine._guard_none_to_pinned` requires
 # `ProvenanceClass.OPERATOR`) -- neither is a judgement call an LLM gets to make from a trace.
 _ALLOWED_MEM_TYPES: Final = (MemType.LESSON, MemType.SEMANTIC)
+
+
+@runtime_checkable
+class DistillationStorePort(Protocol):
+    """The sole persistence operation the quality distiller needs.
+
+    Tier-A extractors are intentionally pure plans. Distillation has its own
+    independently fenced write path and declares this narrow seam locally
+    rather than coupling the quality lane to a separate planner's API.
+    """
+
+    def insert_memory_item(
+        self,
+        project_id: ProjectId,
+        item: NewMemoryItem,
+        scan_verdict: ScanVerdict,
+    ) -> MemoryId: ...
 
 # ALLOW-list, not "everything except INCOMPLETE" -- see gate 1 in the module docstring. These
 # are exactly the three values `ingest.trace_writer._resolve_completeness` can return once a
@@ -579,8 +597,7 @@ class KnownDistillationPort(Protocol):
     """Existing quality-lane distillations' identity signatures for this project.
 
     CONTRACT GAP (reported): no method on `stores.pg.repo.Repo` satisfies this today (no
-    signature-scoped query over `memory_item` exists at all -- the identical gap
-    `workers.tier_a_lane.KnownContentPort` documents for Tier A's content-hash dedup). This is a
+    signature-scoped query over `memory_item` exists at all. This is a
     DISTINCT mechanism from `workers.novelty.NoveltyGate`, not an extension of it:
     `NoveltyGate.decide` hashes a `TierANote`'s closed-vocabulary identity fields
     (`error_class`/`tool_id`/`tool_version`/`payload_class_hash`), and a distilled artifact has
@@ -685,7 +702,7 @@ class Distiller:
     clock: Clock
     llm: LLMProviderPort
     llm_config: LLMProviderConfig
-    writer: MemoryWriterPort
+    writer: DistillationStorePort
     trace_index: TraceIndexPort
     spend: SpendRecorderPort
     known_distillations: KnownDistillationPort

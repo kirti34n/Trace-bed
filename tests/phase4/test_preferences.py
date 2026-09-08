@@ -130,11 +130,6 @@ class _FakePreferenceRepo:
     def get_memory_by_id(self, project_id: ProjectId, memory_id: MemoryId) -> EditableMemory:
         return self._rows[memory_id]
 
-    def select_by_subject_tag(
-        self, project_id: ProjectId, subject_tag: str
-    ) -> list[EditableMemory]:
-        return [r for r in self._rows.values() if r.subject_tag == subject_tag]
-
     def persist_status(self, project_id: ProjectId, write: MemoryStatusWrite) -> None:
         self.persisted.append(write)
         old = self._rows[write.memory_id]

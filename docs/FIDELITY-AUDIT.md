@@ -1,3 +1,10 @@
+# Archived fidelity audit — Tracebed (project "Strata")
+
+> **Historical, point-in-time audit; non-normative for current capability, deployment, security,
+> or release status.** The findings and dates below describe the repository as reviewed at the
+> time of the audit. They must not be used as evidence of present behavior. For current claims,
+> use [`capabilities.toml`](capabilities.toml) and [`CAPABILITIES.md`](CAPABILITIES.md).
+
 # Fidelity Audit — Tracebed (project "Strata")
 
 **Question:** how true is the built system to what was originally asked for, and where it is not,
@@ -68,7 +75,7 @@ the deduplicated distinct-issue counts are given below the table.
 | 4 | PLAN §2 — the eight load-bearing invariants | 26 | 21 | 1 | **3** | 0 | 0 | 1 | **strong** |
 | 5 | PLAN §5/§6 — data model, DDL, state machine, config surface | 122 | 105 | 4 | **6** | 5 | 2 | 0 | **strong** |
 | 6 | PLAN §7/§8/§9 — five phases, 32 gate clauses, cuttables, backlog | 74 | 54 | 2 | **12** | 4 | 2 | 0 | **weak** |
-| 7 | PLAN §10 never-do list, security posture, Atom seam | 23 | 11 | 1 | **8** | 3 | 0 | 0 | mixed |
+| 7 | PLAN §10 never-do list, security posture, host-integration seam | 23 | 11 | 1 | **8** | 3 | 0 | 0 | mixed |
 | 8 | DECISIONS.md integrity + gate-report honesty | 47 | 26 | 1 | **17** | 1 | 0 | 2 | **weak** |
 | 9 | The user's own spoken instructions (9 directives) | 26 | 19 | 0 | **3** | 3 | 0 | 1 | mixed |
 | | **TOTALS** | **472** | **325** | **25** | **72** | **40** | **5** | **5** | |
@@ -374,7 +381,7 @@ subset of the blast-radius walk in TypeScript over the `/export/project` NDJSON 
 
 **S43 — `docs/MEMORY-FLOW.md` §8 names every port wrong** — 8 for 8 (`PrincipalResolver` vs
 `PrincipalPort`, `ObjectStore` vs `TraceStorePort`, …). This is the boundary contract the user's "I will
-integrate with Atom myself" instruction makes load-bearing.
+integrate the host myself" instruction makes load-bearing.
 
 **S44 — D-030's justification document does not exist.** It waives the ReMe shim because the delta "is
 documented in the adapter guide instead". `"ReMe"` appears three times in the entire repo:
@@ -434,7 +441,7 @@ Unrequested surface area the user now owns and must maintain.
 | E3 | Phase 3 gate assertion 8 (dependence drill) made CI-blocking | `phase3_gate.py:497-529`; appears in no PLAN §7 gate clause | This is the mechanism by which a "CUTTABLE" improvement stopped being cuttable (S39) |
 | E4 | `promotion.min_distinct_principals` as overridable config | `config.py:276`, `promotion` is in `OVERRIDABLE_SECTIONS` | PLAN §5 states the count as a literal. Floored at 2 so it can only be raised — bounded, but it moves a governance threshold into `project_config` |
 | E5 | `api.workers` | `config.py:96`, zero readers | Dead knob on the deployment surface |
-| E6 | Top-level `docs/` (7 files incl. a checked-in `MEMORY-FLOW.html`) | Absent from PLAN §4's tree | Arguably implied by the Phase 4 "operator docs" task |
+| E6 | Top-level documentation set | Absent from PLAN §4's tree | Arguably implied by the Phase 4 "operator docs" task |
 
 ---
 
@@ -442,13 +449,13 @@ Unrequested surface area the user now owns and must maintain.
 
 | # | Instruction | Verdict | Evidence |
 |---|---|---|---|
-| 1 | "You create the standalone service, I will integrate with Atom myself" | **Honoured** | `adapters/atom/` is README + `__init__` + `stubs.py`; all 8 classes raise `NotImplementedError` in `__init__`, and the three `FeedbackPort` stubs declare an explicit no-arg `__init__` purely so a `@runtime_checkable` isinstance check cannot silently pass them (`stubs.py:22-28`). `tests/phase4/test_archetype_configs.py:657` asserts none can be constructed. `grep -i atom src/` outside the package → only the substring "atomic" |
+| 1 | "You create the standalone service, I will integrate the host myself" | **Honoured historically** | A former host-specific stub package deliberately contained only non-constructible interfaces. It was removed from the current tree; the maintained boundary is the generic port guide and deployment-owned adapter work. |
 | 2 | `project_id` server-side from the authenticated principal, never caller-asserted | **Honoured** | Four layers: `ProjectScope` constructible only by `Repo.resolve_project`; every `/v1/*` model `extra="forbid"` with no `project_id`; every admin/report read takes `ScopeDep`; `dashboard/src/api/client.ts:111-129` carries a recursive client-side `assertNoProjectId` guard. Sole exception is `POST /admin/agents/register` behind `require_admin_key` — provisioning, not scope assertion |
 | 3 | "Replace ReMe — just make sure we are not losing anything" | **Violated** | Nobody ever checked. D-030 waives the shim by citing a parity write-up in the adapter guide that does not exist (S44). The honest answer: a deployed Tracebed loses everything ReMe actually did — ReMe wrote session-end conversation summaries and handed them back next session; Tracebed has no cross-session memory (M10) and no reachable learning worker (M2), so traces go in and nothing comes out |
-| 4 | "We will use Gemini" / "whatever is more accurate" / swappable by one config line | **Partial** | Gemini defaults are correct and match what Atom's own LiteLLM routes to (`config.py:137-155`). Generation swap is genuinely one line. **Embedding swap is not** — `driver='onnx-local'` raises `ConfigError` unconditionally (`api/main.py:210-213`), and `onnxruntime` is not a declared dependency (S28) |
+| 4 | "We will use Gemini" / "whatever is more accurate" / swappable by one config line | **Partial** | Gemini was the configured production default. Generation swap is genuinely one line. **Embedding swap is not** — `driver='onnx-local'` raises `ConfigError` unconditionally (`api/main.py:210-213`), and `onnxruntime` is not a declared dependency (S28) |
 | 5 | "Make it good for all, no number-one focus" | **Honoured** | `grep -i 'soc\|bfsi\|analyst\|fraud' src/*.py` → one hit, a quotation inside a docstring. `general_purpose.toml` is the shipped default; the SOC-shaped lift sim is in `harness/`, where the prompt put it |
 | 6 | "Our focus is security and governance" | **Partial** | The preventive half is strong (invariants 3, 6, 7, 8; scan-verdict-required inserts; closed render grammar). The **accountability half does not exist**: no audit sink, no audit table, no governance event is recorded anywhere (S15, M11) — and `MEMORY-FLOW.md §8` advertises a default that is not there |
-| 7 | "Standalone UI like the other services" | **Honoured** | React 18.3.1 / Vite 5.4 / TS 5.5 / Tailwind 3.4 / react-router-dom ^6.26.2 — the same stack and near-identical versions as Atom's own frontend; own Dockerfile on :8111 served by nginx rather than `vite preview`, which is better than Atom's production image |
+| 7 | "Standalone UI like the other services" | **Honoured historically** | React 18.3.1 / Vite 5.4 / TS 5.5 / Tailwind 3.4 / react-router-dom ^6.26.2; own Dockerfile on :8111 served by nginx rather than `vite preview`. This historical observation is not a production-readiness claim. |
 | 8 | "100k runs/day is a stress premise that could become real" | **Honoured (design), unmeasured (fact)** | Every unbounded read paginated; `/export/project` uses a server-side named cursor with `itersize=500` (`repo.py:1588-1606`); the 1,000-project partition ceiling is documented with a migration path; the queue implements `_XMIN_HORIZON_SQL` (`stores/pg/queue.py:184-211`) for exactly the buffer-cache coupling the user named; `high_volume.toml` moves batch size and lease together and refuses to move two governance knobs that look like throughput knobs. **But** nothing sweeps the vault at runtime (M2), so accumulation is unbounded regardless of what the bench would have shown |
 | 9 | 300 ms p99 / 200 ms embed | **Honoured as defaults, unproven as facts** | `config.py:176-177`, read on the hot path, sub-budget clamped to the remaining total (`hotpath/budget.py:47-90`), logged as D-010 with the degradation ladder. No p99 has ever been measured on this machine |
 

@@ -10,6 +10,10 @@ env:
   TB_EMBEDDING__MODEL_VERSION: ci-pin
   TB_HOLDOUT_SALT: ci-salt
 
+# Workflow tokens are read-only unless an individual release-only workflow grants more.
+permissions:
+  contents: read
+
 jobs:
   # Gates that need no services. These run first and fast: the licence gate is CI step 1
   # because psycopg (LGPL-3.0-only) would have failed the original spec's permissive-only
@@ -17,12 +21,12 @@ jobs:
   static:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv venv --python 3.13 .venv
-      - run: uv pip install -e ".[dev]"
-        env:
-          VIRTUAL_ENV: .venv
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
+        with:
+          version: "0.11.21"
+          checksum: "8c88519b0ef0af9801fcdee419bbb12116bd9e6b18e162ae093c932d8b264050"
+      - run: uv sync --locked --extra dev
 
       - name: CI step 1 — licence gate
         run: |
@@ -42,6 +46,9 @@ jobs:
       - name: CI step 2c — dependency audit (hard rule 10 / D-104)
         run: .venv/bin/python scripts/license_check.py --dependency-audit
 
+      - name: capability contract parity
+        run: PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/capability_check.py --check
+
       - name: CI step 3 — hot-path purity (invariant 1)
         run: |
           .venv/bin/python scripts/purity_check.py --self-test
@@ -57,12 +64,10 @@ jobs:
       # on every commit and makes invariant 8 CI-blocking from Phase 3 on; a phase0-only
       # selector ran roughly one test in three and gated none of: the negative probes
       # (phase1), the render property tests (phase1), the red team (phase3), or the
-      # guessed-reward drill. Integration-marked tests still need the stack and run in the
-      # `integration` job below.
+      # guessed-reward drill. Compose-v1 is exercised separately because it
+      # requires secret files and a closed network profile.
       - name: offline test suite (every phase)
         run: .venv/bin/pytest -m "not integration" -q
-        env:
-          TB_STORAGE__PG_DSN: postgresql://unused/unused
 
       # The harnesses that are scripts rather than pytest modules. Each runs offline against
       # in-memory doubles and exits non-zero on failure, so they gate here rather than only
@@ -73,8 +78,11 @@ jobs:
           .venv/bin/python harness/failopen_drill.py
           .venv/bin/python harness/consolidation_regression.py
           .venv/bin/python harness/workflow_scope.py
-        env:
-          TB_STORAGE__PG_DSN: postgresql://unused/unused
+
+      - name: build wheel/sdist and run isolated artifact smoke
+        run: |
+          uv build
+          .venv/bin/python scripts/artifact_smoke.py dist/*.whl dist/*.tar.gz
 
   # The operator console. Split from `static` because it needs Node rather than Python,
   # and kept independent of `integration` because none of these gates touch the stack —
@@ -90,10 +98,10 @@ jobs:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "20"
+          node-version: "20.19.0"
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
 
@@ -106,6 +114,9 @@ jobs:
           node scripts/license_check.mjs --self-test
           node scripts/license_check.mjs
 
+      - name: dashboard test command
+        run: npm test
+
       - name: dashboard step 2 — typecheck
         run: npx tsc --noEmit
 
@@ -117,72 +128,19 @@ jobs:
       - name: dashboard step 4 — build
         run: npm run build
 
-  # Gates that need the stack. Split out so a service outage cannot mask a static failure.
-  integration:
+  # Compose-v1 is the only supported live topology.  The acceptance harness
+  # generates a unique project name and exact-mode secret source internally,
+  # then removes only resources carrying its exact project label.
+  compose-v1:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: tensorchord/vchord-suite:pg18-latest
-        env:
-          POSTGRES_USER: tracebed_owner
-          POSTGRES_PASSWORD: tracebed_ci
-          POSTGRES_DB: tracebed
-        ports: ["5442:5432"]
-        options: >-
-          --health-cmd "pg_isready -U tracebed_owner -d tracebed"
-          --health-interval 5s --health-timeout 5s --health-retries 20
-      valkey:
-        image: valkey/valkey:8-alpine
-        ports: ["6389:6379"]
-        options: >-
-          --health-cmd "valkey-cli ping"
-          --health-interval 5s --health-timeout 3s --health-retries 20
-    env:
-      TB_STORAGE__PG_DSN: postgresql://tracebed_owner:tracebed_ci@localhost:5442/tracebed
-      TB_STORAGE__VALKEY_URL: valkey://localhost:6389/0
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv venv --python 3.13 .venv
-      - run: uv pip install -e ".[dev]"
-        env:
-          VIRTUAL_ENV: .venv
-
-      - name: bootstrap roles
-        run: psql "$TB_STORAGE__PG_DSN" -f docker/initdb/01-roles.sql
-
-      - name: migrate
-        run: .venv/bin/python -m tracebed.stores.pg.migrate apply
-
-      # Every phase gate, not just phase 0. A gate exits non-zero unless its verdict is PASS,
-      # and INCOMPLETE is explicitly not a pass — so with the stack present these are real
-      # gates. Run with `if: always()` chaining so one phase's failure still produces the
-      # later reports rather than hiding them.
-      - name: phase 0 gate
-        run: .venv/bin/python harness/phase0_gate.py
-
-      - name: phase 1 gate
-        if: always()
-        run: .venv/bin/python harness/phase1_gate.py
-
-      - name: phase 2 gate
-        if: always()
-        run: .venv/bin/python harness/phase2_gate.py
-
-      - name: phase 3 gate
-        if: always()
-        run: .venv/bin/python harness/phase3_gate.py
-
-      - name: phase 4 gate
-        if: always()
-        run: .venv/bin/python harness/phase4_gate.py
-
-      - name: full gate
-        if: always()
-        run: .venv/bin/python harness/full_gate.py
-
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
         with:
-          name: gate-reports
-          path: gate_report_*.md
+          version: "0.11.21"
+          checksum: "8c88519b0ef0af9801fcdee419bbb12116bd9e6b18e162ae093c932d8b264050"
+      - run: uv sync --locked --extra dev
+
+      - name: Compose-v1 isolated full acceptance
+        timeout-minutes: 30
+        run: env -u TB_HOLDOUT_SALT uv run python scripts/compose_acceptance.py

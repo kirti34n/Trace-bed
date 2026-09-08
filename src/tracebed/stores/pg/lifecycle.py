@@ -93,7 +93,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
-from psycopg.rows import DictRow, dict_row
+from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from psycopg_pool import ConnectionPool
 
@@ -270,13 +270,6 @@ class LifecycleWriter:
 # wired the learning plane, not by the chunk that wrote `LifecycleWriter`.
 # --------------------------------------------------------------------------- #
 
-_SELECT_BY_SUBJECT_TAG_SQL: Final[str] = """
-SELECT id, project_id, status, trust_tier, mem_type, provenance, status_changed_at, subject_tag
-FROM memory_item
-WHERE project_id = %(project_id)s AND subject_tag = %(subject_tag)s
-ORDER BY id
-""".strip()
-
 _RUNS_INJECTED_WITH_SQL: Final[str] = """
 SELECT DISTINCT run_id
 FROM injection_log
@@ -314,25 +307,6 @@ def _to_editable(row: MemoryItemRow) -> EditableMemory:
     )
 
 
-def _dict_to_editable(row: DictRow) -> EditableMemory:
-    """Same projection from a raw row. `select_by_subject_tag` selects only the eight columns
-    `EditableMemory` carries rather than reusing `Repo`'s wider `_MEMORY_ITEM_COLUMNS`: an
-    erasure path should not pull `content` for every matching row into this process's memory."""
-    from tracebed.domain.enums import MemType, TrustTier
-    from tracebed.domain.memory import Provenance
-
-    return EditableMemory(
-        id=MemoryId(row["id"]),
-        project_id=ProjectId(row["project_id"]),
-        status=Status(row["status"]),
-        trust_tier=TrustTier(row["trust_tier"]),
-        mem_type=MemType(row["mem_type"]),
-        provenance=Provenance.from_json(row["provenance"]),
-        status_changed_at=row["status_changed_at"],
-        subject_tag=row["subject_tag"],
-    )
-
-
 class MemoryEditRepo:
     """`workers.edit_ops.MemoryEditRepoPort` over Postgres -- and, structurally, the port
     `workers.preferences.PreferenceManager` takes as well (that module imports
@@ -345,9 +319,9 @@ class MemoryEditRepo:
     here would be a second way to write a status, which is the admin bypass PLAN.md section 10
     forbids wearing a repository's clothes.
 
-    Only `select_by_subject_tag` is new SQL, because it was the one method with no `Repo`
-    equivalent -- its port docstring said so: "CONTRACT GAP: `Repo` has no query indexed on
-    `memory_item.subject_tag` today".
+    It deliberately has no raw subject-tag selector.  E2 erasure admission and
+    closure are handled by the profiled fence boundary, never by an ordinary
+    lifecycle repository scan.
     """
 
     def __init__(self, pool: ConnectionPool, repo: Repo, lifecycle: LifecycleWriter) -> None:
@@ -357,24 +331,6 @@ class MemoryEditRepo:
 
     def get_memory_by_id(self, project_id: ProjectId, memory_id: MemoryId) -> EditableMemory:
         return _to_editable(self._repo.get_memory_by_id(project_id, memory_id))
-
-    def select_by_subject_tag(
-        self, project_id: ProjectId, subject_tag: str
-    ) -> Sequence[EditableMemory]:
-        """Every memory carrying this subject tag, for `EditOps.delete_by_subject` (the
-        crypto-shred path). `subject_tag` is a bound parameter, never interpolated: it is the
-        one value on this method derived from caller-supplied data.
-
-        `stores.pg.ddl`'s `memory_item` partition carries a btree on `subject_tag`, so this is
-        an index scan rather than the partition scan an erasure request must not become.
-        """
-        with scoped(self._pool, project_id) as conn, conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                _SELECT_BY_SUBJECT_TAG_SQL,
-                {"project_id": project_id, "subject_tag": subject_tag},
-            )
-            rows = cur.fetchall()
-        return [_require_scoped(_dict_to_editable(row), project_id) for row in rows]
 
     def persist_status(self, project_id: ProjectId, write: MemoryStatusWrite) -> None:
         self._lifecycle.persist_status(project_id, write)
@@ -447,19 +403,3 @@ class ForensicsRepo:
             OutcomeEventRef(event_id=row["event_id"], run_id=RunId(row["run_id"]))
             for row in rows
         ]
-
-
-def _require_scoped(row: EditableMemory, project_id: ProjectId) -> EditableMemory:
-    """The SQL predicate is the control; this is the assertion the control held.
-
-    Same discipline as `stores.pg.search._row_to_arm_hit` and
-    `stores.pg.learning._row_to_embedding_candidate`. It matters more here than on most reads:
-    `select_by_subject_tag` feeds `EditOps.delete_by_subject`, so a row that crossed the project
-    wall would be a memory this caller is about to tombstone and crypto-shred.
-    """
-    if row.project_id != project_id:  # pragma: no cover - RLS + predicate both hold
-        raise TracebedError(
-            f"select_by_subject_tag for project {project_id} returned memory {row.id} "
-            f"belonging to project {row.project_id} -- invariant 4"
-        )
-    return row

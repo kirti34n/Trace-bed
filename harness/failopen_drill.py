@@ -83,6 +83,7 @@ from tracebed.domain.enums import Arm, OutcomeCode, Slot
 from tracebed.domain.events import ContextBlock, ContextSlot, RunContext
 from tracebed.domain.ids import AgentTypeId, PrincipalId, ProjectId, RunId
 from tracebed.domain.scope import ProjectScope
+from tracebed.hotpath.budget import Deadline
 from tracebed.hotpath.fusion import FusedCandidate
 from tracebed.hotpath.pipeline import CandidateSetResult, Pipeline
 
@@ -101,9 +102,15 @@ _N_RUNS_PER_SCENARIO: Final[int] = 5
 agent runtime completes EVERY run" is a claim about repetition, not one call."""
 
 
-def _cfg(*, total_budget_ms: int = _DEFAULT_TOTAL_BUDGET_MS, embed_timeout_ms: int = _DEFAULT_EMBED_TIMEOUT_MS) -> EffectiveConfig:
+def _cfg(
+    *,
+    total_budget_ms: int = _DEFAULT_TOTAL_BUDGET_MS,
+    embed_timeout_ms: int = _DEFAULT_EMBED_TIMEOUT_MS,
+) -> EffectiveConfig:
     return EffectiveConfig(
-        retrieval=RetrievalConfig(total_budget_ms=total_budget_ms, embed_timeout_ms=embed_timeout_ms),
+        retrieval=RetrievalConfig(
+            total_budget_ms=total_budget_ms, embed_timeout_ms=embed_timeout_ms
+        ),
         abstention=AbstentionConfig(),
         score=ScoreConfig(),
         budget=BudgetConfig(),
@@ -145,7 +152,9 @@ class _ConfigProvider:
         self._cfg = cfg
         self._raises = raises
 
-    def effective(self, project_id: ProjectId, agent_type_id: AgentTypeId | None = None) -> EffectiveConfig:
+    def effective(
+        self, project_id: ProjectId, agent_type_id: AgentTypeId | None = None
+    ) -> EffectiveConfig:
         if self._raises:
             raise RuntimeError("config store unreachable (drill-injected: Postgres down)")
         return self._cfg
@@ -205,7 +214,10 @@ class _FaultRetriever:
         self._degraded = degraded
         self._raises = raises
 
-    def retrieve(self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig) -> _Outcome:
+    def retrieve(
+        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig, deadline: Deadline
+    ) -> _Outcome:
+        del project_id, query_text, cfg, deadline
         if self._stall_ms:
             self._clock.advance(ms=self._stall_ms)
         if self._raises:
@@ -232,7 +244,9 @@ class _FixedAssembly:
         query_text: str,
         candidates: Sequence[FusedCandidate],
         cfg: EffectiveConfig,
+        deadline: Deadline,
     ) -> CandidateSetResult:
+        del scope, query_text, candidates, cfg, deadline
         self.calls += 1
         slots = [ContextSlot(slot=Slot.FACT, memory_id=uuid4(), tokens=10, text="a recalled fact")]
         return CandidateSetResult(outcome_code=OutcomeCode.INJECTED, slots=slots, top_score=0.8)
@@ -266,7 +280,9 @@ class ScenarioResult:
 
     @property
     def outcome_code_correct(self) -> bool:
-        return bool(self.outcomes_seen) and all(o is self.expected_outcome for o in self.outcomes_seen)
+        return bool(self.outcomes_seen) and all(
+            o is self.expected_outcome for o in self.outcomes_seen
+        )
 
     @property
     def ok(self) -> bool:
@@ -292,7 +308,9 @@ def _run_scenario(
     for i in range(n_runs):
         try:
             result = pipeline.retrieve(
-                _scope(), RunContext(query_text=f"drill probe #{i} for {name}"), session_id=f"{name}-{i}"
+                _scope(),
+                RunContext(query_text=f"drill probe #{i} for {name}"),
+                session_id=f"{name}-{i}",
             )
             outcomes.append(result.outcome_code)
             completed += 1

@@ -22,7 +22,7 @@ object]]`. Two host-facing defaults satisfy it structurally here, matching PLAN.
 
 Raw payload shape emitted by both, and consumed by
 `workers.invalidator.parse_invalidation_payload`: `{"event_type": str, "selector":
-Mapping[str, object]}` — the same two columns `Repo.insert_invalidation_event` persists
+Mapping[str, object]}` — the same two columns the authority-gated invalidation writer persists
 (D-041). Neither class here writes to Postgres; persisting the row is `POST
 /v1/invalidation`'s job. These are *sources* a poller reads, not writers of
 `invalidation_event`.

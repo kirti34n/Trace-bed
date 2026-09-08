@@ -12,7 +12,7 @@ const KIND_COPY: Record<ApiErrorKind, { title: string; description: string }> = 
   unauthorized: {
     title: "Not signed in",
     description:
-      "Your credential is missing or no longer valid. Enter an API key or bearer token in Settings.",
+      "Your same-origin BFF session is missing or no longer valid. Sign in again from Settings.",
   },
   forbidden: {
     title: "No project access",
@@ -38,7 +38,7 @@ const KIND_COPY: Record<ApiErrorKind, { title: string; description: string }> = 
   },
   network: {
     title: "Can't reach the API",
-    description: "Check that the API at :8110 is running and reachable.",
+    description: "Check that the same-origin API/BFF route is reachable.",
   },
   cancelled: {
     title: "Request cancelled",

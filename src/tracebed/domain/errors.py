@@ -23,19 +23,34 @@ if TYPE_CHECKING:
     from tracebed.domain.state_machine import Status
 
 __all__ = [
+    "ActivityBusy",
     "AuthenticationFailed",
+    "AuthorizationDenied",
     "BudgetExceeded",
     "CapExceeded",
     "ConfigError",
     "CrossEpochComparison",
     "DuplicateRegistration",
     "EmbeddingTimeout",
+    "ErasureClosureChanged",
+    "ErasureDependencyTimeout",
+    "ErasureFenced",
+    "ErasureLeaseLost",
+    "ErasureOperatorBlocked",
+    "ErasureRequestNotFound",
+    "ErasureSnapshotStale",
+    "ErasureTargetConflict",
     "GuardNotSatisfied",
     "IllegalTransition",
     "MasterKeyMissing",
     "NotFound",
+    "ProjectInactive",
+    "ProjectProvisioningConflict",
     "ProvenanceIncomplete",
     "QueueFull",
+    "RequestDeadlineExceeded",
+    "RetrievalAuditUnavailable",
+    "RunAuthorityDenied",
     "ScanRejected",
     "ScanVerdictForgery",
     "ScopeResolutionFailed",
@@ -52,6 +67,10 @@ class TracebedError(Exception):
     everything else, so a stray unmapped exception never leaks a stack trace
     or class name to a caller.
     """
+
+
+class RetrievalAuditUnavailable(TracebedError):
+    """Terminal retrieval audit could not be durably recorded."""
 
 
 # -- config / wiring --------------------------------------------------------
@@ -86,11 +105,129 @@ class ScopeResolutionFailed(TracebedError):
     """
 
 
+class AuthorizationDenied(TracebedError):
+    """Authenticated caller lacks the required project capability.
+
+    Maps to one opaque HTTP 403 shape.  It deliberately accepts no detail so
+    callers cannot turn a missing role, grant source, or revoked capability
+    into an authorization oracle.
+    """
+
+    status_code = 403
+
+    def __init__(self) -> None:
+        super().__init__("access denied")
+
+
+class ProjectInactive(TracebedError):
+    """The server resolved a non-active project state (opaque HTTP 403)."""
+
+    status_code = 403
+
+    def __init__(self) -> None:
+        super().__init__("access denied")
+
+
+class RunAuthorityDenied(TracebedError):
+    """A run is absent, foreign, or bound to different server-side ownership.
+
+    It maps to the same opaque 404 body as an ordinary by-id miss and accepts
+    no identifiers or mismatch details.
+    """
+
+    status_code = 404
+
+    def __init__(self) -> None:
+        super().__init__("not found")
+
+
+class ActivityBusy(TracebedError):
+    """A keyed activity is already in progress; callers may retry (HTTP 503)."""
+
+    status_code = 503
+    retryable = True
+
+    def __init__(self) -> None:
+        super().__init__("activity busy")
+
+
+class ErasureTargetConflict(TracebedError):
+    """A different non-terminal erasure target already owns the project.
+
+    The exception deliberately retains no target or request identity.  The
+    API maps every such collision to one opaque 409 response so a caller
+    cannot use it to enumerate another subject's request.
+    """
+
+    status_code = 409
+
+    def __init__(self) -> None:
+        super().__init__("erasure target conflict")
+
+
+class ErasureFenced(TracebedError):
+    """A durable erasure/project fence refuses a normal side effect (409)."""
+
+    status_code = 409
+
+    def __init__(self) -> None:
+        super().__init__("erasure fence refused activity")
+
+
+class ErasureSnapshotStale(TracebedError):
+    """A worker's claimed attribution snapshot is no longer authoritative.
+
+    This is an internal retry signal. Consumers NACK and reload their
+    propagated queue row before any side effect; it is never a public API
+    response or a reason to terminally dead-letter valid work.
+    """
+
+
+class ErasureLeaseLost(TracebedError):
+    """The E3 executor no longer owns its short-lived database lease.
+
+    This is an internal stop signal.  It must be handled before another
+    external I/O operation or a receipt/work mark is attempted.
+    """
+
+
+class ErasureOperatorBlocked(TracebedError):
+    """A fail-closed erasure condition needs a fixed-code operator action."""
+
+
+class ErasureClosureChanged(TracebedError):
+    """The authoritative closure revision changed during an E3 step.
+
+    This is neither a store proof failure nor an operator condition.  The
+    executor records the closed ``closure_changed`` retry receipt, releases
+    its lease through the normal retry path, and a later claim re-runs the
+    revision-sensitive pass.
+    """
+
+
+class ErasureDependencyTimeout(TracebedError):
+    """A bounded E3 store operation exceeded its configured deadline.
+
+    This is intentionally distinct from an unverifiable store result: the
+    executor records the closed ``dependency_timeout`` retry code and leaves
+    any externally completed side effect to a successor's idempotent proof.
+    """
+
+
 class DuplicateRegistration(TracebedError):
     """A second `agent_registration` row for a principal that already has one.
 
     `agent_registration.principal_id` is UNIQUE (PHASE-0 Task 5) — one
     principal binds to exactly one project. Maps to HTTP 409 (§9.4).
+    """
+
+
+class ProjectProvisioningConflict(TracebedError):
+    """An idempotency key was replayed with a different project request.
+
+    The API maps this to an opaque 409.  The stored request hash is useful
+    only for the transactional comparison and must never be exposed to a
+    caller.
     """
 
 
@@ -105,6 +242,17 @@ class NotFound(TracebedError):
     is what leak-suite probe 2 (cross-project by-id fetch) verifies: a
     distinguishable error shape is itself a leak of project existence.
     """
+
+
+class ErasureRequestNotFound(NotFound):
+    """An erasure status row is absent, foreign, or not visible.
+
+    It is intentionally a ``NotFound`` subclass so the wire body is exactly
+    identical to every other project-scoped by-id miss.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
 
 
 # -- write-side governance ---------------------------------------------
@@ -186,9 +334,15 @@ class GuardNotSatisfied(TracebedError):
 class QueueFull(TracebedError):
     """Producer-side hard cap on `work_queue` depth.
 
-    Reserved for a later phase's backpressure policy; PHASE-0's queue has no
-    producer-side cap, so nothing raises this yet.
+    Opaque, retryable admission backpressure.  Capacity details stay server
+    side so a caller cannot use the response as a queue-depth oracle.
     """
+
+    status_code = 503
+    retryable = True
+
+    def __init__(self) -> None:
+        super().__init__("queue busy")
 
 
 # -- crypto / trace store --------------------------------------------------
@@ -222,6 +376,12 @@ class EmbeddingTimeout(TracebedError):
 
 class BudgetExceeded(TracebedError):
     """Reserved for Phase 1's retrieval token-budget enforcement."""
+
+
+class RequestDeadlineExceeded(TracebedError):
+    """A cooperative request boundary had no remaining time to begin work."""
+
+    status_code = 503
 
 
 class CapExceeded(TracebedError):

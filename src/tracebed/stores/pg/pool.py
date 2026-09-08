@@ -19,7 +19,9 @@ contract §5.3), so it never needs ``scoped()`` and is not weakened by getting t
 unpartitioned, no RLS policy, and for ``resolve_project``/``create_project``/``create_principal``
 there is no ``project_id`` to scope by yet: those calls are what *establish* or *derive* project
 identity in the first place (contract §5.1's six-method registry allowlist). It is not exported
-in ``__all__``; the only importer is ``stores.pg.repo``, and only for that allowlist.
+in ``__all__``; the registry-bound ``stores.pg.repo`` and
+``stores.pg.authority.AuthorityStore`` are its only importers, each with explicit
+project/principal predicates.
 
 HARD CANCELLATION (BMAD-EVALUATION finding, D-132). Invariant 2's 300ms budget was enforced
 against exceptions only: nothing here bounded a connection attempt or an in-flight statement, so a
@@ -43,37 +45,65 @@ independent, OPT-IN controls close that gap without touching any of this module'
    catching the case that bound cannot -- a query that keeps consuming server resources after the
    caller has given up on it.
 
-BOTH DEFAULT TO ``None`` (NO TIMEOUT), preserving today's behaviour for every existing call exactly
--- and that is deliberate, not an oversight: ``create_pool()`` is the ONE constructor
-``api/main.py``'s hot-path pool and ``workers/runner.py``'s background-plane pool both call, and
-``scoped()`` is the ONE gateway both ``stores.pg.search.SearchStore`` (hot path) and
-``stores.pg.repo.Repo`` (background workers' partitioned writes, e.g. the distiller's, the
-scorer's) call -- a non-optional default here would be "one global that strangles the background
-plane" exactly as PLAN.md §2 invariant 2's own audit warns against: workers' statements
-legitimately run far longer than 300ms, and neither of those two call sites is this chunk's file
-list to edit and differentiate. Making the values OPT-IN means the mechanism is real, complete, and
-independently tested (below and in ``tests/phase1/test_hard_cancellation.py``) without any risk of
-starving a worker that never asked for a hot-path budget -- and it is recorded as a contract gap
-(DECISIONS.md D-132) that wiring ``retrieval.total_budget_ms`` through to the hot-path pool's
-``create_pool``/``scoped`` calls in ``api/main.py``/``stores.pg.search`` is therefore still open,
-owned by whichever chunk holds those files.
+BOTH DEFAULT TO ``None`` (NO TIMEOUT), preserving historical non-request callers. Request paths
+may instead pass a shared ``RemainingBudget`` to ``scoped()`` or ``_unscoped()``. Those helpers
+bound pool checkout to the remaining allowance and require a fresh transaction-local statement
+timeout before each caller-owned data statement. This is cooperative accounting, not strict native
+cancellation: a pool health check, connection setup, or query already under way can outlive the
+caller waiting for it.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
+from math import ceil
 from typing import Any, Final
 
 import psycopg
 from psycopg import postgres, pq
 from psycopg.abc import Buffer
 from psycopg.adapt import Dumper
-from psycopg_pool import ConnectionPool
+from psycopg.errors import QueryCanceled
+from psycopg_pool import ConnectionPool, PoolTimeout
 
+from tracebed.domain.deadline import RemainingBudget as RemainingBudget
 from tracebed.domain.ids import ProjectId, TypedId
 
 __all__ = ["create_pool", "register_typed_id_adapters", "scoped"]
+
+
+class PoolDeadlineExceeded(TimeoutError):
+    """The caller's retrieval deadline elapsed before a scoped statement could start."""
+
+
+def is_expired_deadline_query_cancellation(
+    exc: BaseException, deadline: RemainingBudget | None
+) -> bool:
+    """Identify a PostgreSQL cancellation observed while this request is expired.
+
+    PostgreSQL uses ``QueryCanceled`` for both statement-timeout and manual
+    cancellation, so this cannot establish the original cause of the error.
+    Callers use it only when the request deadline is already exhausted.
+    """
+    return isinstance(exc, QueryCanceled) and deadline is not None and deadline.remaining_ms() <= 0
+
+
+def refresh_deadline_statement_timeout(
+    conn: psycopg.Connection[Any], deadline: RemainingBudget
+) -> None:
+    """Apply the remaining request budget immediately before a data statement.
+
+    Checkout and setup SQL consume time too.  Refreshing after that work prevents a SELECT from
+    inheriting a stale, wider timeout; an exhausted deadline starts no further statement.
+    """
+    remaining_ms = deadline.remaining_ms()
+    if remaining_ms <= 0:
+        raise PoolDeadlineExceeded("retrieval deadline expired before data statement")
+    conn.execute(_SET_STATEMENT_TIMEOUT, {"statement_timeout_ms": str(max(1, ceil(remaining_ms)))})
+    if deadline.remaining_ms() <= 0:
+        raise PoolDeadlineExceeded("retrieval deadline expired while refreshing statement timeout")
+
 
 # --------------------------------------------------------------------------------------- #
 # psycopg parameter adaptation for `domain.ids.TypedId`.
@@ -171,6 +201,8 @@ def create_pool(
     max_size: int = 10,
     connect_timeout_s: int | None = None,
     checkout_timeout_s: float | None = None,
+    configure: Callable[[Any], None] | None = None,
+    checkout_check: Callable[[Any], None] | None = None,
 ) -> ConnectionPool:
     """The one pool constructor (contract §5.0). Opens eagerly so connection failures surface at
     startup, not on the first request. `Repo` and `WorkQueue` are constructed with this same
@@ -190,18 +222,25 @@ def create_pool(
     than by a value chosen here.
     """
     kwargs = _connect_timeout_kwargs(connect_timeout_s) if connect_timeout_s is not None else None
+    pool_kwargs: dict[str, Any] = {
+        "min_size": min_size,
+        "max_size": max_size,
+        "open": True,
+        "kwargs": kwargs,
+    }
+    if configure is not None:
+        pool_kwargs["configure"] = configure
+    if checkout_check is not None:
+        # Runtime pools opt into libpq's fresh checkout probe so a Postgres
+        # restart cannot leave a stale idle socket for the next API request.
+        # Keep it explicit: hot-path/offline callers retain their established
+        # checkout cost unless their runtime boundary requires this recovery.
+        pool_kwargs["check"] = checkout_check
     if checkout_timeout_s is not None:
         if checkout_timeout_s <= 0:
             raise ValueError(f"checkout_timeout_s must be positive, got {checkout_timeout_s!r}")
-        return ConnectionPool(
-            dsn,
-            min_size=min_size,
-            max_size=max_size,
-            open=True,
-            kwargs=kwargs,
-            timeout=checkout_timeout_s,
-        )
-    return ConnectionPool(dsn, min_size=min_size, max_size=max_size, open=True, kwargs=kwargs)
+        pool_kwargs["timeout"] = checkout_timeout_s
+    return ConnectionPool(dsn, **pool_kwargs)
 
 
 @contextmanager
@@ -211,6 +250,7 @@ def scoped(
     *,
     statement_timeout_ms: int | None = None,
     idle_in_transaction_session_timeout_ms: int | None = None,
+    deadline: RemainingBudget | None = None,
 ) -> Iterator[psycopg.Connection[Any]]:
     """THE only way anything in this codebase obtains a connection inside a transaction that may
     touch a partitioned table (invariant 4). `project_id` is positional and type-required --
@@ -242,28 +282,84 @@ def scoped(
             "idle_in_transaction_session_timeout_ms must be positive, got "
             f"{idle_in_transaction_session_timeout_ms!r}"
         )
-    with pool.connection() as conn, conn.transaction():
-        conn.execute(_SET_PROJECT_GUC, {"project_id": str(project_id)})
-        if statement_timeout_ms is not None:
-            conn.execute(
-                _SET_STATEMENT_TIMEOUT, {"statement_timeout_ms": str(statement_timeout_ms)}
-            )
-        if idle_in_transaction_session_timeout_ms is not None:
-            conn.execute(
-                _SET_IDLE_IN_TRANSACTION_TIMEOUT,
-                {
-                    "idle_in_transaction_session_timeout_ms": str(
-                        idle_in_transaction_session_timeout_ms
-                    )
-                },
-            )
-        yield conn
+    if deadline is not None and statement_timeout_ms is not None:
+        raise ValueError("deadline and statement_timeout_ms are mutually exclusive")
+    if deadline is None:
+        connection = pool.connection()
+    else:
+        remaining_ms = deadline.remaining_ms()
+        if remaining_ms <= 0:
+            raise PoolDeadlineExceeded("retrieval deadline expired before pool checkout")
+        connection = pool.connection(timeout=remaining_ms / 1000.0)
+    with ExitStack() as stack:
+        try:
+            conn = stack.enter_context(connection)
+        except PoolTimeout as exc:
+            if deadline is None:
+                raise
+            raise PoolDeadlineExceeded("pool checkout exceeded retrieval deadline") from exc
+        if deadline is not None:
+            # The wait for a pooled connection consumes the same request budget.  PostgreSQL
+            # treats zero as unlimited, so do not begin a transaction in that case.
+            remaining_ms = deadline.remaining_ms()
+            if remaining_ms <= 0:
+                raise PoolDeadlineExceeded("retrieval deadline expired during pool checkout")
+            statement_timeout_ms = max(1, ceil(remaining_ms))
+        with conn.transaction():
+            conn.execute(_SET_PROJECT_GUC, {"project_id": str(project_id)})
+            if statement_timeout_ms is not None:
+                conn.execute(
+                    _SET_STATEMENT_TIMEOUT, {"statement_timeout_ms": str(statement_timeout_ms)}
+                )
+            if idle_in_transaction_session_timeout_ms is not None:
+                conn.execute(
+                    _SET_IDLE_IN_TRANSACTION_TIMEOUT,
+                    {
+                        "idle_in_transaction_session_timeout_ms": str(
+                            idle_in_transaction_session_timeout_ms
+                        )
+                    },
+                )
+            yield conn
 
 
 @contextmanager
-def _unscoped(pool: ConnectionPool) -> Iterator[psycopg.Connection[Any]]:
-    """Module-private: registry-table access with no project scope to set (see module docstring).
-    Not in `__all__`; `stores.pg.repo` is the only importer.
+def _unscoped(
+    pool: ConnectionPool, *, deadline: RemainingBudget | None = None
+) -> Iterator[psycopg.Connection[Any]]:
+    """Open a registry-table transaction without setting a project GUC.
+
+    The default path intentionally retains the historical unbounded checkout and transaction
+    behavior.  A caller that supplies ``deadline`` gets a cooperative bound on pool checkout and
+    an expiry guard before work is yielded.  This helper deliberately issues *no* setup SQL:
+    callers that require transaction characteristics must establish those first, then call
+    :func:`refresh_deadline_statement_timeout` immediately before each data query.  In
+    particular, ``AuthorityStore`` must issue its ``SET TRANSACTION ... READ ONLY`` before any
+    timeout ``set_config`` statement, because PostgreSQL rejects changing transaction
+    characteristics after a query has started a snapshot.
     """
-    with pool.connection() as conn, conn.transaction():
-        yield conn
+    if deadline is None:
+        with pool.connection() as conn, conn.transaction():
+            yield conn
+        return
+
+    remaining_ms = deadline.remaining_ms()
+    if remaining_ms <= 0:
+        raise PoolDeadlineExceeded("request deadline expired before pool checkout")
+    connection = pool.connection(timeout=remaining_ms / 1000.0)
+    with ExitStack() as stack:
+        try:
+            conn = stack.enter_context(connection)
+        except PoolTimeout as exc:
+            # ``ConnectionPool.connection`` returns a lazy context manager.  Restrict this
+            # translation to its enter operation so a PoolTimeout raised by a query/body keeps
+            # its original identity.
+            raise PoolDeadlineExceeded("pool checkout exceeded request deadline") from exc
+        if deadline.remaining_ms() <= 0:
+            raise PoolDeadlineExceeded("request deadline expired during pool checkout")
+        with conn.transaction():
+            # Starting a transaction can itself consume the final budget.  Do not hand a
+            # connection to a caller after that happens.
+            if deadline.remaining_ms() <= 0:
+                raise PoolDeadlineExceeded("request deadline expired during transaction entry")
+            yield conn

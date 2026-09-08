@@ -1,6 +1,5 @@
 import { useMemo, useState } from "react";
-import { get } from "../api/client";
-import { useQuery } from "../api/hooks";
+import { useLiftReport } from "../api/hooks";
 import { Chart, type ChartMarkerShape, type ChartSeries } from "../components/Chart";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
@@ -12,7 +11,7 @@ import {
   formatInt,
   truncateId,
 } from "../lib/format";
-import type { MemType } from "../api/types";
+import type { LiftCellOut, LiftMethodologyOut, LiftWindowOut, MemType, QTrajectoryOut, QTrajectoryPointOut } from "../api/types";
 
 // THE MOST DANGEROUS VIEW IN THE PRODUCT — this is the one an operator quotes
 // in a meeting. Every number here that claims memory "helped" or "hurt" is a
@@ -37,83 +36,6 @@ import type { MemType } from "../api/types";
 // LiftCellOut / QTrajectoryOut / QTrajectoryPointOut. They are NOT a guess at
 // a shape; when the two disagree, that file is right and this one is a bug.
 
-// --------------------------------------------------------------------- //
-// Wire contract for GET /admin/lift/report (api/models_reports.py).
-// --------------------------------------------------------------------- //
-
-interface LiftWindowOut {
-  since: string;
-  days: number;
-  observations_considered: number;
-  /** True when the server's observation join came back at its cap, so every
-   * N below is a LOWER BOUND on the window's real N, not the window's N. */
-  observations_truncated: boolean;
-  observations_cap: number;
-}
-
-interface LiftMethodologyOut {
-  min_cell_n: number;
-  killswitch_window_days: number;
-  correction: string;
-  confidence: number;
-  bh_alpha: number;
-  bh_hypotheses: number;
-  /** `"process_default"` means these are the server's compiled-in defaults,
-   * NOT this project's resolved config — see the server model's own note on
-   * why it cannot resolve overrides for this report yet. Rendered as that
-   * distinction, never as "this deployment's configured values". */
-  source: string;
-}
-
-interface LiftCellOut {
-  agent_type_id: string;
-  mem_type: MemType;
-  n_treatment: number;
-  n_control: number;
-  min_cell_n: number;
-  /** True whenever either arm is below `min_cell_n`, INCLUDING the degenerate
-   * case where no interval was computable at all. This view refuses to render
-   * a figure for such a cell; the server still sends what it has so that a
-   * server-side omission and a genuinely-zero estimate stay distinguishable. */
-  insufficient: boolean;
-  point_estimate: number | null;
-  lower_bound: number | null;
-  upper_bound: number | null;
-  confidence: number | null;
-  p_value: number | null;
-  /** `null` for every insufficient cell — the cell still counted as a
-   * hypothesis in the correction (methodology.bh_hypotheses), it just has no
-   * adjusted value to show beside an estimate that is being refused. */
-  bh_adjusted_p: number | null;
-}
-
-interface QTrajectoryPointOut {
-  agent_type_id: string;
-  mem_type: MemType;
-  memory_id: string;
-  q_value: number;
-  confidence: number;
-  scored_use_count: number;
-  observed_at: string;
-  /** INFERRED by the server as the nearest scoring_epoch.started_at at or
-   * before `observed_at` — memory_item has no epoch column to read. `null`
-   * when no epoch precedes the point at all. Never dropped for being null. */
-  scoring_epoch_id: number | null;
-}
-
-interface QTrajectoryOut {
-  items: QTrajectoryPointOut[];
-  limit: number;
-  offset: number;
-  returned: number;
-}
-
-interface LiftReportOut {
-  window: LiftWindowOut;
-  methodology: LiftMethodologyOut;
-  cells: LiftCellOut[];
-  q_trajectory: QTrajectoryOut;
-}
 
 // --------------------------------------------------------------------- //
 // Section: methodology + window provenance
@@ -339,9 +261,7 @@ function NullResultNote({ cells }: { cells: LiftCellOut[] }) {
 // consecutive points belong to DIFFERENT memories. A line through them would
 // render "Q is trending up" out of data that contains no trend, which is the
 // same class of lie as a lift figure with no interval. Points are drawn as a
-// scatter (mode: "points"), split into one series per scoring epoch, and the
-// epoch is a server-side inference rather than a stored fact — labelled as
-// such at the point of use.
+// scatter (mode: "points"), split into one series per persisted scoring epoch.
 // --------------------------------------------------------------------- //
 
 const KNOWN_EPOCH_MARKERS: ChartMarkerShape[] = ["circle", "square", "diamond"];
@@ -365,8 +285,8 @@ function epochSeries(points: QTrajectoryPointOut[]): ChartSeries[] {
       const idx = isUnknown ? -1 : known.indexOf(epoch);
       return {
         label: isUnknown
-          ? "No epoch precedes these points"
-          : `Scoring epoch ${formatInt(epoch)} (inferred)`,
+          ? "No persisted scoring epoch"
+          : `Scoring epoch ${formatInt(epoch)}`,
         points: points
           .filter((p) => p.scoring_epoch_id === epoch)
           .map((p) => ({ x: Date.parse(p.observed_at), y: p.q_value })),
@@ -403,8 +323,8 @@ function QScatter({ points }: { points: QTrajectoryPointOut[] }) {
       </p>
       {hasUnknownEpoch && (
         <p className="mt-1 text-xs text-text-muted">
-          Some points fall before any recorded scoring epoch and are grouped separately rather
-          than folded into the nearest one. They are drawn, never dropped.
+          Some points have no persisted scoring epoch and are grouped separately. They are drawn,
+          never dropped.
         </p>
       )}
     </div>
@@ -481,11 +401,10 @@ function QPointsTable({ points }: { points: QTrajectoryPointOut[] }) {
       width: "18ch",
       render: (row) =>
         row.scoring_epoch_id === null ? (
-          <span className="text-text-faint">none precedes this point</span>
+          <span className="text-text-faint">no stored epoch</span>
         ) : (
           <span className="text-text">
-            {formatInt(row.scoring_epoch_id)}{" "}
-            <span className="text-text-faint">(inferred)</span>
+            {formatInt(row.scoring_epoch_id)}
           </span>
         ),
       sortValue: (row) => row.scoring_epoch_id,
@@ -494,7 +413,7 @@ function QPointsTable({ points }: { points: QTrajectoryPointOut[] }) {
 
   return (
     <Table
-      caption="Every scored memory's current Q value, its confidence, how many scored uses it rests on, when it was last scored, and the scoring epoch the server inferred for that timestamp"
+      caption="Every scored memory's current Q value, its confidence, how many scored uses it rests on, when it was last scored, and its persisted scoring epoch"
       columns={columns}
       rows={points}
       getRowId={(row) => row.memory_id}
@@ -516,11 +435,10 @@ function QSection({ trajectory }: { trajectory: QTrajectoryOut }) {
         <code className="font-mono">memory_item</code> stores one current{" "}
         <code className="font-mono">q_value</code> per memory and no table anywhere in this
         schema records a Q update, so no view can plot how any individual Q got where it is.
-        What is below is one point per scored memory. The scoring epoch on each point is{" "}
-        <em>inferred</em> by the server as the nearest epoch starting at or before the
-        memory&rsquo;s <code className="font-mono">last_scored_at</code> &mdash; it is not read
-        off a stored column, because none exists. Two points in different epochs were scored by
-        different judge models and their Q values are not comparable on one ruler.
+        What is below is one point per scored memory. The scoring epoch on each point is read
+        directly from that memory&rsquo;s persisted <code className="font-mono">epoch_id</code>.
+        Two points in different epochs were scored by different judge models and their Q values
+        are not comparable on one ruler.
       </div>
 
       {points.length === 0 ? (
@@ -565,10 +483,7 @@ function QSection({ trajectory }: { trajectory: QTrajectoryOut }) {
 // --------------------------------------------------------------------- //
 
 export default function LiftAndQ() {
-  const query = useQuery<LiftReportOut>(
-    (signal) => get<LiftReportOut>("/admin/lift/report", { signal }),
-    "/admin/lift/report"
-  );
+  const query = useLiftReport();
   const report = query.data;
 
   return (

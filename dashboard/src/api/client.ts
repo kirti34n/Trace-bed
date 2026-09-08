@@ -1,80 +1,17 @@
-// THE one place that talks HTTP (task brief, rule 3). Every hook in
-// api/hooks.ts goes through the functions exported here; no component or
-// hook is allowed to call `fetch` directly.
-//
-// Two independent guarantees live here, both load-bearing for invariant 4:
-//   1. `assertNoProjectId` — a body or query object containing a `project_id`
-//      key throws in development, UNLESS the call site explicitly opted in
-//      via `{ allowProjectId: true }`. Exactly one route may do that:
-//      `POST /admin/agents/register`, where the ADMIN names the project
-//      being provisioned (contract §9.3's own parenthetical). Every other
-//      route derives scope from the authenticated principal server-side.
-//   2. Typed errors distinguish 401/403/404/409/422/5xx so a hook can render
-//      "you're not signed in" differently from "that memory isn't yours (or
-//      doesn't exist)" differently from "the server broke" — collapsing
-//      these into one generic Error is exactly what makes an ErrorState
-//      useless to an operator deciding what to do next.
-
-// --------------------------------------------------------------------- //
-// Credentials. The dashboard has no login route of its own to call (none
-// exists in the contract — see README's contract gaps): an operator pastes
-// in the bearer token or `tb_sk_...` API key their registration minted, plus
-// the bootstrap admin key if they hold one, and this module is the only
-// reader/writer of where those live (localStorage, never sent anywhere but
-// the Authorization/X-Api-Key/X-Admin-Key headers below).
-// --------------------------------------------------------------------- //
-
-export type PrincipalAuthMode = "bearer" | "api_key";
-
-export interface PrincipalCredential {
-  mode: PrincipalAuthMode;
-  value: string;
-}
-
-const PRINCIPAL_KEY = "tb:auth:principal";
-const ADMIN_KEY = "tb:auth:admin_key";
-
-function readJson<T>(key: string): T | null {
-  const raw = window.localStorage.getItem(key);
-  if (raw === null) return null;
-  try {
-    return JSON.parse(raw) as T;
-  } catch {
-    return null;
-  }
-}
-
-export const credentials = {
-  getPrincipal(): PrincipalCredential | null {
-    return readJson<PrincipalCredential>(PRINCIPAL_KEY);
-  },
-  setPrincipal(cred: PrincipalCredential | null): void {
-    if (cred === null) window.localStorage.removeItem(PRINCIPAL_KEY);
-    else window.localStorage.setItem(PRINCIPAL_KEY, JSON.stringify(cred));
-  },
-  getAdminKey(): string | null {
-    return window.localStorage.getItem(ADMIN_KEY);
-  },
-  setAdminKey(key: string | null): void {
-    if (key === null) window.localStorage.removeItem(ADMIN_KEY);
-    else window.localStorage.setItem(ADMIN_KEY, key);
-  },
-};
-
-// --------------------------------------------------------------------- //
-// Typed errors (api/main.py §9.4's exact mapping, plus the client-side
-// states it has no opinion about: network failure and cancellation).
-// --------------------------------------------------------------------- //
+// The only module that performs HTTP. The dashboard intentionally speaks only
+// to its own origin: the reverse proxy/BFF owns upstream identity credentials
+// and browser code never sees, stores, or forwards them.
+import type { SessionStatusOut } from "./types";
 
 export type ApiErrorKind =
-  | "unauthorized" // 401 — AuthenticationFailed
-  | "forbidden" // 403 — ScopeResolutionFailed (no agent_registration row)
-  | "not_found" // 404 — NotFound (uniform for "absent" and "not your project")
-  | "conflict" // 409 — DuplicateRegistration
-  | "validation" // 422 — pydantic extra="forbid" / field errors
-  | "server" // 5xx or any TracebedError with no specific mapping
-  | "network" // fetch itself rejected (offline, DNS, CORS, refused)
-  | "cancelled"; // the caller's AbortSignal fired
+  | "unauthorized"
+  | "forbidden"
+  | "not_found"
+  | "conflict"
+  | "validation"
+  | "server"
+  | "network"
+  | "cancelled";
 
 export class ApiError extends Error {
   readonly kind: ApiErrorKind;
@@ -88,6 +25,28 @@ export class ApiError extends Error {
     this.status = status;
     this.detail = detail;
   }
+}
+
+const AUTH_CHANGED_EVENT = "tracebed:auth-changed";
+let synchronizerCsrfToken: string | null = null;
+const EXPORT_MAX_BYTES_HEADER = "X-Tracebed-Export-Max-Bytes";
+const EXPORT_COMPLETENESS_HEADER = "X-Tracebed-Export-Completeness";
+
+/** Kept in module memory only. It is deliberately neither a credential nor a
+ * session identifier; refresh/navigate drops it and status fetches mint/read it
+ * again from the BFF's authenticated cookie session. */
+export function setSynchronizerCsrfToken(token: string | null): void {
+  synchronizerCsrfToken = token;
+}
+
+export function notifyAuthenticationChanged(): void {
+  synchronizerCsrfToken = null;
+  window.dispatchEvent(new Event(AUTH_CHANGED_EVENT));
+}
+
+export function onAuthenticationChanged(listener: () => void): () => void {
+  window.addEventListener(AUTH_CHANGED_EVENT, listener);
+  return () => window.removeEventListener(AUTH_CHANGED_EVENT, listener);
 }
 
 function kindForStatus(status: number): ApiErrorKind {
@@ -107,60 +66,27 @@ function kindForStatus(status: number): ApiErrorKind {
   }
 }
 
-// --------------------------------------------------------------------- //
-// The project_id guard (invariant 4). Recursive and depth-bounded: a nested
-// payload (e.g. `retention_policy` jsonb) hiding a `project_id` key would
-// otherwise slip past a shallow check.
-// --------------------------------------------------------------------- //
+/** Refuse accidental cross-origin, protocol-relative, or relative URL use at
+ * the one transport boundary. All application routes are absolute paths. */
+function sameOriginPath(path: string): string {
+  if (!path.startsWith("/") || path.startsWith("//") || /[\r\n]/.test(path)) {
+    throw new Error("dashboard API paths must be same-origin absolute paths");
+  }
+  return path;
+}
 
 function containsProjectId(value: unknown, depth = 0): boolean {
   if (depth > 8 || value === null || typeof value !== "object") return false;
-  if (Array.isArray(value)) return value.some((v) => containsProjectId(v, depth + 1));
-  for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
-    if (key === "project_id") return true;
-    if (containsProjectId(v, depth + 1)) return true;
+  if (Array.isArray(value)) return value.some((entry) => containsProjectId(entry, depth + 1));
+  return Object.entries(value as Record<string, unknown>).some(
+    ([key, entry]) => key === "project_id" || containsProjectId(entry, depth + 1)
+  );
+}
+
+function assertNoProjectId(body: unknown): void {
+  if (import.meta.env.DEV && containsProjectId(body)) {
+    throw new Error("request body must not carry project_id; scope is server-derived");
   }
-  return false;
-}
-
-function assertNoProjectId(body: unknown, allowProjectId: boolean): void {
-  if (import.meta.env.DEV && !allowProjectId && containsProjectId(body)) {
-    throw new Error(
-      "invariant 4 violation: request body carries a project_id — the server " +
-        "derives scope from the authenticated principal; no data route may send one " +
-        "(the one legitimate exception, POST /admin/agents/register, must pass " +
-        "{ allowProjectId: true } explicitly)."
-    );
-  }
-}
-
-// --------------------------------------------------------------------- //
-// The fetch wrapper. `API_BASE` is empty by default (same-origin — works
-// against vite.config.ts's dev proxy and nginx.conf's prod reverse proxy
-// identically); VITE_API_BASE overrides it for a build that talks to a
-// non-same-origin API.
-// --------------------------------------------------------------------- //
-
-const API_BASE: string = import.meta.env.VITE_API_BASE ?? "";
-
-interface RequestOptions {
-  signal?: AbortSignal;
-  /** See `assertNoProjectId` — do not set this anywhere but the one route
-   * the contract names. */
-  allowProjectId?: boolean;
-}
-
-function principalAuthHeaders(): HeadersInit {
-  const cred = credentials.getPrincipal();
-  if (cred === null) return {};
-  return cred.mode === "bearer"
-    ? { Authorization: `Bearer ${cred.value}` }
-    : { "X-Api-Key": cred.value };
-}
-
-function adminAuthHeaders(): HeadersInit {
-  const key = credentials.getAdminKey();
-  return key === null ? {} : { "X-Admin-Key": key };
 }
 
 async function parseErrorDetail(res: Response): Promise<unknown> {
@@ -175,89 +101,26 @@ async function parseErrorDetail(res: Response): Promise<unknown> {
   }
 }
 
-async function execute<T>(
-  path: string,
-  init: RequestInit,
-  opts: RequestOptions
-): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(`${API_BASE}${path}`, { ...init, signal: opts.signal });
-  } catch (err) {
-    if (opts.signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) {
-      throw new ApiError("cancelled", "request was cancelled");
+interface RequestOptions {
+  signal?: AbortSignal;
+  csrf?: boolean;
+}
+
+async function execute<T>(path: string, init: RequestInit, opts: RequestOptions = {}): Promise<T> {
+  const headers = new Headers(init.headers);
+  if (opts.csrf) {
+    if (synchronizerCsrfToken === null) {
+      throw new ApiError("unauthorized", "no active session synchronizer token");
     }
-    throw new ApiError("network", err instanceof Error ? err.message : "network error");
+    headers.set("X-CSRF-Token", synchronizerCsrfToken);
   }
-  if (!res.ok) {
-    const detail = await parseErrorDetail(res);
-    throw new ApiError(kindForStatus(res.status), `${res.status} ${res.statusText}`, res.status, detail);
-  }
-  if (res.status === 204) return undefined as T;
-  const text = await res.text();
-  return text.length === 0 ? (undefined as T) : (JSON.parse(text) as T);
-}
 
-/** GET against a principal-scoped route (`/v1/*` reads, `/admin/memory/{id}`). */
-export function get<T>(path: string, opts: RequestOptions = {}): Promise<T> {
-  return execute<T>(path, { method: "GET", headers: { ...principalAuthHeaders() } }, opts);
-}
-
-/** POST against a principal-scoped route (`/v1/*`). */
-export function postJson<T>(
-  path: string,
-  body: unknown,
-  opts: RequestOptions = {}
-): Promise<T> {
-  assertNoProjectId(body, opts.allowProjectId ?? false);
-  return execute<T>(
-    path,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...principalAuthHeaders() },
-      body: JSON.stringify(body),
-    },
-    opts
-  );
-}
-
-/** POST against the bootstrap admin-key routes (`/admin/projects`,
- * `/admin/agents/register`) — a distinct auth plane on purpose (contract
- * §9.3/C-20): no `agent_registration` row can exist yet for a caller these
- * routes are about to create one for. */
-export function postAdmin<T>(
-  path: string,
-  body: unknown,
-  opts: RequestOptions = {}
-): Promise<T> {
-  assertNoProjectId(body, opts.allowProjectId ?? false);
-  return execute<T>(
-    path,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...adminAuthHeaders() },
-      body: JSON.stringify(body),
-    },
-    opts
-  );
-}
-
-/**
- * Streams `GET /export/project`'s `application/x-ndjson` body (contract
- * §9.3) one parsed line at a time, so a huge project export never sits fully
- * materialised in a JS string before the first row is usable. The connection
- * stays open for the caller's `for await` — abort `opts.signal` to stop early
- * without waiting for the server to finish streaming.
- */
-export async function* streamNdjson<T>(
-  path: string,
-  opts: RequestOptions = {}
-): AsyncGenerator<T, void, unknown> {
   let res: Response;
   try {
-    res = await fetch(`${API_BASE}${path}`, {
-      method: "GET",
-      headers: { ...principalAuthHeaders() },
+    res = await fetch(sameOriginPath(path), {
+      ...init,
+      headers,
+      credentials: "same-origin",
       signal: opts.signal,
     });
   } catch (err) {
@@ -268,27 +131,124 @@ export async function* streamNdjson<T>(
   }
   if (!res.ok) {
     const detail = await parseErrorDetail(res);
+    if (res.status === 401) notifyAuthenticationChanged();
     throw new ApiError(kindForStatus(res.status), `${res.status} ${res.statusText}`, res.status, detail);
   }
-  const body = res.body;
-  if (body === null) return;
-  const reader = body.getReader();
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  return text.length === 0 ? (undefined as T) : (JSON.parse(text) as T);
+}
+
+export function get<T>(path: string, opts: RequestOptions = {}): Promise<T> {
+  return execute<T>(path, { method: "GET" }, opts);
+}
+
+export function postJson<T>(path: string, body: unknown, opts: RequestOptions = {}): Promise<T> {
+  assertNoProjectId(body);
+  return execute<T>(
+    path,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    { ...opts, csrf: true }
+  );
+}
+
+/** BFF session status contains no bearer/API token or session identifier. */
+export function getSessionStatus(signal?: AbortSignal): Promise<SessionStatusOut> {
+  return get<SessionStatusOut>("/auth/session", { signal });
+}
+
+/** Login is an IdP/BFF navigation, never a credential form or XHR exchange. */
+export function beginLogin(): void {
+  window.location.assign("/auth/login");
+}
+
+export async function logout(signal?: AbortSignal): Promise<void> {
+  await postJson<void>("/auth/logout", {}, { signal });
+  notifyAuthenticationChanged();
+}
+
+/** An export is safe to render only when the BFF committed to a complete,
+ * bounded relay before sending bytes. A chunked relay marked `bounded` may be
+ * cut at the edge limit, leaving an EOF indistinguishable from a full export.
+ * Reject it before exposing any rows rather than presenting a partial project
+ * snapshot as a successful query. */
+function completeExportLimit(res: Response): number {
+  const max = Number(res.headers.get(EXPORT_MAX_BYTES_HEADER));
+  if (!Number.isSafeInteger(max) || max <= 0) {
+    throw new ApiError("server", "export response omitted a valid maximum-byte bound");
+  }
+  if (res.headers.get(EXPORT_COMPLETENESS_HEADER) !== "complete") {
+    throw new ApiError("server", "export stream completeness cannot be established");
+  }
+  const contentLength = res.headers.get("content-length");
+  if (contentLength !== null) {
+    const declared = Number(contentLength);
+    if (!Number.isSafeInteger(declared) || declared < 0 || declared > max) {
+      throw new ApiError("server", "export response exceeds its declared maximum-byte bound");
+    }
+  }
+  return max;
+}
+
+export async function* streamNdjson<T>(path: string, opts: RequestOptions = {}): AsyncGenerator<T, void, unknown> {
+  let res: Response;
+  try {
+    res = await fetch(sameOriginPath(path), { method: "GET", credentials: "same-origin", signal: opts.signal });
+  } catch (err) {
+    if (opts.signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) {
+      throw new ApiError("cancelled", "request was cancelled");
+    }
+    throw new ApiError("network", err instanceof Error ? err.message : "network error");
+  }
+  if (!res.ok) {
+    const detail = await parseErrorDetail(res);
+    if (res.status === 401) notifyAuthenticationChanged();
+    throw new ApiError(kindForStatus(res.status), `${res.status} ${res.statusText}`, res.status, detail);
+  }
+  let maxBytes: number | undefined;
+  if (path === "/export/project") {
+    try {
+      maxBytes = completeExportLimit(res);
+    } catch (err) {
+      await res.body?.cancel().catch(() => undefined);
+      throw err;
+    }
+  }
+  if (res.body === null) return;
+  const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let completed = false;
+  let observedBytes = 0;
+  const cancelReader = () => void reader.cancel().catch(() => undefined);
+  if (opts.signal?.aborted) cancelReader();
+  else opts.signal?.addEventListener("abort", cancelReader, { once: true });
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        completed = true;
+        break;
+      }
+      observedBytes += value.byteLength;
+      if (maxBytes !== undefined && observedBytes > maxBytes) {
+        throw new ApiError("server", "export stream exceeded its maximum-byte bound");
+      }
       buffer += decoder.decode(value, { stream: true });
-      let newlineIndex: number;
-      while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, newlineIndex);
-        buffer = buffer.slice(newlineIndex + 1);
-        if (line.trim().length > 0) yield JSON.parse(line) as T;
+      let newline: number;
+      while ((newline = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (line.trim()) yield JSON.parse(line) as T;
       }
     }
-    if (buffer.trim().length > 0) yield JSON.parse(buffer) as T;
+    if (buffer.trim()) yield JSON.parse(buffer) as T;
   } finally {
+    // `for await` calls this path on a row cap; effect cleanup reaches it via
+    // AbortController. Both explicitly cancel the network reader rather than
+    // relying on garbage collection to stop an upstream export.
+    if (!completed) await reader.cancel().catch(() => undefined);
+    opts.signal?.removeEventListener("abort", cancelReader);
     reader.releaseLock();
   }
 }

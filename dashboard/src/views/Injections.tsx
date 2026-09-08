@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { useExportRows, useMemoryItem, type QueryStatus } from "../api/hooks";
+import { useEffect, useState } from "react";
+import { useInjections, useMemoryItem } from "../api/hooks";
 import { Table, type ColumnDef } from "../components/Table";
 import { StatusBadge, TrustTierBadge } from "../components/StatusBadge";
 import { EmptyState } from "../components/EmptyState";
@@ -13,20 +13,18 @@ import {
 } from "../lib/format";
 import {
   RETRIEVABLE_STATUSES,
-  type InjectionLogExportRow,
+  type InjectionEntryOut,
   type Slot,
-  type TraceIndexExportRow,
 } from "../api/types";
 
 // "What was injected into which run, in which slot, at what score, costing how
 // many tokens. Drill from an injection to the memory, and from the memory to
 // its provenance traces. This is the view that makes memory auditable" (task
 // brief). Every step of that drill uses a route that actually exists:
-//   injection_log rows      -> GET /export/project (filtered client-side)
+//   injection_log rows      -> GET /admin/injections (paged server feed)
 //   injection -> memory     -> GET /admin/memory/{id} (the only by-id read)
-//   memory -> provenance    -> memory_item.provenance.trace_ids, resolved
-//                              against trace_index rows from the same export
-// No list/filter/paginate route exists for injection_log (contract gap).
+// The API has no trace-index drilldown route, so provenance trace ids are
+// disclosed as identifiers rather than reconstructed from a project export.
 //
 // The one thing this view must not imply: that the memory panel describes the
 // memory AS IT WAS when it was injected. `GET /admin/memory/{id}` returns
@@ -36,7 +34,7 @@ import {
 // find. It is called out in the panel, prominently, whenever the memory's
 // current status is one the hot path would no longer serve.
 
-const EXPORT_ROW_CAP = 8000;
+const PAGE_SIZE = 100;
 
 const SLOT_LABEL: Record<Slot, string> = {
   static_prefix: "Static prefix",
@@ -67,17 +65,7 @@ function median(values: readonly number[]): number | null {
   return lo !== undefined && hi !== undefined ? (lo + hi) / 2 : null;
 }
 
-function MemoryDetailPanel({
-  injection,
-  traceRows,
-  traceStatus,
-  traceTruncated,
-}: {
-  injection: InjectionLogExportRow;
-  traceRows: TraceIndexExportRow[];
-  traceStatus: QueryStatus;
-  traceTruncated: boolean;
-}) {
+function MemoryDetailPanel({ injection }: { injection: InjectionEntryOut }) {
   const memoryQuery = useMemoryItem(injection.memory_id);
 
   const header = (
@@ -135,8 +123,6 @@ function MemoryDetailPanel({
     );
   } else {
     const memory = memoryQuery.data;
-    const traceIds = memory.provenance.trace_ids ?? [];
-    const matchedTraces = traceRows.filter((t) => traceIds.includes(t.run_id));
     const stillServable = RETRIEVABLE_STATUSES.has(memory.status);
 
     body = (
@@ -197,59 +183,8 @@ function MemoryDetailPanel({
         )}
 
         <div>
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-text-muted">
-            Provenance — {memory.provenance.class}
-          </h3>
-          {traceIds.length === 0 ? (
-            <p className="mt-1 text-xs text-text-faint">
-              This memory's provenance carries no trace_ids (expected for provenance classes such as{" "}
-              <code className="font-mono">operator</code> or{" "}
-              <code className="font-mono">human_verdict</code>, which point at a verdict rather than
-              a raw run).
-            </p>
-          ) : traceStatus === "error" ? (
-            <p className="mt-1 text-xs text-status-tombstoned-fg">
-              Could not load trace_index rows, so these {traceIds.length} provenance trace id(s)
-              could not be resolved. Absence below is a load failure, not evidence the traces are
-              missing.
-            </p>
-          ) : traceStatus === "loading" || traceStatus === "idle" ? (
-            <p className="mt-1 text-xs text-text-faint">
-              Resolving {traceIds.length} provenance trace(s)…
-            </p>
-          ) : (
-            <>
-              <ul className="mt-2 space-y-1.5">
-                {matchedTraces.map((t) => (
-                  <li
-                    key={t.run_id}
-                    className="rounded-md border border-border-strong px-2.5 py-1.5 text-xs"
-                  >
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <span className="font-mono text-text" title={t.run_id}>
-                        {truncateId(t.run_id)}
-                      </span>
-                      <span className="text-text-muted">{t.outcome_status}</span>
-                    </div>
-                    <div className="mt-0.5 text-text-faint">
-                      {t.instrumentation_source} · arm {t.arm} · started{" "}
-                      {t.started_at !== null ? formatDateTime(t.started_at) : "—"}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-              {matchedTraces.length < traceIds.length && (
-                <p className="mt-2 text-xs text-text-muted">
-                  {formatInt(traceIds.length - matchedTraces.length)} of{" "}
-                  {formatInt(traceIds.length)} provenance trace id(s) were not found among the
-                  exported trace_index rows
-                  {traceTruncated
-                    ? " — the trace export hit its row cap, so this is very likely truncation rather than missing provenance."
-                    : ", so they either predate this project's retained trace history or were never indexed."}
-                </p>
-              )}
-            </>
-          )}
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-text-muted">Provenance — {memory.provenance.class}</h3>
+          <p className="mt-1 text-xs text-text-faint">This paginated feed has no trace-index join. The API reports {memory.provenance.trace_ids?.length ?? 0} provenance trace id(s); it does not provide an as-of trace drilldown.</p>
         </div>
       </div>
     );
@@ -264,24 +199,11 @@ function MemoryDetailPanel({
 }
 
 export default function Injections() {
-  const injectionExport = useExportRows(["injection_log"], EXPORT_ROW_CAP);
-  const traceExport = useExportRows(["trace_index"], EXPORT_ROW_CAP);
-  const [selected, setSelected] = useState<InjectionLogExportRow | null>(null);
-
-  const injectionRows = useMemo(
-    () =>
-      injectionExport.rows.flatMap((r): InjectionLogExportRow[] =>
-        r.table === "injection_log" ? [r.row] : []
-      ),
-    [injectionExport.rows]
-  );
-  const traceRows = useMemo(
-    () =>
-      traceExport.rows.flatMap((r): TraceIndexExportRow[] =>
-        r.table === "trace_index" ? [r.row] : []
-      ),
-    [traceExport.rows]
-  );
+  const [offset, setOffset] = useState(0);
+  const injectionPage = useInjections(PAGE_SIZE, offset);
+  const [selected, setSelected] = useState<InjectionEntryOut | null>(null);
+  const injectionRows = injectionPage.data?.items ?? [];
+  useEffect(() => setSelected(null), [offset]);
 
   const totalTokens = injectionRows.reduce((sum, r) => sum + r.tokens, 0);
   const scores = injectionRows.map((r) => r.score);
@@ -289,7 +211,7 @@ export default function Injections() {
   const distinctRuns = new Set(injectionRows.map((r) => r.run_id)).size;
   const distinctMemories = new Set(injectionRows.map((r) => r.memory_id)).size;
 
-  const columns: ColumnDef<InjectionLogExportRow>[] = [
+  const columns: ColumnDef<InjectionEntryOut>[] = [
     {
       key: "injected_at",
       header: "Injected (UTC)",
@@ -369,9 +291,9 @@ export default function Injections() {
         </p>
       </div>
 
-      {injectionExport.status === "error" ? (
-        <ErrorState error={injectionExport.error} onRetry={injectionExport.reload} />
-      ) : injectionExport.status === "loading" ? (
+      {injectionPage.status === "error" ? (
+        <ErrorState error={injectionPage.error} onRetry={injectionPage.reload} />
+      ) : injectionPage.status === "loading" ? (
         <div role="status" aria-label="Loading injections" className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           {Array.from({ length: 4 }, (_, i) => (
             <div key={i} className="h-[70px] animate-pulse rounded-lg border border-border bg-surface" />
@@ -388,7 +310,7 @@ export default function Injections() {
             <StatTile
               label="Injections"
               value={formatInt(injectionRows.length)}
-              sublabel="all-time, exported"
+              sublabel={`page starting at ${formatInt(offset + 1)}`}
             />
             <StatTile
               label="Distinct runs"
@@ -406,14 +328,6 @@ export default function Injections() {
               sublabel={`across ${formatInt(distinctRuns)} run(s)`}
             />
           </div>
-          {injectionExport.truncated && (
-            <p className="text-xs text-status-quarantined-fg">
-              This list hit its {formatInt(EXPORT_ROW_CAP)}-row export cap before finishing — older
-              injections may be missing, so every figure above is a lower bound. No paginated or
-              filtered injection_log route exists (see Contract gaps).
-            </p>
-          )}
-
           <p className="text-xs text-text-muted">
             Score is the assembler's selection score recorded at injection time. It is not a
             probability and is not comparable across scoring epochs, so it ranks within a run rather
@@ -425,7 +339,7 @@ export default function Injections() {
               caption="Memories injected into runs, one row per run and memory pair. Select a row to load that memory and its provenance."
               columns={columns}
               rows={injectionRows}
-              getRowId={(row) => `${row.run_id}:${row.memory_id}`}
+              getRowId={(row) => `${row.run_id}:${row.memory_id}:${row.slot}:${row.injected_at}`}
               onRowClick={setSelected}
               initialSort={{ key: "injected_at", direction: "desc" }}
               maxHeight="70vh"
@@ -438,15 +352,17 @@ export default function Injections() {
                 />
               ) : (
                 <MemoryDetailPanel
-                  key={`${selected.run_id}:${selected.memory_id}`}
+                  key={`${selected.run_id}:${selected.memory_id}:${selected.slot}:${selected.injected_at}`}
                   injection={selected}
-                  traceRows={traceRows}
-                  traceStatus={traceExport.status}
-                  traceTruncated={traceExport.truncated}
                 />
               )}
             </div>
           </div>
+          <nav aria-label="Injection pages" className="flex items-center justify-end gap-3 text-sm">
+            <button type="button" disabled={offset === 0} onClick={() => setOffset((current) => Math.max(0, current - PAGE_SIZE))} className="rounded-md border border-border-strong px-3 py-1.5 disabled:opacity-40">Newer</button>
+            <span className="text-text-muted">{formatInt(offset + 1)}–{formatInt(offset + injectionRows.length)}</span>
+            <button type="button" disabled={injectionPage.data === undefined || injectionPage.data.returned < injectionPage.data.limit} onClick={() => setOffset((current) => current + PAGE_SIZE)} className="rounded-md border border-border-strong px-3 py-1.5 disabled:opacity-40">Older</button>
+          </nav>
         </>
       )}
     </div>

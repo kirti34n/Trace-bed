@@ -18,6 +18,10 @@ out/
 .env.local
 .env.*.local
 *.pem
+# Compose-v1 reads named local secret files only.  They are deliberately not
+# discoverable by the Docker build contexts or version control.
+secrets/
+*.secret
 
 # Logs
 *.log
@@ -51,6 +55,11 @@ gate_report_phase*.md
 gate_report_full.md
 bench_report_phase*.md
 
+# Local evidence and release workspaces. The checked-in capability contract is
+# docs/capabilities.toml; do not ignore it or its generated Markdown view.
+evidence/
+release-artifacts/
+
 # Local trace-store root (contains encrypted trace payloads)
 .tracestore/
 var/
@@ -63,5 +72,13 @@ Desktop.ini
 .vscode/*
 !.vscode/extensions.json
 
-# Claude Code: project config IS tracked; only local-only overrides are ignored
+# Claude Code configuration is not repository content; ignore local state and settings.
 .claude/settings.local.json
+.claude/settings.json
+.claude/plugins/
+.tracebed-demo/
+output/
+.playwright-cli/
+graphify-out/
+**/graphify-out/
+.serena/

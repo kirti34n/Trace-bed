@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from typing import Final
 from uuid import uuid4
 
+from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import (
     AbstentionConfig,
     BudgetConfig,
@@ -91,6 +92,7 @@ from tracebed.hotpath.abstention import (
     measured_abstention_rate,
 )
 from tracebed.hotpath.assembler import Candidate, assemble
+from tracebed.hotpath.budget import Deadline
 from tracebed.hotpath.calibration import CalibratedSignals, calibrated_score
 from tracebed.hotpath.fusion import ArmSignal, FusedCandidate
 from tracebed.hotpath.pipeline import CandidateSetResult, Pipeline
@@ -242,9 +244,12 @@ class ProbeAssembly:
         query_text: str,
         candidates: Sequence[FusedCandidate],
         cfg: EffectiveConfig,
+        deadline: Deadline,
     ) -> CandidateSetResult:
         if not candidates:
-            return CandidateSetResult(outcome_code=OutcomeCode.EMPTY_RESULT, slots=(), top_score=None)
+            return CandidateSetResult(
+                outcome_code=OutcomeCode.EMPTY_RESULT, slots=(), top_score=None
+            )
 
         decisions: list[tuple[FusedCandidate, AbstentionDecision]] = [
             (fc, decide(self._by_id[fc.memory_id].signals, cfg.abstention)) for fc in candidates
@@ -283,7 +288,9 @@ class ProbeAssembly:
             )
         assembled = assemble(built, cfg=cfg)
         top_score = max((c.score for c in built), default=None)
-        return CandidateSetResult(outcome_code=OutcomeCode.INJECTED, slots=assembled.slots, top_score=top_score)
+        return CandidateSetResult(
+            outcome_code=OutcomeCode.INJECTED, slots=assembled.slots, top_score=top_score
+        )
 
 
 def _fused_candidates(probe: Probe) -> tuple[FusedCandidate, ...]:
@@ -314,7 +321,19 @@ def run_probe(probe: Probe, *, cfg: EffectiveConfig | None = None) -> ProbeResul
     fused = _fused_candidates(probe)
     assembly = ProbeAssembly(probe)
     scope = _scope()
-    result = assembly.run(scope, query_text=probe.query_text, candidates=fused, cfg=resolved)
+    clock = FakeClock()
+    deadline = Deadline(
+        clock=clock,
+        total_budget_ms=resolved.retrieval.total_budget_ms,
+        embed_timeout_ms=resolved.retrieval.embed_timeout_ms,
+    )
+    result = assembly.run(
+        scope,
+        query_text=probe.query_text,
+        candidates=fused,
+        cfg=resolved,
+        deadline=deadline,
+    )
     decisions = tuple(decide(c.signals, resolved.abstention) for c in probe.candidates)
     return ProbeResult(
         probe=probe,
@@ -346,7 +365,14 @@ class _FixedRetriever:
     def __init__(self, candidates: Sequence[FusedCandidate]) -> None:
         self._candidates = tuple(candidates)
 
-    def retrieve(self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig) -> _FixedOutcome:
+    def retrieve(
+        self,
+        project_id: ProjectId,
+        query_text: str,
+        *,
+        cfg: RetrievalConfig,
+        deadline: Deadline,
+    ) -> _FixedOutcome:
         return _FixedOutcome(
             candidates=self._candidates,
             degraded=False,
@@ -359,7 +385,9 @@ class _StaticConfigProvider:
     def __init__(self, cfg: EffectiveConfig) -> None:
         self._cfg = cfg
 
-    def effective(self, project_id: ProjectId, agent_type_id: AgentTypeId | None = None) -> EffectiveConfig:
+    def effective(
+        self, project_id: ProjectId, agent_type_id: AgentTypeId | None = None
+    ) -> EffectiveConfig:
         return self._cfg
 
 
@@ -380,14 +408,14 @@ def _scope() -> ProjectScope:
     )
 
 
-def run_probe_through_pipeline(probe: Probe, *, cfg: EffectiveConfig | None = None) -> RetrieveResult:
+def run_probe_through_pipeline(
+    probe: Probe, *, cfg: EffectiveConfig | None = None
+) -> RetrieveResult:
     """Runs one probe through a REAL `hotpath.pipeline.Pipeline` — the exact
     orchestrator `/v1/retrieve` calls — with a fake retriever standing in for
     the two search arms and the same `ProbeAssembly` `run_probe` uses standing
     in for the not-yet-built `CandidateAssemblyPort`. Proves the negative-probe
     guarantee survives the orchestrator, not just the abstention module."""
-    from tracebed.domain.clock import FakeClock
-
     resolved = cfg if cfg is not None else default_config()
     # The holdout arm is memory-off (D-099): a probe whose random scope hashes into holdout
     # returns OutcomeCode.HOLDOUT and an empty block, which would count as a (vacuous) zero
@@ -406,7 +434,9 @@ def run_probe_through_pipeline(probe: Probe, *, cfg: EffectiveConfig | None = No
         assembly=ProbeAssembly(probe),
         holdout_salt="negative-probe-salt",
     )
-    return pipeline.retrieve(_scope(), RunContext(query_text=probe.query_text), session_id=probe.name)
+    return pipeline.retrieve(
+        _scope(), RunContext(query_text=probe.query_text), session_id=probe.name
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -424,7 +454,9 @@ def _rare_signals(*, cos_sim: float, bm25_raw: float) -> CandidateSignals:
     )
 
 
-def _common_term_signals(*, cos_sim: float, bm25_raw: float, corpus_doc_count: int) -> CandidateSignals:
+def _common_term_signals(
+    *, cos_sim: float, bm25_raw: float, corpus_doc_count: int
+) -> CandidateSignals:
     """Rarity gate FAILS on term commonness alone — every shared term's
     document frequency is well above `rarity_max_df_pct` (2.0), and
     `corpus_doc_count` clears `rarity_min_corpus_docs` (200) so this is not
@@ -432,7 +464,9 @@ def _common_term_signals(*, cos_sim: float, bm25_raw: float, corpus_doc_count: i
     return CandidateSignals(
         cos_sim=cos_sim,
         bm25_raw=bm25_raw,
-        rarity=RarityEvidence(shared_term_doc_freq_pct=(10.0, 40.0, 80.0), corpus_doc_count=corpus_doc_count),
+        rarity=RarityEvidence(
+            shared_term_doc_freq_pct=(10.0, 40.0, 80.0), corpus_doc_count=corpus_doc_count
+        ),
     )
 
 
@@ -444,7 +478,9 @@ def _cold_start_signals(*, corpus_doc_count: int) -> CandidateSignals:
     return CandidateSignals(
         cos_sim=0.9,
         bm25_raw=80.0,
-        rarity=RarityEvidence(shared_term_doc_freq_pct=(0.5, 1.0, 1.5), corpus_doc_count=corpus_doc_count),
+        rarity=RarityEvidence(
+            shared_term_doc_freq_pct=(0.5, 1.0, 1.5), corpus_doc_count=corpus_doc_count
+        ),
     )
 
 
@@ -460,7 +496,12 @@ def _empty_vault_probes() -> list[Probe]:
         "who owns the incident response runbook for the auth service",
     )
     return [
-        Probe(name=f"empty_vault_{i:02d}", probe_class=ProbeClass.EMPTY_VAULT, query_text=q, candidates=())
+        Probe(
+            name=f"empty_vault_{i:02d}",
+            probe_class=ProbeClass.EMPTY_VAULT,
+            query_text=q,
+            candidates=(),
+        )
         for i, q in enumerate(queries)
     ]
 
@@ -526,7 +567,9 @@ def _generic_common_terms_probes() -> list[Probe]:
             slot=Slot.PITFALL,
             text=f"generic common-term candidate {i}",
             tokens=25,
-            signals=_common_term_signals(cos_sim=cos_sim, bm25_raw=bm25_raw, corpus_doc_count=corpus_doc_count),
+            signals=_common_term_signals(
+                cos_sim=cos_sim, bm25_raw=bm25_raw, corpus_doc_count=corpus_doc_count
+            ),
         )
         probes.append(
             Probe(

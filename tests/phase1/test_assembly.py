@@ -153,20 +153,26 @@ class FakeStore:
         self.corpus_calls: list[ProjectId] = []
 
     def fetch_candidates(
-        self, project_id: ProjectId, memory_ids: Sequence[MemoryId]
+        self,
+        project_id: ProjectId,
+        memory_ids: Sequence[MemoryId],
+        *,
+        deadline: object | None = None,
     ) -> list[CandidateRow]:
         self.fetch_calls.append((project_id, list(memory_ids)))
         wanted = set(memory_ids)
         return [row for row in self._rows if row.memory_id in wanted]
 
-    def document_frequency(self, project_id: ProjectId, terms: Sequence[str]) -> dict[str, int]:
+    def document_frequency(
+        self, project_id: ProjectId, terms: Sequence[str], *, deadline: object | None = None
+    ) -> dict[str, int]:
         self.df_calls.append((project_id, list(terms)))
         # Default: every term is rare (df 1), so the rarity gate passes unless a test says
         # otherwise. Stated explicitly rather than left implicit -- a fake that made every gate
         # pass by accident would make the abstention tests below prove nothing.
         return {term: self._frequencies.get(term, 1) for term in terms}
 
-    def corpus_size(self, project_id: ProjectId) -> int:
+    def corpus_size(self, project_id: ProjectId, *, deadline: object | None = None) -> int:
         self.corpus_calls.append(project_id)
         return self._corpus
 
@@ -196,7 +202,9 @@ def test_result_shape_matches_the_pipelines_own_declaration() -> None:
 def test_the_real_assembly_satisfies_the_pipelines_port() -> None:
     """Structural typing is only a contract if something checks it: `Pipeline` accepts this
     object by Protocol, so a renamed keyword here would fail at request time, in production."""
-    assert isinstance(CandidateAssembly(FakeStore(), FakeClock(NOW)), pipeline_module.CandidateAssemblyPort)
+    assert isinstance(
+        CandidateAssembly(FakeStore(), FakeClock(NOW)), pipeline_module.CandidateAssemblyPort
+    )
     ours = inspect.signature(CandidateAssembly.run)
     theirs = inspect.signature(pipeline_module.CandidateAssemblyPort.run)
     assert list(ours.parameters) == list(theirs.parameters)
@@ -255,12 +263,16 @@ def test_cold_start_abstains_on_rarity_and_never_pays_for_the_df_query() -> None
 
 def test_a_corpus_below_the_configured_floor_abstains_on_rarity() -> None:
     store = FakeStore(rows=[_row(_mid("a"))], corpus=199)
-    result = _run(store, [_fused(_mid("a"))], abstention=AbstentionConfig(rarity_min_corpus_docs=200))
+    result = _run(
+        store, [_fused(_mid("a"))], abstention=AbstentionConfig(rarity_min_corpus_docs=200)
+    )
     assert result.outcome_code is OutcomeCode.ABSTAINED_RARITY
     # And the mirror: one more document and the same candidate clears the same gate.
     store = FakeStore(rows=[_row(_mid("a"))], corpus=200)
     assert (
-        _run(store, [_fused(_mid("a"))], abstention=AbstentionConfig(rarity_min_corpus_docs=200)).outcome_code
+        _run(
+            store, [_fused(_mid("a"))], abstention=AbstentionConfig(rarity_min_corpus_docs=200)
+        ).outcome_code
         is OutcomeCode.INJECTED
     )
 
@@ -269,7 +281,9 @@ def test_common_shared_terms_do_not_count_as_rare() -> None:
     """Every shared term is present, but each matches 10% of a 1000-document corpus, well above
     `rarity_max_df_pct` (2.0) -- this is the gate that stops a generic query matching generic
     memory."""
-    store = FakeStore(rows=[_row(_mid("a"))], corpus=1_000, frequencies=dict.fromkeys(query_terms(QUERY), 100))
+    store = FakeStore(
+        rows=[_row(_mid("a"))], corpus=1_000, frequencies=dict.fromkeys(query_terms(QUERY), 100)
+    )
     assert _run(store, [_fused(_mid("a"))]).outcome_code is OutcomeCode.ABSTAINED_RARITY
 
 
@@ -289,7 +303,9 @@ def test_a_low_cosine_abstains_on_the_threshold_gate() -> None:
 def test_a_low_bm25_abstains_on_the_threshold_gate() -> None:
     store = FakeStore(rows=[_row(_mid("a"))])
     # bm25_saturate(1.0, k=10) == 0.09, below the 0.50 default threshold.
-    assert _run(store, [_fused(_mid("a"), bm25=1.0)]).outcome_code is OutcomeCode.ABSTAINED_THRESHOLD
+    assert (
+        _run(store, [_fused(_mid("a"), bm25=1.0)]).outcome_code is OutcomeCode.ABSTAINED_THRESHOLD
+    )
 
 
 def test_everything_clears_but_nothing_fits_is_empty_not_injected() -> None:
@@ -399,7 +415,11 @@ def test_a_stale_memory_scores_below_an_identical_fresh_one() -> None:
     store = FakeStore(
         rows=[
             _row(fresh, created_at=NOW),
-            _row(stale, created_at=NOW - timedelta(days=365), content="retry idempotent invocation notes"),
+            _row(
+                stale,
+                created_at=NOW - timedelta(days=365),
+                content="retry idempotent invocation notes",
+            ),
         ]
     )
     result = _run(store, [_fused(fresh, rank=1), _fused(stale, rank=2)])
@@ -419,7 +439,9 @@ def test_a_document_frequency_above_the_corpus_count_does_not_raise() -> None:
     """`df` and the corpus count come from two separate statements; a write landing between them
     can make the ratio exceed 1. `RarityEvidence` refuses a percentage outside [0, 100], and a
     benign race must not become the ladder's store-error rung."""
-    store = FakeStore(rows=[_row(_mid("a"))], corpus=10, frequencies=dict.fromkeys(query_terms(QUERY), 999))
+    store = FakeStore(
+        rows=[_row(_mid("a"))], corpus=10, frequencies=dict.fromkeys(query_terms(QUERY), 999)
+    )
     assert _run(store, [_fused(_mid("a"))]).outcome_code is OutcomeCode.ABSTAINED_RARITY
 
 
@@ -442,7 +464,9 @@ def test_every_mem_type_maps_to_a_slot(mem_type: MemType, expected: Slot) -> Non
 
 
 @pytest.mark.parametrize("mem_type", list(MemType))
-def test_a_tier_a_candidate_row_is_a_candidate_note_whatever_its_mem_type(mem_type: MemType) -> None:
+def test_a_tier_a_candidate_row_is_a_candidate_note_whatever_its_mem_type(
+    mem_type: MemType,
+) -> None:
     """PLAN.md §5: a `candidate` row is retrievable only as Tier A, labelled lower-trust, capped
     at 1/run. The label IS the slot -- routing it by mem_type instead would render an
     unpromoted memory as an ordinary validated fact."""

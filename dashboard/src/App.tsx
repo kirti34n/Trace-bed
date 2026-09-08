@@ -1,6 +1,7 @@
 import { lazy, Suspense } from "react";
 import { Navigate, Outlet, Route, Routes } from "react-router-dom";
 import { Layout } from "./components/Layout";
+import { SessionProvider, useSession } from "./auth/session";
 
 // Every route here renders a real view against a real route. There is no
 // scaffold panel and no fixture page left in this tree: a view whose data has
@@ -34,6 +35,7 @@ const Spend = lazy(() => import("./views/Spend"));
 const Health = lazy(() => import("./views/Health"));
 const Projects = lazy(() => import("./views/Projects"));
 const Settings = lazy(() => import("./views/Settings"));
+const ValidationRuns = lazy(() => import("./views/ValidationRuns"));
 
 /** Route-level loading. Fixed height and the same border/surface as a real
  * panel so the page does not reflow when the chunk lands — a view that jumps
@@ -48,17 +50,37 @@ function RouteFallback() {
   );
 }
 
-export default function App() {
+/** Do not mount data views until the BFF session is known to be authenticated.
+ * This makes logout and auth loss clear rendered project state synchronously,
+ * even if the subsequent `/auth/session` probe is slow or fails. */
+function ProtectedOutlet() {
+  const { phase, login, error, reload } = useSession();
+  if (phase === "authenticated") return <Outlet />;
+  if (phase === "anonymous") {
+    return (
+      <div className="rounded-lg border border-border bg-surface p-6">
+        <h1 className="text-lg font-semibold text-text">Sign in required</h1>
+        <p className="mt-1 text-sm text-text-muted">Use the same-origin identity flow to access project-scoped views.</p>
+        <button type="button" onClick={login} className="mt-4 rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-contrast">Sign in</button>
+      </div>
+    );
+  }
+  if (phase === "error") {
+    return <div role="alert" className="rounded-lg border border-status-quarantined-border bg-status-quarantined-bg p-6 text-sm text-status-quarantined-fg">Could not verify the session{error?.message ? ": " + error.message : "."}<button type="button" onClick={reload} className="ml-3 underline">Retry</button></div>;
+  }
+  return <RouteFallback />;
+}
+
+function RoutedApp() {
+  // There is no client query cache, but pages do retain local data/filter
+  // state. An authentication transition remounts the route tree so no result,
+  // selection, or filter survives under a different BFF identity.
+  const { epoch } = useSession();
   return (
-    <Routes>
+    <Routes key={epoch}>
       <Route element={<Layout />}>
-        <Route
-          element={
-            <Suspense fallback={<RouteFallback />}>
-              <Outlet />
-            </Suspense>
-          }
-        >
+        <Route element={<ProtectedOutlet />}>
+          <Route element={<Suspense fallback={<RouteFallback />}><Outlet /></Suspense>}>
           <Route index element={<Overview />} />
           <Route path="injections" element={<Injections />} />
           <Route path="memory-vault" element={<MemoryVault />} />
@@ -78,9 +100,19 @@ export default function App() {
           <Route path="health" element={<Health />} />
           <Route path="registry" element={<Projects />} />
           <Route path="settings" element={<Settings />} />
+          <Route path="validation-runs" element={<ValidationRuns />} />
           <Route path="*" element={<Navigate to="/" replace />} />
+          </Route>
         </Route>
       </Route>
     </Routes>
+  );
+}
+
+export default function App() {
+  return (
+    <SessionProvider>
+      <RoutedApp />
+    </SessionProvider>
   );
 }

@@ -1,4 +1,4 @@
-"""Operator edit operations: pin, delete-by-subject, merge, operator_edit (PLAN.md §7
+"""Operator edit operations: pin, merge, operator_edit (PLAN.md §7
 Phase 3; PLAN.md §10 "no admin bypass exists in code").
 
 These four operations LOOK administrative -- a dashboard button that deletes, merges, or
@@ -15,13 +15,6 @@ module that duplicates the machine's own refusal.
     provenance actually has. Preferences only (`_guard_none_to_pinned` requires
     `mem_type == PREFERENCE`); goes through `core.scans` like every other insert
     (invariant 6: no write path skips the scan suite, preferences included).
-  * `delete_by_subject` -- crypto-shredding (`crypto.shred.SubjectKeyManager.destroy_subject`)
-    destroys the subject's KEK, and every `memory_item` tagged with that subject is
-    additionally tombstoned through `apply()` (`erasure_or_approved_delete=True`,
-    PLAN.md §5's wildcard `*->tombstoned` row). Two independent effects, both erasure:
-    the trace payload's subject sections become cryptographically unreadable (§6,
-    `crypto/shred.py` -- already tested there), and any GOVERNED memory carrying that
-    subject_tag is tombstoned (this module's job).
   * `merge` -- combines >= 2 `validated` sources by superseding each of them
     (`validated -> superseded`, `contradiction_equal_or_stronger=True` -- an operator
     merge decision is definitionally an equal-or-stronger authority over the sources it
@@ -50,7 +43,7 @@ module that duplicates the machine's own refusal.
     left to whoever next owns `domain/state_machine.py`.
 
 Every method below re-fetches nothing it did not just receive: `MemoryEditRepoPort` is
-this chunk's own Protocol (`Repo` has no `select_by_subject_tag`/`persist_status` at all
+this chunk's own Protocol (`Repo` has no `persist_status` at all
 -- a real contract gap, distinct from the state-machine one above -- and returns
 `stores.pg.rows.MemoryItemRow` from `get_memory_by_id`, not this module's smaller
 `EditableMemory` projection; a thin adapter is the natural next step for whoever wires
@@ -67,7 +60,6 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from tracebed.core.scans import ScanContext, scan
-from tracebed.crypto.shred import SubjectKeyManager
 from tracebed.domain.clock import Clock
 from tracebed.domain.config import EffectiveConfig
 from tracebed.domain.enums import Lane, MemType, ProvenanceClass, ScopeType, TrustTier
@@ -78,7 +70,6 @@ from tracebed.domain.scan import ScanVerdict
 from tracebed.domain.state_machine import Status, TransitionEvidence, TransitionLimits, apply
 
 __all__ = [
-    "DeleteBySubjectResult",
     "EditOps",
     "EditableMemory",
     "MemoryEditRepoPort",
@@ -120,11 +111,11 @@ def _require_aware(name: str, value: datetime | None) -> datetime | None:
 @dataclass(frozen=True, slots=True)
 class EditableMemory:
     """The projection of a `memory_item` row every op in this module needs: enough to
-    build a `TransitionEvidence` and to re-assert project scope, plus `subject_tag`
-    (needed by `delete_by_subject`, and absent from `workers.invalidator.LifecycleMemoryRow`
-    -- that dataclass is the closest existing sibling shape but does not carry it, so a
-    separate projection lives here rather than forcing an unrelated chunk's row type to
-    grow a field this chunk needs)."""
+    build a `TransitionEvidence` and to re-assert project scope.
+
+    `subject_tag` remains a legacy read projection while historical rows exist; it is
+    intentionally not an erasure selector or write path.
+    """
 
     id: MemoryId
     project_id: ProjectId
@@ -194,12 +185,6 @@ class MemoryEditRepoPort(Protocol):
         new query."""
         ...
 
-    def select_by_subject_tag(
-        self, project_id: ProjectId, subject_tag: str
-    ) -> Sequence[EditableMemory]:
-        """CONTRACT GAP: `Repo` has no query indexed on `memory_item.subject_tag` today."""
-        ...
-
     def persist_status(self, project_id: ProjectId, write: MemoryStatusWrite) -> None:
         """CONTRACT GAP: `Repo` has no `UPDATE memory_item SET status = ...` path at all
         -- only `insert_memory_item` (a fresh row) exists today."""
@@ -217,20 +202,6 @@ class MemoryEditRepoPort(Protocol):
 class PinResult:
     memory_id: MemoryId
     status: Status
-
-
-@dataclass(frozen=True, slots=True)
-class DeleteBySubjectResult:
-    subject_tag: str
-    key_destroyed: bool
-    """`SubjectKeyManager.destroy_subject`'s own return: `False` iff the subject never had
-    a KEK row at all (idempotent -- re-destroying an already-destroyed key is `True`)."""
-    tombstoned_memory_ids: tuple[MemoryId, ...]
-    already_tombstoned_memory_ids: tuple[MemoryId, ...]
-    """Rows `select_by_subject_tag` returned that were already `tombstoned` -- skipped
-    without calling `apply()`, because `(TOMBSTONED, TOMBSTONED)` is not in `TRANSITIONS`
-    at all (tombstoned is the machine's one terminal status) and re-tombstoning an
-    already-erased row is not a status change, it is a no-op that must not raise."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,14 +230,15 @@ def _require_project(row: EditableMemory, project_id: ProjectId, *, source: str)
 
 
 class EditOps:
-    """The four operator edit operations. `repo` is this module's own
-    `MemoryEditRepoPort`; `key_manager` is the crypto-shredding seam
-    (`crypto.shred.SubjectKeyManager`) `delete_by_subject` uses for the KEK half of
-    erasure."""
+    """The three non-erasure operator edit operations.
 
-    def __init__(self, repo: MemoryEditRepoPort, key_manager: SubjectKeyManager, clock: Clock) -> None:
+    Erasure is deliberately absent from this worker-facing surface.  E2 publishes a
+    durable request and fence only; the low-level key-destruction primitive remains
+    future-saga machinery and is not reachable through an ordinary edit operation.
+    """
+
+    def __init__(self, repo: MemoryEditRepoPort, clock: Clock) -> None:
         self._repo = repo
-        self._key_manager = key_manager
         self._clock = clock
 
     # -- pin ------------------------------------------------------------------------
@@ -305,14 +277,8 @@ class EditOps:
         LLM judge is ever involved, exactly like the operational lane) -- an arbitrary but
         fixed and documented choice, not a magic number smuggled into logic a guard reads.
 
-        `subject_tag` is the erasure handle and it is NOT optional in practice for a
-        preference that is about a person: `delete_by_subject` (this same module) finds
-        rows exclusively through `memory_item.subject_tag`, so a pinned preference created
-        without one is unreachable by the erasure path forever -- content this module
-        creates that the module's own erasure operation provably cannot delete. It stays
-        `None`-defaulted only because a genuinely subject-less operator preference (an
-        environment or project-wide rule) exists and must not be forced to invent a
-        subject it does not have.
+        Subject identity, where supplied, is handled at the authoritative ingress
+        boundary.  This legacy editor does not expose erasure or key-destruction paths.
         """
         ctx = ScanContext(
             project_id=project_id,
@@ -349,82 +315,6 @@ class EditOps:
         )
         memory_id = self._repo.insert_memory_item(project_id, item, verdict)
         return PinResult(memory_id=memory_id, status=new_status)
-
-    # -- delete-by-subject ------------------------------------------------------------
-
-    def delete_by_subject(
-        self, project_id: ProjectId, subject_tag: str, *, cfg: EffectiveConfig
-    ) -> DeleteBySubjectResult:
-        """Crypto-shredding (`SubjectKeyManager.destroy_subject`) plus a tombstone
-        transition for every governed memory tagged with this subject
-        (`*->tombstoned`, `erasure_or_approved_delete=True`).
-
-        The two effects are independent and both real: destroying the KEK makes every
-        trace payload SECTION tagged with this subject permanently unreadable while the
-        stored object's BYTES never change (`crypto/shred.py`, already tested there); this
-        method's own job is the SEPARATE governed-memory side -- a `memory_item` row
-        merely carrying `subject_tag` on its own column, independent of whatever trace
-        sections it may or may not still reference.
-
-        Every row the store returned is validated BEFORE any of them is tombstoned. A
-        store that hands back a foreign-project or foreign-subject row is an isolation
-        failure, and discovering it halfway through the loop would leave an erasure
-        half-applied against an unknown-correct row set -- the refusal has to come before
-        the first write, not from inside it.
-
-        KEK destruction happens first and unconditionally: it is the erasure act that
-        must not be blocked by a store defect on the governed-memory side (a subject's
-        right to erasure does not wait on `memory_item` being well-formed).
-        """
-        if not subject_tag:
-            raise ValueError("delete_by_subject requires a non-empty subject_tag")
-
-        key_destroyed = self._key_manager.destroy_subject(project_id, subject_tag)
-        rows = self._repo.select_by_subject_tag(project_id, subject_tag)
-        for row in rows:
-            _require_project(row, project_id, source="select_by_subject_tag")
-            if row.subject_tag != subject_tag:
-                raise TracebedError(
-                    f"select_by_subject_tag({subject_tag!r}) returned memory {row.id} "
-                    f"tagged {row.subject_tag!r}; a subject-scoped erasure must not act on "
-                    f"a row outside the requested subject"
-                )
-
-        now = self._clock.now()
-        limits = TransitionLimits.from_config(cfg)
-        tombstoned: list[MemoryId] = []
-        already: list[MemoryId] = []
-        for row in rows:
-            if row.status is Status.TOMBSTONED:
-                # `(TOMBSTONED, TOMBSTONED)` is not a legal edge (tombstoned is the one
-                # terminal status) -- calling `apply()` on it would raise `IllegalTransition`
-                # for a row that is already exactly where erasure wants it. A no-op, not a
-                # refusal.
-                already.append(row.id)
-                continue
-            evidence = TransitionEvidence(
-                now=now,
-                provenance_class=row.provenance.cls,
-                trust_tier=row.trust_tier,
-                mem_type=row.mem_type,
-                status_changed_at=row.status_changed_at,
-                erasure_or_approved_delete=True,
-            )
-            new_status = apply(row.status, Status.TOMBSTONED, evidence, limits)
-            self._repo.persist_status(
-                project_id,
-                MemoryStatusWrite(
-                    memory_id=row.id, from_status=row.status, to_status=new_status, now=now
-                ),
-            )
-            tombstoned.append(row.id)
-
-        return DeleteBySubjectResult(
-            subject_tag=subject_tag,
-            key_destroyed=key_destroyed,
-            tombstoned_memory_ids=tuple(tombstoned),
-            already_tombstoned_memory_ids=tuple(already),
-        )
 
     # -- merge ------------------------------------------------------------------------
 

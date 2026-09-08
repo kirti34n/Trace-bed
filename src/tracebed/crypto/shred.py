@@ -24,15 +24,20 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Protocol
 from uuid import UUID, uuid4
 
+from cryptography.exceptions import InvalidTag
+
 from tracebed.crypto import envelope
+from tracebed.crypto.subject_digest import subject_digest, subject_digest_pairs
+from tracebed.domain.canonical import canonical_json
 from tracebed.domain.clock import Clock
-from tracebed.domain.errors import MasterKeyMissing, NotFound, Tombstoned
+from tracebed.domain.errors import MasterKeyMissing, NotFound, Tombstoned, TracebedError
 from tracebed.domain.ids import ProjectId, RunId
 
 if TYPE_CHECKING:
@@ -48,6 +53,8 @@ __all__ = [
     "PROJECT_SUBJECT_TAG",
     "EncryptedPayload",
     "EnvMasterKeyProvider",
+    "KeyBindingMismatch",
+    "KeyMaterialUnavailable",
     "MasterKeyProvider",
     "PlainSection",
     "SubjectKeyManager",
@@ -65,6 +72,24 @@ PROJECT_SUBJECT_TAG: Final = "__project__"
 MAX_SECTIONS: Final = 10_000
 MAX_WRAPS_PER_SECTION: Final = 64
 _MAX_SEQ: Final = 1 << 40
+
+
+class KeyMaterialUnavailable(TracebedError):
+    """The configured master key cannot unwrap persisted KEK material.
+
+    Archive readers retry this operator/dependency condition. It is distinct
+    from an authenticated section or DEK-wrap failure, which is immutable
+    archive corruption.
+    """
+
+
+class KeyBindingMismatch(TracebedError):
+    """A persisted envelope wrap no longer binds to its retained key row.
+
+    This is deterministic archive corruption, not an erasure result.  The
+    subject-key row retained by ``destroy_subject`` is the sole durable
+    evidence that a missing DEK share was intentionally shredded.
+    """
 
 
 class MasterKeyProvider(Protocol):
@@ -115,11 +140,17 @@ class SubjectKeyStore(Protocol):
 
     def get_subject_key(self, project_id: ProjectId, subject_tag: str) -> SubjectKeyRow | None: ...
 
+    def get_subject_key_by_digest(
+        self, project_id: ProjectId, subject_digest: bytes
+    ) -> SubjectKeyRow | None: ...
+
     def insert_subject_key(
         self, project_id: ProjectId, subject_tag: str, key_id: UUID, wrapped_kek: bytes
     ) -> None: ...
 
-    def destroy_subject_key(self, project_id: ProjectId, subject_tag: str) -> bool: ...
+    def insert_subject_key_v2(
+        self, project_id: ProjectId, subject_digest: bytes, key_id: UUID, wrapped_kek: bytes
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +164,11 @@ class PlainSection:
     seq_to: int
     subject_tags: tuple[str, ...]
     lines: tuple[bytes, ...]
+    # v2 never persists raw tags.  Keeping the opaque declared digest set on
+    # the decrypted section lets the archive reader re-derive attribution
+    # from the plaintext without smuggling identities through a v2 envelope.
+    subject_digests: tuple[bytes, ...] = ()
+    envelope_version: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +180,8 @@ class TombstonedSection:
     seq_from: int
     seq_to: int
     subject_tags: tuple[str, ...]
+    subject_digests: tuple[bytes, ...] = ()
+    envelope_version: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +193,14 @@ class EncryptedPayload:
     sections: tuple[Mapping[str, object], ...]
 
     def to_bytes(self) -> bytes:
+        if (
+            self.header.get("fmt") == envelope.V2_ENVELOPE_FMT
+            and self.header.get("v") == envelope.V2_ENVELOPE_VERSION
+        ):
+            # v2 has exactly one valid byte representation.  The runtime
+            # writer is intentionally not switched here; this makes a v2
+            # value constructed by the future gated writer serialize safely.
+            return envelope.serialize_v2_envelope(self.header, self.sections)
         out = envelope.dumps_line(self.header)
         for section in self.sections:
             out += envelope.dumps_line(section)
@@ -169,6 +215,22 @@ class EncryptedPayload:
         an old node into a wrong-looking-but-plausible tombstone; an explicit
         `ValueError` is loud, a silent tombstone is an invisible data loss.
         """
+        # A fully canonical v2 object takes the v2 path before the permissive
+        # legacy JSONL decoder.  A malformed object which claims v2 cannot be
+        # rescued by the v1 path below: its exact fmt/version check fails.
+        try:
+            strict_v2_lines = envelope.loads_v2_lines(raw)
+        except ValueError:
+            strict_v2_lines = None
+        if strict_v2_lines:
+            v2_header, *v2_sections = strict_v2_lines
+            if (
+                v2_header.get("fmt") == envelope.V2_ENVELOPE_FMT
+                and v2_header.get("v") == envelope.V2_ENVELOPE_VERSION
+            ):
+                envelope.validate_v2_envelope(v2_header, v2_sections)
+                return cls(header=v2_header, sections=tuple(v2_sections))
+
         try:
             lines = envelope.loads_lines(raw)
         except (UnicodeDecodeError, ValueError) as exc:
@@ -181,7 +243,10 @@ class EncryptedPayload:
             # escaping as a 500 rather than a typed envelope error.
             raise ValueError("EncryptedPayload.from_bytes: every line must be a JSON object")
         header, *sections = lines
-        if header.get("fmt") != envelope.ENVELOPE_FMT or header.get("v") != envelope.ENVELOPE_VERSION:
+        if (
+            header.get("fmt") != envelope.ENVELOPE_FMT
+            or header.get("v") != envelope.ENVELOPE_VERSION
+        ):
             raise ValueError(
                 f"EncryptedPayload.from_bytes: unsupported envelope "
                 f"{header.get('fmt')!r} v{header.get('v')!r}"
@@ -212,6 +277,12 @@ def _as_str(raw: object, field: str) -> str:
     return raw
 
 
+def _as_list(raw: object, field: str) -> list[object]:
+    if not isinstance(raw, list):
+        raise ValueError(f"envelope: {field} must be a list")
+    return raw
+
+
 def _as_b64(raw: object, field: str) -> bytes:
     try:
         return envelope.b64d(_as_str(raw, field))
@@ -236,7 +307,8 @@ class SubjectKeyManager:
     plain in-memory fake satisfies in every offline test.
 
     Holds NO key cache. That is deliberate and load-bearing: a cached KEK
-    would keep decrypting sections after `destroy_subject()`, which would
+    would keep decrypting sections after a future erasure executor destroys a
+    key, which would
     make erasure a property of process lifetime instead of a property of the
     stored key material.
     """
@@ -245,6 +317,18 @@ class SubjectKeyManager:
         self._store = store
         self._master = master
         self._clock = clock
+
+    def bound_to(self, store: SubjectKeyStore) -> SubjectKeyManager:
+        """Return an equivalent manager using one caller-owned store binding.
+
+        Trace ingress uses this to keep v2 key lookup/creation inside the
+        same scoped transaction as its snapshot, archive metadata, and run
+        attribution.  It exposes neither key material nor a destructive
+        operation; it only avoids a second repository transaction opening
+        while the caller already holds the canonical run locks.
+        """
+
+        return SubjectKeyManager(store=store, master=self._master, clock=self._clock)
 
     # -- KEK lifecycle ------------------------------------------------------
 
@@ -256,15 +340,6 @@ class SubjectKeyManager:
     def get_or_create_subject_kek(self, project_id: ProjectId, subject_tag: str) -> bytes:
         kek, _key_id = self._get_or_create_kek(project_id, subject_tag)
         return kek
-
-    def destroy_subject(self, project_id: ProjectId, subject_tag: str) -> bool:
-        """Erasure = state-machine `*->tombstoned` for every memory derived
-        from this subject (PLAN.md §5 table) PLUS this: the KEK itself is
-        gone, so even the raw trace sections referencing it become
-        permanently unreadable — crypto-shredding is what makes that
-        coexist with an object-locked archive (`subject_key` table comment,
-        PLAN.md §5). Returns False if the subject has no KEK row at all."""
-        return self._store.destroy_subject_key(project_id, subject_tag)
 
     def _get_or_create_kek(self, project_id: ProjectId, subject_tag: str) -> tuple[bytes, UUID]:
         if not subject_tag:
@@ -285,6 +360,55 @@ class SubjectKeyManager:
         key_id = uuid4()
         wrapped = self._wrap_kek(kek, project_id=project_id, subject_tag=subject_tag, key_id=key_id)
         self._store.insert_subject_key(project_id, subject_tag, key_id, wrapped)
+        return kek, key_id
+
+    def _get_or_create_v2_kek(self, project_id: ProjectId, digest: bytes) -> tuple[bytes, UUID]:
+        """Resolve a v2-only KEK row by opaque digest.
+
+        New v2 rows never use the raw-tag v1 persistence path. An already
+        retained v1 row is readable only as a compatibility bridge for a
+        mixed v1/v2 run archive: the legacy KEK is unwrapped with its legacy
+        AAD, while the v2 share still has its separate v2 AAD. This avoids a
+        duplicate digest identity while preserving the immutable v1 object.
+        """
+
+        if len(digest) != 32:
+            raise ValueError("v2 subject digest is invalid")
+        row = self._store.get_subject_key_by_digest(project_id, digest)
+        if row is not None:
+            if row.subject_digest is not None and row.subject_digest != digest:
+                raise KeyBindingMismatch("subject key binding mismatch")
+            if row.wrap_version == 1:
+                # E3 redacts the raw tag when it destroys a legacy key.  A
+                # retained row with the exact digest/key identity is already
+                # authoritative tombstone evidence; requiring the erased raw
+                # tag first would turn a valid privacy result into corruption.
+                if row.destroyed_at is not None:
+                    raise Tombstoned("subject key has been shredded")
+                if row.subject_tag is None or subject_digest(project_id, row.subject_tag) != digest:
+                    raise KeyBindingMismatch("subject key binding mismatch")
+                return self._unwrap_kek(
+                    row.wrapped_kek,
+                    project_id=project_id,
+                    subject_tag=row.subject_tag,
+                    key_id=row.key_id,
+                ), row.key_id
+            if row.wrap_version != 2 or row.subject_tag is not None:
+                raise KeyBindingMismatch("subject key binding mismatch")
+            if row.destroyed_at is not None:
+                raise Tombstoned("subject key has been shredded")
+            return self._unwrap_v2_or_legacy_kek(project_id, digest, row), row.key_id
+
+        kek = envelope.random_bytes(envelope.KEY_LEN)
+        key_id = uuid4()
+        nonce = envelope.random_bytes(envelope.NONCE_LEN)
+        wrapped = nonce + envelope.aesgcm_encrypt(
+            self._master.master_key(),
+            nonce,
+            kek,
+            envelope.build_v2_kek_aad(project_id, digest, key_id),
+        )
+        self._store.insert_subject_key_v2(project_id, digest, key_id, wrapped)
         return kek, key_id
 
     def _kek_wrap_aad(self, project_id: ProjectId, subject_tag: str, key_id: UUID) -> bytes:
@@ -308,7 +432,14 @@ class SubjectKeyManager:
         master = self._master.master_key()
         nonce, ct = wrapped[: envelope.NONCE_LEN], wrapped[envelope.NONCE_LEN :]
         aad = self._kek_wrap_aad(project_id, subject_tag, key_id)
-        return envelope.aesgcm_decrypt(master, nonce, ct, aad)
+        try:
+            return envelope.aesgcm_decrypt(master, nonce, ct, aad)
+        except InvalidTag:
+            # This layer authenticates the persisted KEK with the configured
+            # master key.  A wrong/rotated master is an operator dependency
+            # failure and is retried by archive intake; authenticated DEK
+            # share failures below remain deterministic archive corruption.
+            raise KeyMaterialUnavailable("subject key material is unavailable") from None
 
     # -- envelope encrypt/decrypt --------------------------------------------
 
@@ -375,6 +506,129 @@ class SubjectKeyManager:
         }
         return EncryptedPayload(header=header, sections=tuple(encoded_sections))
 
+    def encrypt_v2(
+        self, project_id: ProjectId, run_id: RunId, sections: Sequence[PlainSection]
+    ) -> EncryptedPayload:
+        """Build a strict ``tb-env/2`` object without enabling its runtime use.
+
+        This explicit method is the E1 writer primitive.  Production archive
+        composition continues to call :meth:`encrypt` until the owner-only
+        cutover/profile gate is activated; exposing a separate method avoids a
+        flag that could silently turn an old runtime into a v2 emitter.
+        """
+
+        if not sections or len(sections) > MAX_SECTIONS:
+            raise ValueError("v2 envelope section count is invalid")
+
+        encoded_sections: list[dict[str, object]] = []
+        first_seq: int | None = None
+        last_seq: int | None = None
+        previous_seq_to: int | None = None
+        for section_index, section in enumerate(sections):
+            if not 0 <= section.seq_from <= section.seq_to < _MAX_SEQ:
+                raise ValueError("v2 envelope section sequence range is invalid")
+            if previous_seq_to is not None and section.seq_from <= previous_seq_to:
+                raise ValueError("v2 envelope sections are not strictly ordered")
+            pairs = subject_digest_pairs(project_id, section.subject_tags)
+            declared_digests = tuple(digest for digest, _tag in pairs)
+            wrap_pairs = pairs or (
+                (subject_digest(project_id, PROJECT_SUBJECT_TAG), PROJECT_SUBJECT_TAG),
+            )
+            plaintext = self._v2_plaintext(section)
+            section_aad = envelope.build_v2_section_aad(
+                project_id,
+                run_id,
+                section_index,
+                section.seq_from,
+                section.seq_to,
+                declared_digests,
+            )
+            dek = envelope.random_bytes(envelope.KEY_LEN)
+            nonce = envelope.random_bytes(envelope.NONCE_LEN)
+            ciphertext = envelope.aesgcm_encrypt(dek, nonce, plaintext, section_aad)
+            shares = envelope.split_dek(dek, len(wrap_pairs))
+            wraps: list[dict[str, object]] = []
+            for wrap_index, ((digest, _tag), share) in enumerate(
+                zip(wrap_pairs, shares, strict=True)
+            ):
+                kek, key_id = self._get_or_create_v2_kek(project_id, digest)
+                wrap_nonce = envelope.random_bytes(envelope.NONCE_LEN)
+                share_aad = envelope.build_v2_share_aad(section_aad, wrap_index, digest, key_id)
+                encrypted_share = envelope.aesgcm_encrypt(kek, wrap_nonce, share, share_aad)
+                wraps.append(
+                    {
+                        "digest": envelope.b64e(digest),
+                        "key_id": str(key_id),
+                        "nonce": envelope.b64e(wrap_nonce),
+                        "share": envelope.b64e(encrypted_share),
+                    }
+                )
+            encoded_sections.append(
+                {
+                    "ct": envelope.b64e(ciphertext),
+                    "nonce": envelope.b64e(nonce),
+                    "section_index": section_index,
+                    "seq_from": section.seq_from,
+                    "seq_to": section.seq_to,
+                    "subject_digests": [envelope.b64e(digest) for digest in declared_digests],
+                    "wraps": wraps,
+                }
+            )
+            first_seq = section.seq_from if first_seq is None else min(first_seq, section.seq_from)
+            last_seq = section.seq_to if last_seq is None else max(last_seq, section.seq_to)
+            previous_seq_to = section.seq_to
+        assert first_seq is not None and last_seq is not None
+        return EncryptedPayload(
+            header={
+                "alg": envelope.ENVELOPE_ALG,
+                "first_seq": first_seq,
+                "fmt": envelope.V2_ENVELOPE_FMT,
+                "last_seq": last_seq,
+                "project_id": str(project_id),
+                "run_id": str(run_id),
+                "section_count": len(encoded_sections),
+                "split": envelope.V2_SPLIT,
+                "v": envelope.V2_ENVELOPE_VERSION,
+                "wrap_alg": envelope.V2_WRAP_ALG,
+            },
+            sections=tuple(encoded_sections),
+        )
+
+    @staticmethod
+    def _v2_plaintext(section: PlainSection) -> bytes:
+        """Validate the canonical event JSONL that v2 authenticates."""
+
+        if not section.lines:
+            raise ValueError("v2 envelope plaintext is empty")
+        checked: list[bytes] = []
+        first_sequence: int | None = None
+        previous_seq: int | None = None
+        for raw_line in section.lines:
+            try:
+                decoded = raw_line.decode("utf-8", "strict")
+                value = json.loads(decoded)
+            except (UnicodeDecodeError, ValueError):
+                raise ValueError("v2 envelope plaintext is invalid") from None
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"seq", "event"}
+                or isinstance(value.get("seq"), bool)
+                or not isinstance(value.get("seq"), int)
+                or canonical_json(value) != raw_line
+            ):
+                raise ValueError("v2 envelope plaintext is not canonical")
+            sequence = value["seq"]
+            if not section.seq_from <= sequence <= section.seq_to or (
+                previous_seq is not None and sequence <= previous_seq
+            ):
+                raise ValueError("v2 envelope plaintext sequence is invalid")
+            checked.append(raw_line)
+            first_sequence = sequence if first_sequence is None else first_sequence
+            previous_seq = sequence
+        if first_sequence != section.seq_from or previous_seq != section.seq_to:
+            raise ValueError("v2 envelope plaintext sequence is invalid")
+        return b"".join(line + b"\n" for line in checked)
+
     @staticmethod
     def _section_tags(section: PlainSection) -> tuple[str, ...]:
         """The tags a section's DEK is actually split across: its own, or the
@@ -387,9 +641,7 @@ class SubjectKeyManager:
         disguising which subjects a section belongs to.
         """
         if not 0 <= section.seq_from <= section.seq_to < _MAX_SEQ:
-            raise ValueError(
-                f"PlainSection: bad seq range [{section.seq_from}, {section.seq_to}]"
-            )
+            raise ValueError(f"PlainSection: bad seq range [{section.seq_from}, {section.seq_to}]")
         for line in section.lines:
             if b"\n" in line:
                 # Sections are JSONL; an embedded newline would come back as
@@ -409,9 +661,9 @@ class SubjectKeyManager:
     def decrypt(
         self, project_id: ProjectId, payload: EncryptedPayload
     ) -> list[PlainSection | TombstonedSection]:
-        """Returns a `TombstonedSection` sentinel — never an exception — for
-        any section whose referenced subject KEK is missing or destroyed, and
-        keeps decrypting the rest of the payload (crypto-shred test's core
+        """Returns a `TombstonedSection` sentinel only for a section whose
+        retained subject-key row explicitly records destruction, and keeps
+        decrypting the rest of the payload (crypto-shred test's core
         assertion: one shredded subject must not blind the whole trace).
 
         Raises `NotFound` when the payload belongs to another project
@@ -421,6 +673,11 @@ class SubjectKeyManager:
         about erasure and must never be produced by a parse failure.
         """
         header = payload.header
+        if (
+            header.get("fmt") == envelope.V2_ENVELOPE_FMT
+            and header.get("v") == envelope.V2_ENVELOPE_VERSION
+        ):
+            return self._decrypt_v2(project_id, payload)
         header_project = _as_str(header.get("project_id"), "header.project_id")
         if header_project != str(project_id):
             # The trace store's key check (stores/tracestore/base.py) is the
@@ -436,6 +693,164 @@ class SubjectKeyManager:
         for raw_section in payload.sections:
             results.append(self._decrypt_section(project_id, run_id, raw_section))
         return results
+
+    def _decrypt_v2(
+        self, project_id: ProjectId, payload: EncryptedPayload
+    ) -> list[PlainSection | TombstonedSection]:
+        """Decrypt a fully structural-validated v2 object by opaque digest.
+
+        ``EncryptedPayload.from_bytes`` has already validated its exact JSON
+        framing, wire types, order, and field sizes.  This method still binds
+        every referenced key row before returning a privacy result: malformed
+        or swapped bindings must never be mistaken for an erasure.
+        """
+
+        header = payload.header
+        if _as_str(header.get("project_id"), "header.project_id") != str(project_id):
+            raise NotFound("trace payload not found")
+        run_id = RunId(_as_str(header.get("run_id"), "header.run_id"))
+        results: list[PlainSection | TombstonedSection] = []
+        for raw_section in payload.sections:
+            seq_from = _as_int(raw_section.get("seq_from"), "section.seq_from")
+            seq_to = _as_int(raw_section.get("seq_to"), "section.seq_to")
+            section_index = _as_int(raw_section.get("section_index"), "section.section_index")
+            digests = tuple(
+                envelope.b64d_canonical(value)
+                for value in _as_list(raw_section.get("subject_digests"), "section.subject_digests")
+            )
+            section_aad = envelope.build_v2_section_aad(
+                project_id, run_id, section_index, seq_from, seq_to, digests
+            )
+            wraps = _as_list(raw_section.get("wraps"), "section.wraps")
+            bindings: list[tuple[Mapping[str, Any], bytes, UUID, SubjectKeyRow]] = []
+            for raw_wrap in wraps:
+                wrap = _as_wrap(raw_wrap)
+                digest = envelope.b64d_canonical(wrap.get("digest"))
+                try:
+                    key_id = UUID(_as_str(wrap.get("key_id"), "wrap.key_id"))
+                except ValueError:
+                    raise ValueError("v2 envelope key id is invalid") from None
+                row = self._store.get_subject_key_by_digest(project_id, digest)
+                if row is None or row.key_id != key_id:
+                    raise KeyBindingMismatch("subject key binding mismatch")
+                if row.subject_digest is not None and row.subject_digest != digest:
+                    raise KeyBindingMismatch("subject key binding mismatch")
+                if row.subject_digest is None and (
+                    row.subject_tag is None or subject_digest(project_id, row.subject_tag) != digest
+                ):
+                    raise KeyBindingMismatch("subject key binding mismatch")
+                bindings.append((wrap, digest, key_id, row))
+            destroyed = False
+            shares: list[bytes] = []
+            for wrap_index, (wrap, digest, key_id, row) in enumerate(bindings):
+                if row.destroyed_at is not None:
+                    destroyed = True
+                    continue
+                # All readable shares authenticate before a separate
+                # tombstone can become the privacy result. A live malformed
+                # share is archive corruption, not evidence of erasure.
+                kek = self._unwrap_v2_or_legacy_kek(project_id, digest, row)
+                nonce = envelope.b64d_canonical(wrap.get("nonce"))
+                share = envelope.b64d_canonical(wrap.get("share"))
+                share_aad = envelope.build_v2_share_aad(section_aad, wrap_index, digest, key_id)
+                try:
+                    shares.append(envelope.aesgcm_decrypt(kek, nonce, share, share_aad))
+                except InvalidTag:
+                    raise KeyBindingMismatch("v2 wrapped share authentication failed") from None
+            if destroyed:
+                results.append(
+                    TombstonedSection(
+                        seq_from=seq_from,
+                        seq_to=seq_to,
+                        subject_tags=(),
+                        subject_digests=digests,
+                        envelope_version=envelope.V2_ENVELOPE_VERSION,
+                    )
+                )
+                continue
+            dek = envelope.combine_shares(shares)
+            nonce = envelope.b64d_canonical(raw_section.get("nonce"))
+            ciphertext = envelope.b64d_canonical(raw_section.get("ct"))
+            try:
+                plaintext = envelope.aesgcm_decrypt(dek, nonce, ciphertext, section_aad)
+            except InvalidTag:
+                raise ValueError("v2 envelope ciphertext authentication failed") from None
+            lines = self._v2_decrypt_plaintext(plaintext, seq_from, seq_to)
+            results.append(
+                PlainSection(
+                    seq_from=seq_from,
+                    seq_to=seq_to,
+                    subject_tags=(),
+                    lines=lines,
+                    subject_digests=digests,
+                    envelope_version=envelope.V2_ENVELOPE_VERSION,
+                )
+            )
+        return results
+
+    def _unwrap_v2_or_legacy_kek(
+        self, project_id: ProjectId, digest: bytes, row: SubjectKeyRow
+    ) -> bytes:
+        if row.wrap_version == 1:
+            if row.subject_tag is None:
+                raise KeyBindingMismatch("subject key binding mismatch")
+            return self._unwrap_kek(
+                row.wrapped_kek,
+                project_id=project_id,
+                subject_tag=row.subject_tag,
+                key_id=row.key_id,
+            )
+        if (
+            row.wrap_version != 2
+            or len(row.wrapped_kek) != envelope.NONCE_LEN + envelope.KEY_LEN + 16
+        ):
+            raise KeyBindingMismatch("subject key binding mismatch")
+        try:
+            return envelope.aesgcm_decrypt(
+                self._master.master_key(),
+                row.wrapped_kek[: envelope.NONCE_LEN],
+                row.wrapped_kek[envelope.NONCE_LEN :],
+                envelope.build_v2_kek_aad(project_id, digest, row.key_id),
+            )
+        except InvalidTag:
+            # As above, only the master-wrapped KEK maps to the retryable
+            # key-material condition.  The caller maps share authentication
+            # failures to KeyBindingMismatch/DEAD.
+            raise KeyMaterialUnavailable("subject key material is unavailable") from None
+
+    @staticmethod
+    def _v2_decrypt_plaintext(plaintext: bytes, seq_from: int, seq_to: int) -> tuple[bytes, ...]:
+        if not plaintext.endswith(b"\n"):
+            raise ValueError("v2 envelope plaintext is invalid")
+        lines = tuple(plaintext[:-1].split(b"\n"))
+        if not lines or any(not line for line in lines):
+            raise ValueError("v2 envelope plaintext is invalid")
+        previous: int | None = None
+        for line in lines:
+            try:
+                value = json.loads(line.decode("utf-8", "strict"))
+            except (UnicodeDecodeError, ValueError):
+                raise ValueError("v2 envelope plaintext is invalid") from None
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"seq", "event"}
+                or isinstance(value.get("seq"), bool)
+                or not isinstance(value.get("seq"), int)
+                or canonical_json(value) != line
+            ):
+                raise ValueError("v2 envelope plaintext is not canonical")
+            sequence = value["seq"]
+            if not seq_from <= sequence <= seq_to or (
+                previous is not None and sequence <= previous
+            ):
+                raise ValueError("v2 envelope plaintext sequence is invalid")
+            previous = sequence
+        if previous != seq_to:
+            raise ValueError("v2 envelope plaintext sequence is invalid")
+        first = json.loads(lines[0].decode("utf-8"))
+        if first["seq"] != seq_from:
+            raise ValueError("v2 envelope plaintext sequence is invalid")
+        return lines
 
     def _decrypt_section(
         self, project_id: ProjectId, run_id: RunId, raw_section: Mapping[str, object]
@@ -466,7 +881,10 @@ class SubjectKeyManager:
                 f"envelope: section.subject_tags {expected!r} does not match wraps {wrap_tags!r}"
             )
 
-        shares: list[bytes] = []
+        # Bind *every* archived wrap before deciding that a destroyed key is
+        # an erasure result.  Returning on the first destroyed row would let
+        # wrap order hide a later missing or mismatched key binding.
+        bound_wraps: list[tuple[Mapping[str, Any], str, UUID, SubjectKeyRow]] = []
         for raw_wrap in raw_wraps:
             wrap = _as_wrap(raw_wrap)
             tag = _as_str(wrap.get("tag"), "wrap.tag")
@@ -475,16 +893,53 @@ class SubjectKeyManager:
             except ValueError as exc:
                 raise ValueError("envelope: wrap.key_id is not a UUID") from exc
             row = self._store.get_subject_key(project_id, tag)
-            if row is None or row.destroyed_at is not None or row.key_id != key_id:
-                # Absent, destroyed, or rotated to a different key_id — the
-                # share is unrecoverable, so the whole section is (C-13).
-                return TombstonedSection(seq_from=seq_from, seq_to=seq_to, subject_tags=tags)
+            if row is None:
+                # A redacted E3 legacy tombstone no longer has a raw-tag
+                # lookup key.  Resolve its immutable digest identity only to
+                # recognize the same archived key as tombstoned; every live
+                # binding still requires its raw tag below.
+                row = self._store.get_subject_key_by_digest(
+                    project_id, subject_digest(project_id, tag)
+                )
+            if row is None:
+                # A missing row is not erasure evidence.  E3 retains and
+                # marks the immutable key row, so an absent row means an
+                # archive/key-store binding has been corrupted.
+                raise KeyBindingMismatch("subject key binding mismatch")
+            if row.key_id != key_id:
+                # A tombstone is evidence about one retained key identity,
+                # not every arbitrary wrap naming the same subject tag. A
+                # re-provisioned/mutated row or altered wrap is deterministic
+                # archive corruption even when the retained row was later
+                # destroyed.
+                raise KeyBindingMismatch("subject key binding mismatch")
+            if row.destroyed_at is not None:
+                bound_wraps.append((wrap, tag, key_id, row))
+                continue
+            if row.subject_tag != tag:
+                raise KeyBindingMismatch("subject key binding mismatch")
+            bound_wraps.append((wrap, tag, key_id, row))
+
+        destroyed = False
+        shares: list[bytes] = []
+        for wrap, tag, key_id, row in bound_wraps:
+            if row.destroyed_at is not None:
+                destroyed = True
+                continue
             kek = self._unwrap_kek(
                 row.wrapped_kek, project_id=project_id, subject_tag=tag, key_id=row.key_id
             )
             wrap_nonce = _as_b64(wrap.get("nonce"), "wrap.nonce")
             share_ct = _as_b64(wrap.get("share"), "wrap.share")
-            shares.append(envelope.aesgcm_decrypt(kek, wrap_nonce, share_ct, key_id.bytes))
+            try:
+                shares.append(envelope.aesgcm_decrypt(kek, wrap_nonce, share_ct, key_id.bytes))
+            except InvalidTag:
+                raise KeyBindingMismatch("wrapped share authentication failed") from None
+
+        if destroyed:
+            # Every live share above has authenticated. A destroyed retained
+            # key is now the durable privacy result for the whole section.
+            return TombstonedSection(seq_from=seq_from, seq_to=seq_to, subject_tags=tags)
 
         dek = envelope.combine_shares(shares)
         if len(dek) != envelope.KEY_LEN:
@@ -493,5 +948,12 @@ class SubjectKeyManager:
         ct = _as_b64(raw_section.get("ct"), "section.ct")
         aad = envelope.build_aad(project_id, run_id, seq_from, seq_to)
         plaintext = envelope.aesgcm_decrypt(dek, nonce, ct, aad)
-        lines = tuple(line for line in plaintext.split(b"\n") if line)
+        # Writer serialization is one nonblank JSON object per line followed
+        # by exactly one newline.  Do not silently discard an interior blank
+        # line: a strict archive reader must be able to distinguish malformed
+        # ciphertext plaintext from a canonical sparse sequence.
+        raw_lines = plaintext.split(b"\n")
+        if raw_lines[-1] != b"" or not raw_lines[:-1] or any(not line for line in raw_lines[:-1]):
+            raise ValueError("envelope: plaintext must be nonblank canonical JSONL")
+        lines = tuple(raw_lines[:-1])
         return PlainSection(seq_from=seq_from, seq_to=seq_to, subject_tags=tags, lines=lines)

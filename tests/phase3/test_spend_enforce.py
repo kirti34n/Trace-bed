@@ -269,7 +269,7 @@ class _Outcome:
 
 class _Retriever:
     def retrieve(
-        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig
+        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig, deadline: object
     ) -> _Outcome:
         return _Outcome()
 
@@ -285,6 +285,7 @@ class _Assembly:
         query_text: str,
         candidates: Sequence[FusedCandidate],
         cfg: EffectiveConfig,
+        deadline: object,
     ) -> CandidateSetResult:
         return CandidateSetResult(
             outcome_code=OutcomeCode.INJECTED,

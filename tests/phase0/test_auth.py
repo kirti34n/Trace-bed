@@ -35,12 +35,14 @@ from tracebed.adapters.identity import (
     OidcJwksVerifier,
     Principal,
     PrincipalRecord,
+    _bounded_sync_body,
 )
 from tracebed.api.deps import require_admin_key
 from tracebed.api.main import _RepoPrincipalLookup
 from tracebed.domain.canonical import sha256_hex
 from tracebed.domain.clock import FakeClock
-from tracebed.domain.errors import AuthenticationFailed
+from tracebed.domain.deadline import RemainingBudget
+from tracebed.domain.errors import AuthenticationFailed, RequestDeadlineExceeded
 from tracebed.domain.ids import PrincipalId
 from tracebed.stores.pg.rows import PrincipalRow
 
@@ -48,6 +50,14 @@ if TYPE_CHECKING:
     from tracebed.adapters.identity import PrincipalKind
 
 pytestmark = pytest.mark.phase0
+
+
+@dataclass
+class _Budget:
+    remaining: float
+
+    def remaining_ms(self) -> float:
+        return self.remaining
 
 
 # --------------------------------------------------------------------------- #
@@ -61,13 +71,19 @@ class FakePrincipalLookup:
 
     def __init__(self) -> None:
         self._by_key: dict[tuple[str, str], PrincipalRecord] = {}
+        self.deadlines: list[RemainingBudget | None] = []
 
     def put(self, kind: PrincipalKind, external_ref: str, record: PrincipalRecord) -> None:
         self._by_key[(kind, external_ref)] = record
 
     def get_principal_by_external_ref(
-        self, kind: PrincipalKind, external_ref: str
+        self,
+        kind: PrincipalKind,
+        external_ref: str,
+        *,
+        deadline: RemainingBudget | None = None,
     ) -> PrincipalRecord | None:
+        self.deadlines.append(deadline)
         return self._by_key.get((kind, external_ref))
 
 
@@ -117,6 +133,19 @@ class TestApiKeyVerifier:
         assert principal == Principal(
             principal_id=record.principal_id, kind="api_key", external_ref=record.external_ref
         )
+
+    def test_request_budget_reaches_api_key_lookup_without_changing_legacy_calls(self) -> None:
+        lookup = FakePrincipalLookup()
+        secret = "s3cret-value-of-sufficient-length"
+        record = _api_key_record(key_hash=sha256_hex(secret.encode("utf-8")))
+        lookup.put("api_key", record.external_ref, record)
+        budget = _Budget(100.0)
+
+        ApiKeyVerifier(lookup).authenticate(
+            authorization=None, api_key=f"tb_sk_{record.external_ref}.{secret}", deadline=budget
+        )
+
+        assert lookup.deadlines == [budget]
 
     def test_wrong_secret_is_401_same_message_as_unknown_key(self) -> None:
         lookup = FakePrincipalLookup()
@@ -222,9 +251,19 @@ def _sign_token(
     issuer: str = _ISSUER,
     audience: str = _AUDIENCE,
     expires_in: timedelta | None = timedelta(minutes=5),
+    token_type: str | None = None,
+    nonce: str | None = None,
 ) -> str:
     now = datetime.now(UTC)
-    claims: dict[str, object] = {"sub": sub, "iss": issuer, "aud": audience, "iat": now}
+    claims: dict[str, object] = {
+        "sub": sub,
+        "iss": issuer,
+        "aud": audience,
+        "iat": now,
+        "typ": token_type or "Bearer",
+    }
+    if nonce is not None:
+        claims["nonce"] = nonce
     if expires_in is not None:
         claims["exp"] = now + expires_in
     return jwt.encode(
@@ -302,6 +341,257 @@ class TestOidcJwksVerifier:
         assert principal == Principal(
             principal_id=record.principal_id, kind="oidc_sub", external_ref="user-42"
         )
+
+    def test_request_budget_reaches_oidc_jwks_and_principal_lookup(self) -> None:
+        pem, jwk = _generate_rsa_jwk("kid-1")
+        token = _sign_token(pem, kid="kid-1")
+        lookup = _known_sub_lookup()
+        observed_timeouts: list[dict[str, float | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            observed_timeouts.append(cast(dict[str, float | None], request.extensions["timeout"]))
+            return httpx.Response(200, json={"keys": [jwk]})
+
+        configured = httpx.Timeout(connect=0.05, read=0.5, write=0.1, pool=0.25)
+        client = httpx.Client(timeout=configured, transport=httpx.MockTransport(handler))
+        before = (
+            client.timeout.connect,
+            client.timeout.read,
+            client.timeout.write,
+            client.timeout.pool,
+        )
+        budget = _Budget(125.0)
+        verifier = OidcJwksVerifier(
+            _JWKS_URL,
+            _ISSUER,
+            audience=_AUDIENCE,
+            http=client,
+            principals=lookup,
+        )
+
+        verifier.authenticate(authorization=f"Bearer {token}", api_key=None, deadline=budget)
+
+        assert lookup.deadlines == [budget]
+        assert observed_timeouts == [{"connect": 0.05, "read": 0.125, "write": 0.1, "pool": 0.125}]
+        assert (
+            client.timeout.connect,
+            client.timeout.read,
+            client.timeout.write,
+            client.timeout.pool,
+        ) == before
+
+    def test_no_budget_jwks_fetch_preserves_each_configured_client_timeout_phase(self) -> None:
+        pem, jwk = _generate_rsa_jwk("kid-1")
+        token = _sign_token(pem, kid="kid-1")
+        lookup = _known_sub_lookup()
+        observed_timeouts: list[dict[str, float | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            observed_timeouts.append(cast(dict[str, float | None], request.extensions["timeout"]))
+            return httpx.Response(200, json={"keys": [jwk]})
+
+        client = httpx.Client(
+            timeout=httpx.Timeout(connect=0.11, read=0.22, write=0.33, pool=0.44),
+            transport=httpx.MockTransport(handler),
+        )
+        before = (
+            client.timeout.connect,
+            client.timeout.read,
+            client.timeout.write,
+            client.timeout.pool,
+        )
+        verifier = OidcJwksVerifier(
+            _JWKS_URL, _ISSUER, audience=_AUDIENCE, http=client, principals=lookup
+        )
+
+        verifier.authenticate(authorization=f"Bearer {token}", api_key=None)
+
+        assert observed_timeouts == [{"connect": 0.11, "read": 0.22, "write": 0.33, "pool": 0.44}]
+        assert (
+            client.timeout.connect,
+            client.timeout.read,
+            client.timeout.write,
+            client.timeout.pool,
+        ) == before
+
+    def test_expired_budget_stops_jwks_fetch_before_transport_or_lookup(self) -> None:
+        pem, jwk = _generate_rsa_jwk("kid-1")
+        token = _sign_token(pem, kid="kid-1")
+        lookup = _known_sub_lookup()
+        calls: list[object] = []
+        verifier = OidcJwksVerifier(
+            _JWKS_URL,
+            _ISSUER,
+            audience=_AUDIENCE,
+            http=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: (
+                        calls.append(request) or httpx.Response(200, json={"keys": [jwk]})
+                    )
+                )
+            ),
+            principals=lookup,
+        )
+
+        with pytest.raises(RequestDeadlineExceeded):
+            verifier.authenticate(
+                authorization=f"Bearer {token}", api_key=None, deadline=_Budget(0.0)
+            )
+
+        assert calls == []
+        assert lookup.deadlines == []
+
+    def test_refresh_lock_timeout_never_releases_an_unowned_lock_or_fetches(self) -> None:
+        class Lock:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+                self.releases = 0
+
+            def acquire(self, *, timeout: float) -> bool:
+                self.timeouts.append(timeout)
+                return False
+
+            def release(self) -> None:
+                self.releases += 1
+
+        calls: list[object] = []
+        verifier = OidcJwksVerifier(
+            _JWKS_URL,
+            _ISSUER,
+            audience=_AUDIENCE,
+            http=httpx.Client(
+                transport=httpx.MockTransport(
+                    lambda request: calls.append(request) or httpx.Response(200, json={"keys": []})
+                )
+            ),
+            principals=FakePrincipalLookup(),
+        )
+        lock = Lock()
+        verifier._refresh_lock = lock  # type: ignore[assignment]
+
+        with pytest.raises(RequestDeadlineExceeded):
+            verifier._refresh_jwks(deadline=_Budget(123.0))
+
+        assert lock.timeouts == [0.123]
+        assert lock.releases == 0
+        assert calls == []
+
+    @pytest.mark.parametrize("mode", ["success", "http_error", "expired"])
+    def test_acquired_refresh_lock_releases_on_every_exit(self, mode: str) -> None:
+        class Lock:
+            def __init__(self) -> None:
+                self.timeouts: list[float] = []
+                self.releases = 0
+
+            def acquire(self, *, timeout: float) -> bool:
+                self.timeouts.append(timeout)
+                if mode == "expired":
+                    budget.remaining = 0.0
+                return True
+
+            def release(self) -> None:
+                self.releases += 1
+
+        budget = _Budget(123.0)
+        _pem, jwk = _generate_rsa_jwk("kid-1")
+        calls: list[object] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            if mode == "http_error":
+                raise httpx.ReadTimeout("idp stalled", request=request)
+            return httpx.Response(200, json={"keys": [jwk]})
+
+        verifier = OidcJwksVerifier(
+            _JWKS_URL,
+            _ISSUER,
+            audience=_AUDIENCE,
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+            principals=FakePrincipalLookup(),
+        )
+        lock = Lock()
+        verifier._refresh_lock = lock  # type: ignore[assignment]
+
+        if mode == "success":
+            assert verifier._refresh_jwks(deadline=budget) is True
+        elif mode == "http_error":
+            with pytest.raises(AuthenticationFailed):
+                verifier._refresh_jwks(deadline=budget)
+        else:
+            with pytest.raises(RequestDeadlineExceeded):
+                verifier._refresh_jwks(deadline=budget)
+
+        assert lock.timeouts == [0.123]
+        assert lock.releases == 1
+        assert len(calls) == (0 if mode == "expired" else 1)
+
+    @pytest.mark.parametrize("expired", [False, True])
+    def test_http_read_timeout_is_deadline_only_after_budget_expiry(self, expired: bool) -> None:
+        pem, _jwk = _generate_rsa_jwk("kid-1")
+        token = _sign_token(pem, kid="kid-1")
+        budget = _Budget(100.0)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if expired:
+                budget.remaining = 0.0
+            raise httpx.ReadTimeout("idp stalled", request=request)
+
+        verifier = OidcJwksVerifier(
+            _JWKS_URL,
+            _ISSUER,
+            audience=_AUDIENCE,
+            http=httpx.Client(transport=httpx.MockTransport(handler)),
+            principals=_known_sub_lookup(),
+        )
+
+        expected = RequestDeadlineExceeded if expired else AuthenticationFailed
+        with pytest.raises(expected) as raised:
+            verifier.authenticate(authorization=f"Bearer {token}", api_key=None, deadline=budget)
+        assert isinstance(raised.value.__cause__, httpx.ReadTimeout)
+
+    def test_expiry_before_the_next_jwks_body_chunk_stops_iteration(self) -> None:
+        budget = _Budget(10.0)
+        advances = 0
+
+        class Chunks(httpx.SyncByteStream):
+            def __iter__(self) -> object:
+                nonlocal advances
+                advances += 1
+                yield b"{"
+                budget.remaining = 0.0
+                advances += 1
+                yield b"}"
+                advances += 1
+                yield b"ignored"
+
+            def close(self) -> None:
+                return None
+
+        with pytest.raises(RequestDeadlineExceeded):
+            _bounded_sync_body(httpx.Response(200, stream=Chunks()), 10, deadline=budget)
+        assert advances == 2
+
+    def test_access_and_id_tokens_are_not_interchangeable(self) -> None:
+        pem, jwk = _generate_rsa_jwk("kid-1")
+        verifier = OidcJwksVerifier(
+            _JWKS_URL,
+            _ISSUER,
+            audience=_AUDIENCE,
+            http=_mock_jwks_client({_JWKS_URL: {"keys": [jwk]}}),
+            principals=_known_sub_lookup(),
+        )
+        access = _sign_token(pem, kid="kid-1", token_type="Bearer")
+        identity = _sign_token(pem, kid="kid-1", token_type="ID", nonce="browser-nonce")
+
+        assert (
+            verifier.authenticate(authorization=f"Bearer {access}", api_key=None).external_ref
+            == "user-42"
+        )
+        assert verifier.verify_id_token(identity, nonce="browser-nonce")["sub"] == "user-42"
+        with pytest.raises(AuthenticationFailed):
+            verifier.authenticate(authorization=f"Bearer {identity}", api_key=None)
+        with pytest.raises(AuthenticationFailed):
+            verifier.verify_id_token(access, nonce="browser-nonce")
 
     def test_unknown_sub_is_401(self) -> None:
         pem, jwk = _generate_rsa_jwk("kid-1")
@@ -497,10 +787,12 @@ class TestOidcJwksVerifier:
                 )
         assert len(fetches) == 1
 
-    def test_kidless_token_verifies_against_every_advertised_key(self) -> None:
-        """During a rotation the IdP advertises two keys. A `kid`-less token
-        signed by either must verify; picking one arbitrary key out of the set
-        would reject perfectly valid tokens depending on JWKS ordering."""
+    def test_kidless_token_is_rejected_without_signature_work_amplification(self) -> None:
+        """Strict issuer policy requires one valid `kid` per token.
+
+        Trying every advertised key would make the attacker's malformed token
+        choose verification work and leave an ambiguous key-selection policy.
+        """
         _pem_old, jwk_old = _generate_rsa_jwk("kid-old")
         pem_new, jwk_new = _generate_rsa_jwk("kid-new")
         token = _sign_token(pem_new, kid=None)  # signed by the SECOND key
@@ -513,9 +805,8 @@ class TestOidcJwksVerifier:
             principals=_known_sub_lookup(),
             clock=FakeClock(datetime(2026, 1, 1, tzinfo=UTC)),
         )
-        assert verifier.authenticate(
-            authorization=f"Bearer {token}", api_key=None
-        ).external_ref == "user-42"
+        with pytest.raises(AuthenticationFailed):
+            verifier.authenticate(authorization=f"Bearer {token}", api_key=None)
 
     def test_kidless_token_signed_by_a_stranger_is_still_401(self) -> None:
         """Trying every advertised key must not become "accept anything": a
@@ -533,6 +824,51 @@ class TestOidcJwksVerifier:
         )
         with pytest.raises(AuthenticationFailed):
             verifier.authenticate(authorization=f"Bearer {token}", api_key=None)
+
+    @pytest.mark.parametrize(
+        "jwks",
+        [
+            # Duplicate key identifiers make key selection issuer-ambiguous.
+            lambda jwk: {"keys": [jwk, dict(jwk)]},
+            # A verification key cannot be advertised for encryption.
+            lambda jwk: {"keys": [{**jwk, "use": "enc"}]},
+            # Bound key count before any expensive JWK conversion.
+            lambda jwk: {"keys": [{**jwk, "kid": f"key-{index}"} for index in range(17)]},
+        ],
+    )
+    def test_malformed_or_ambiguous_jwks_is_rejected_before_key_selection(self, jwks: Any) -> None:
+        pem, jwk = _generate_rsa_jwk("kid-1")
+        token = _sign_token(pem, kid="kid-1")
+        verifier = OidcJwksVerifier(
+            _JWKS_URL,
+            _ISSUER,
+            audience=_AUDIENCE,
+            http=_mock_jwks_client({_JWKS_URL: jwks(jwk)}),
+            principals=_known_sub_lookup(),
+        )
+        with pytest.raises(AuthenticationFailed):
+            verifier.authenticate(authorization=f"Bearer {token}", api_key=None)
+
+    @pytest.mark.parametrize(
+        "jwks_url,issuer,audience",
+        [
+            ("http://idp.example.test/jwks", _ISSUER, _AUDIENCE),
+            (_JWKS_URL, "https://user@idp.example.test/", _AUDIENCE),
+            (_JWKS_URL, _ISSUER, ""),
+            (_JWKS_URL, _ISSUER, None),
+        ],
+    )
+    def test_uncontrolled_or_incomplete_verifier_configuration_fails_at_startup(
+        self, jwks_url: str, issuer: str, audience: str | None
+    ) -> None:
+        with pytest.raises(ValueError):
+            OidcJwksVerifier(
+                jwks_url,
+                issuer,
+                audience=audience,
+                http=_mock_jwks_client({}),
+                principals=FakePrincipalLookup(),
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -575,9 +911,7 @@ class TestChainVerifier:
         secret = "chain-verifier-secret"
         record = _api_key_record(key_hash=sha256_hex(secret.encode("utf-8")))
         lookup.put("api_key", record.external_ref, record)
-        chain = ChainVerifier(
-            oidc=None, api_key=ApiKeyVerifier(lookup), api_key_mode=True
-        )
+        chain = ChainVerifier(oidc=None, api_key=ApiKeyVerifier(lookup), api_key_mode=True)
 
         principal = chain.authenticate(
             authorization=None, api_key=f"tb_sk_{record.external_ref}.{secret}"
@@ -589,9 +923,7 @@ class TestChainVerifier:
         secret = "chain-verifier-secret"
         record = _api_key_record(key_hash=sha256_hex(secret.encode("utf-8")))
         lookup.put("api_key", record.external_ref, record)
-        chain = ChainVerifier(
-            oidc=None, api_key=ApiKeyVerifier(lookup), api_key_mode=False
-        )
+        chain = ChainVerifier(oidc=None, api_key=ApiKeyVerifier(lookup), api_key_mode=False)
 
         with pytest.raises(AuthenticationFailed):
             chain.authenticate(authorization=None, api_key=f"tb_sk_{record.external_ref}.{secret}")
@@ -699,14 +1031,20 @@ class _FakeRepo:
 
     row: PrincipalRow | None
     seen_kind: str | None = None
+    seen_deadline: RemainingBudget | None = None
     """What the adapter actually passed, so `test_kind_is_pushed_into_the_query`
     can prove the filter is the query's, not a post-hoc comparison."""
 
     def get_principal_by_external_ref(
-        self, external_ref: str, *, kind: str | None = None
+        self,
+        external_ref: str,
+        *,
+        kind: str | None = None,
+        deadline: RemainingBudget | None = None,
     ) -> PrincipalRow | None:
         del external_ref
         self.seen_kind = kind
+        self.seen_deadline = deadline
         if self.row is not None and kind is not None and self.row.kind != kind:
             # A real Postgres UNIQUE(kind, external_ref) lookup returns nothing
             # for the wrong kind; the fake must not be more permissive than the
@@ -779,3 +1117,12 @@ class TestRepoPrincipalLookup:
         lookup.get_principal_by_external_ref("oidc_sub", "ambiguous-ref")
 
         assert repo.seen_kind == "oidc_sub"
+
+    def test_request_budget_is_forwarded_to_the_concrete_repo_adapter(self) -> None:
+        repo = _FakeRepo(_principal_row(kind="api_key"))
+        lookup = _RepoPrincipalLookup(cast(Any, repo))
+        budget = _Budget(100.0)
+
+        lookup.get_principal_by_external_ref("api_key", "ambiguous-ref", deadline=budget)
+
+        assert repo.seen_deadline is budget

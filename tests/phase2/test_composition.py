@@ -10,6 +10,7 @@ test of a different configuration, which is why the check lives in the code and 
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Sequence
 from datetime import timedelta
 from types import MappingProxyType
@@ -26,6 +27,7 @@ from tracebed.workers import composition
 from tracebed.workers.composition import (
     NON_PERIODIC_WORKERS,
     UNSCHEDULED_WORKERS,
+    build_trace_learning_runner,
     discover_worker_modules,
     validate_worker_coverage,
 )
@@ -107,6 +109,41 @@ def test_a_placeholder_reason_in_the_non_periodic_table_is_refused_too() -> None
 def test_the_shipped_classification_covers_every_worker_module() -> None:
     """The check that fires when somebody adds a worker and forgets to decide about it."""
     validate_worker_coverage({"embedder", "corroboration", "gc", "sweeps", "prefix_builder"})
+    assert "trace_learning" in NON_PERIODIC_WORKERS
+    assert "drain" in NON_PERIODIC_WORKERS
+    assert "Compose" in NON_PERIODIC_WORKERS["drain"]
+
+
+def test_trace_learning_is_pull_driven_and_factory_uses_one_job_store() -> None:
+    """The pull loop is not accidentally presented as an ingest-side or periodic lane."""
+
+    assert "strict archive" in NON_PERIODIC_WORKERS["tier_a_lane"]
+    assert "directly supervised" in NON_PERIODIC_WORKERS["trace_learning_coordinator"]
+
+    class _Repo:
+        def list_project_ids(self) -> list[ProjectId]:
+            return []
+
+    lane_factory = lambda cfg, clock: object()  # noqa: E731 - explicit construction seam
+    runner = build_trace_learning_runner(
+        pool=object(),  # type: ignore[arg-type]
+        repo=_Repo(),  # type: ignore[arg-type]
+        tracestore=object(),  # type: ignore[arg-type]
+        keys=object(),  # type: ignore[arg-type]
+        config_resolver=_Resolver(),  # type: ignore[arg-type]
+        clock=FakeClock(),
+        lease_seconds=17,
+        poll_interval=timedelta(seconds=3),
+        owner="trace-learning:test-owner",
+        lane_factory=lane_factory,  # type: ignore[arg-type]
+    )
+
+    assert runner.list_project_ids.__self__.__class__ is _Repo
+    assert runner.poll_interval == timedelta(seconds=3)
+    assert runner.coordinator.owner == "trace-learning:test-owner"
+    assert runner.coordinator.lane_factory is lane_factory
+    assert runner.coordinator.jobs._max_claim_limit == 1  # type: ignore[attr-defined]
+    assert runner.coordinator.jobs._lease_seconds == 17  # type: ignore[attr-defined]
 
 
 def test_discovery_walks_the_package_rather_than_a_hand_written_list() -> None:
@@ -115,6 +152,12 @@ def test_discovery_walks_the_package_rather_than_a_hand_written_list() -> None:
     found = discover_worker_modules()
     assert {"embedder", "corroboration", "gc", "scorer", "killswitch"} <= found
     assert "not_a_worker_module" not in found
+
+
+def test_every_discovered_worker_module_imports_without_removed_legacy_ports() -> None:
+    """Discovery alone is not a boot proof: import every real worker module."""
+    for name in discover_worker_modules():
+        importlib.import_module(f"tracebed.workers.{name}")
 
 
 def test_both_reason_tables_are_read_only() -> None:

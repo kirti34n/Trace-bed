@@ -1,49 +1,58 @@
 # Tracebed dashboard
 
 React 18 + Vite + TypeScript (strict) + Tailwind, served on `:8111`.
-The operator console for Tracebed: PLAN.md §3 (stack), §5–§7 (what each view
-is for).
+
+> **Same-origin BFF session surface.** The browser sends only same-origin requests with
+> `credentials: "same-origin"`. Browser JavaScript never handles a bearer token, API key, or
+> session identifier. The browser does hold and automatically sends the opaque HttpOnly cookie;
+> JavaScript cannot read it. `GET /auth/session` exposes session state and an in-memory
+> synchronizer token; `GET /auth/login` starts navigation; `POST /auth/logout` requires
+> `X-CSRF-Token`. The server and edge remain the authorization boundary.
+>
+> **No validated erasure workflow.** This UI cannot establish deletion or right-to-erasure
+> across data stores, derived records, exports, logs, or backups. Do not make erasure,
+> retention, export-completeness, or compliance promises from its screens; see the blocked
+> capability contract entries for those gaps.
 
 ```
 npm ci           # not `install` — the licence gate judges the locked tree
-npm run dev      # :8111, proxies /v1 /admin /export to :8110 (vite.config.ts)
+npm run dev      # :8111, proxies only approved BFF routes to edge :8120
 npm run build    # tsc --noEmit && vite build -> dist/
 npm run lint     # eslint . --max-warnings 0
+npm test          # Vitest + React Testing Library, jsdom
 
 node scripts/license_check.mjs --self-test   # prove the licence gate bites
 node scripts/license_check.mjs               # gate the resolved npm tree
 ```
 
-All four run in CI as the `dashboard` job (`.github/workflows/ci.yml`), in
-that order — licence gate first, for the same reason the Python `static` job
-runs its licence gate first: a dependency tree is cheapest to reject before
-anything is built on top of it.
+Run these local checks in the order shown when changing the dashboard. They provide build and
+source-quality evidence only; they do not validate a deployment or its authorization boundary.
 
-Docker: `docker/dashboard.Dockerfile` builds `dist/` and serves it via
-`nginx.conf`, which reverse-proxies `/v1`, `/admin` and `/export` to the `api`
-compose service on `:8110`.
+The dashboard Dockerfile builds `dist/` and serves it via `nginx.conf`. Any reverse proxy,
+identity integration, and API routing policy are deployment-owned.
 
-There is **no test harness**. No Vitest, no RTL, no `*.test.*` file anywhere
-under `dashboard/`. Verification is `tsc` + `eslint` + `vite build` + the
-licence gate, and nothing else. This is a real gap, not an omission from this
-document — see "Known weaknesses" at the end.
+Focused Vitest/RTL coverage exercises session transport, CSRF mutation headers,
+same-origin path rejection, no browser-held auth state, status-specific error rendering,
+cursor-page loading/empty states, stale-page clearing, escaped content, and semantic tables.
 
 ---
 
-## Which views are live, and against what
+## Local development views and their source paths
 
-This is the table to check first. **No view in this tree is fixture-backed.**
-Every hand-authored fixture was deleted; there is no code path in any view
-that renders a number the server did not send. But "live" is not one thing,
-and the distinction below is load-bearing:
+This is a source inventory of paths that the local development UI can render. It is not proof
+that a route is deployed, authorized at an edge, complete, or appropriate for an operator. No
+view should be interpreted as a compliance record or a production monitoring console.
 
 - **Aggregate route** — a purpose-built server-side endpoint. Paginated or
   windowed, computed by the server, no client-side derivation.
 - **Export-derived** — the view streams `GET /export/project` (the whole
   project as NDJSON: five tables, no filters, no pagination) and derives its
-  table in the browser. `useExportRows` caps at `maxRows` (default 5000) and
-  exposes `truncated: boolean`; **every** view below that uses it renders that
-  flag. These views are live but partial by construction, and slower and
+  table in the browser. `useExportRows` accepts only an edge response marked
+  `X-Tracebed-Export-Completeness: complete` with a valid maximum-byte bound;
+  a bounded, over-limit, or aborted stream renders an error with no partial
+  rows. It caps a complete stream at `maxRows` (default 5000), cancels the
+  reader, and exposes `truncated: boolean`; **every** view below that uses it
+  renders that flag. These views are partial by construction, and slower and
   heavier than they need to be.
 - **Empty by construction** — the route is real, tested and scoped, but no
   writer exists anywhere in the codebase to put rows behind it. It returns an
@@ -51,56 +60,52 @@ and the distinction below is load-bearing:
 
 | View | Route | Data source | What an operator does here |
 |---|---|---|---|
-| **Overview** | `/export/project`, `/admin/killswitch_state`, `/admin/review_queue`, `/admin/spend` | mixed (aggregate + export-derived) | First screen of the morning. Answers "did anything change overnight" — kill-switch state, open review items, spend, vault counts. Every tile is badged `Live data`. |
-| **Injections** | `/export/project` | export-derived | Trace what was actually placed into a prompt, and follow a row to the memory that produced it. |
-| **Abstention** | `/export/project` | export-derived | Confirm the retriever is abstaining as designed (≥50% by PLAN.md §6). A *low* abstention rate is the alarming reading, not a high one. |
+| **Overview** | `/export/project`, `/admin/killswitch_state`, `/admin/review_queue`, `/admin/spend` | mixed (aggregate + export-derived) | Local source view for kill-switch state, review items, spend, and vault counts. It is not an operational attestation. |
+| **Injections** | `/admin/injections`, `/admin/memory/{id}` | paginated server feed | Browse page by page, then inspect the current memory state. Trace-index joins are unavailable and stated as such. |
+| **Abstention** | `/export/project` | export-derived | Local source view of recorded abstention fields. Its totals may be truncated and are not a deployment metric. |
 | **Health** | `/healthz`, `/export/project` | mixed | Liveness plus queue/worker freshness. Where you look when a number elsewhere stops moving. |
-| **Memory Vault** | `/export/project` | export-derived | Browse and filter the vault by status/tier/type; the entry point to any individual memory. |
+| **Memory Vault** | `/admin/memory` | cursor-paginated server list | Browse a 100-row server page at a time. The opaque `next_cursor` controls Older/Newer traversal; page counts are never vault totals. |
 | **Memory Detail** | `/admin/memory/{id}`, `/export/project` | mixed | The only place a memory's provenance is readable. This is what makes a row governable rather than merely visible. |
 | **Vault Trend** | `/export/project` | export-derived | Watch vault composition move over time — is the candidate pool growing faster than validation can clear it. |
 | **Staleness** | `/admin/staleness/report` | aggregate route | Audit invalidation. Which events fired, what they plausibly matched, which memories are overdue for revalidation and were never staled. |
-| **Consolidation** | `/admin/consolidation/diffs` | aggregate route, **empty by construction** | Would show what a consolidation sweep added, amended and removed. Nothing writes sweeps today (see gap 3), so it renders an empty page and says why on the page. |
+| **Consolidation** | `/admin/consolidation/diffs` | aggregate route, **empty by construction** | Would show what a consolidation sweep added, amended and removed. Nothing writes sweeps today (see gap 1), so it renders an empty page and says why on the page. |
 | **Review Queue** | `/admin/review_queue` | aggregate route | Work the queue: what has been escalated for human judgement, and what is still open. |
 | **Forensics** | `/export/project` | export-derived | Blast-radius scan: given a subject or memory id, what else is implicated. |
-| **Lift & Q** | `/admin/lift/report` | aggregate route | **The view an operator quotes in a meeting.** Stratified lift per (agent type, memory type) with CI, N and BH-adjusted significance, plus a population snapshot of every scored memory's Q. |
+| **Lift & Q** | `/admin/lift/report` | aggregate route | Local source view of stratified lift and Q fields. It is not an independently validated performance or governance report. |
 | **Kill Switch** | `/admin/killswitch_state` | aggregate route, **read-only** | See what the kill switch actually decided and on what evidence. There is no write route — nothing here can arm or disarm it. |
 | **Spend** | `/admin/spend` | aggregate route | Budget consumption by day. |
-| **Registry** | `/admin/whoami`, `/admin/projects`, `/admin/agents/register` | aggregate route + admin writes | Provision a project, register an agent type, see which scope the current credential resolves to. |
-| **Settings** | `/admin/whoami`, `/admin/config` | aggregate route | Paste credentials; read this project's resolved configuration. |
+| **Registry** | `/admin/whoami` | aggregate route | See the session-derived scope; owner onboarding is outside the browser surface. |
+| **Settings** | `/auth/session`, `/auth/login`, `/auth/logout`, `/admin/whoami`, `/admin/config` | BFF session + aggregate routes | Inspect session state, sign in/out, and read this scope's configuration. |
+| **Validation Runs** | `/auth/demo-manifest`, `/export/project` | local-demo manifest + authoritative trace index | Loopback demo only; joins imported evidence labels to exported terminal run rows. |
 
-### Three purpose-built routes currently have no consumer
-
-Honest and worth fixing, because each one exists specifically to replace an
-export-derived view above:
+### Purpose-built list routes
 
 | Route | Should replace | Status |
 |---|---|---|
-| `GET /admin/memory` (`MemoryListOut`, paginated) | **Memory Vault**'s full-export stream | unused; `useMemoryList` has zero callers |
-| `GET /admin/injections` (paginated, project-scoped) | **Injections**' full-export stream | unused; view still streams the export |
+| `GET /admin/memory` (`MemoryListOut`, cursor-paginated) | **Memory Vault** | consumed by `useMemoryList`; opaque `next_cursor` is retained only for page traversal |
+| `GET /admin/injections` (paginated, project-scoped) | **Injections** | consumed by `useInjections`; explicit offset controls page traversal |
 | `GET /admin/invalidations` (`InvalidationListOut`) | nothing directly — **Staleness** uses the richer report route instead | unused; `useInvalidations` has zero callers |
 
-Each of the three views involved is separately audited, works, and discloses
-its own 5000-row truncation, so none of them is *wrong* — they are just
-pulling an entire project export to render one table when a purpose-built
-route is sitting there. Rewriting them was outside the blast radius of the
-work that added the routes.
+The remaining export-derived views retain their explicit row-cap/truncation disclosure. This does
+not establish export authorization or completeness.
 
 ---
 
 ## The API surface
 
-`src/tracebed/api/routes_v1.py`, `admin.py` and `reports.py` are the real
-routes — the complete surface, from every `@router.*` decorator in the repo:
+`src/tracebed/api/routes_v1.py`, `admin.py` and `reports.py` are source locations for the
+routes represented by this UI. This list is not a deployed API inventory or authorization proof:
 
 | Route | Auth | What it does |
 |---|---|---|
+| `GET /auth/session` | BFF cookie | returns only `authenticated` and the synchronizer token (`null` when anonymous) |
+| `GET /auth/login` | none | BFF/identity navigation entry; not an XHR credential exchange |
+| `POST /auth/logout` | BFF cookie + CSRF | clears the BFF session; browser sends `X-CSRF-Token` |
 | `POST /v1/retrieve` | principal | sync, budgeted retrieval |
 | `POST /v1/trace`, `/v1/trace/batch` | principal | 202, enqueue only |
 | `POST /v1/feedback` | principal | 202, enqueue only |
 | `POST /v1/propose_memory` | principal | 202, enqueue only |
 | `POST /v1/invalidation` | principal | 202, synchronous single-row insert |
-| `POST /admin/projects` | admin key | create project + partitions + KEK |
-| `POST /admin/agents/register` | admin key | create agent_type/principal/registration |
 | `GET /admin/whoami` | principal | the scope this credential resolves to |
 | `GET /admin/memory` | principal | paginated memory list |
 | `GET /admin/memory/{id}` | principal | one memory item, by id |
@@ -116,12 +121,13 @@ routes — the complete surface, from every `@router.*` decorator in the repo:
 | `GET /export/project` | principal | NDJSON dump of the whole project (5 tables, no filters, no pagination) |
 | `GET /healthz` | none | liveness |
 
-**No request may carry a `project_id`.** The server derives scope from the
-principal, and `client.ts`'s `assertNoProjectId` walks every request body
-recursively in dev builds and throws if it finds one. Exactly one call site is
-allowlisted — `useRegisterAgent` / `POST /admin/agents/register` — because
-that route is an admin *naming* the project being provisioned, not a data
-route reading within one.
+The local demo key has exactly `data`, `admin`, and `export` grants. It cannot make feedback
+writes without a source-bound feedback grant. Erasure is deliberately not presented as a completed
+browser workflow; dashboard screens do not prove deletion, retention, or export compliance.
+
+The client source attempts to reject caller-provided `project_id` values in development builds.
+That client-side behavior is not an authorization control: RBAC, project scoping, and privileged
+route behavior require server-side and deployment-specific validation.
 
 `src/api/types.ts` mirrors the wire types by hand from `domain/enums.py`,
 `domain/state_machine.py`, `domain/events.py`, `domain/memory.py`,
@@ -147,13 +153,14 @@ token table instead of something every author has to remember.
 | Focus | `ring-focus` | The one visible focus ring, applied globally via `:focus-visible` in `index.css` |
 | Status (9) | `bg-status-{name}-bg`, `text-status-{name}-fg`, `border-status-{name}-border` for `name` in `quarantined, candidate, validated, superseded, stale, retired, archived, pinned, tombstoned` | Memory lifecycle state (`domain/state_machine.py`'s `Status`). Always paired with an icon + label in `StatusBadge` — never colour alone. |
 | Tier | `text-tier-a`, `text-tier-b` (+ `border-tier-a`/`b`, solid vs dashed border) | Trust tier A (structural) vs B (content-derived) |
-| Risk | `text-risk-low/med/high` | Reserved for a future safety/lift view (PLAN.md §8 improvement 2) |
+| Risk | `text-risk-low/med/high` | Reserved for a future safety/lift view. |
 | Chart | `stroke-chart-line`, `fill-chart-band`, `stroke-chart-grid`, `fill-chart-axis` | `Chart.tsx`'s line, confidence band, gridlines, axis labels |
 
 Dark mode: `tailwind.config.ts` uses `darkMode: "class"`. `lib/theme.ts`
 toggles a `.dark` class on `<html>`, persisted to `localStorage["tb:theme"]`;
-`index.html` has an inline pre-paint script that applies the persisted (or OS)
-preference before React mounts, so there is no flash.
+the same-origin `theme-bootstrap.ts` module applies the persisted (or OS)
+preference before the React entrypoint. No inline script or CSP
+`unsafe-inline` exception is needed.
 
 ### Non-negotiable rendering rules
 
@@ -303,8 +310,8 @@ safeguard.
 ## API layer (`src/api/`)
 
 - **`client.ts`** — the only module that calls `fetch`. Exports `get`,
-  `postJson`, `postAdmin`, `streamNdjson`, `ApiError`, `credentials`, and
-  `assertNoProjectId`.
+  `postJson`, `streamNdjson`, `ApiError`, BFF session functions, and the
+  module-memory synchronizer-token setter.
 - **`types.ts`** — wire types, transcribed by hand.
 - **`hooks.ts`** — `useQuery`/`useMutation` generics plus one named hook per
   route. No react-query/SWR dependency. `useExportRows` streams
@@ -312,18 +319,9 @@ safeguard.
   `truncated` — a view built on it **must** surface that flag rather than
   present a partial vault as complete.
 
-Ad hoc reads (the three report routes) call `useQuery<T>` + `get<T>` directly
-with a locally-declared response interface transcribed from
-`api/models_reports.py`. This is deliberate but not ideal: see weakness 2.
-
-### Auth
-
-No login route exists. **Settings** lets an operator paste the bearer token or
-`tb_sk_...` API key their `POST /admin/agents/register` minted, plus the
-bootstrap admin key. `client.ts`'s `credentials` is the only reader/writer of
-`localStorage["tb:auth:principal"]` and `localStorage["tb:auth:admin_key"]`.
-`Layout.tsx`'s top bar shows whether a credential is set (polls on window
-focus, since Settings writes via a plain module rather than a shared store).
+The report response types and their named hooks live here too, rather than being
+redeclared in view files. The BFF/session layer is UX only; API and edge checks
+remain authoritative.
 
 ---
 
@@ -338,9 +336,8 @@ The policy lives inside the `.mjs` rather than beside `license_policy.toml`
 because Node has no standard-library TOML parser, and a licence gate that needs
 a dependency in order to check dependencies has a hole in it.
 
-Current verdict: **343 packages, 341 allowed, 2 conditional (named), 0 denied,
-0 unknown.** The two conditionals are both build-time-only *data* packages,
-neither of which reaches `dist/`:
+The source policy contains two named conditional build-time data packages. This documentation
+does not make a current dependency inventory, SBOM, provenance, or release-assurance claim:
 
 | Package | Licence | Why it is accepted |
 |---|---|---|
@@ -358,39 +355,25 @@ consumer will rely on.
 
 Stated here rather than discovered later.
 
-1. **No test harness at all.** No Vitest, no RTL, no render test. The three
-   most recent view rebuilds shipped with runtime contract mismatches against
-   the backend — a view expecting `report.trend` where the server sends
-   `report.window` — and `tsc`, `eslint` and `vite build` all passed clean
-   through every one of them, because a locally-declared interface that
-   disagrees with the server is not a type error. **A single render test per
-   view against a recorded response body would have caught all three.** This
-   is the highest-value missing thing in this directory.
-2. **Three independently-drifting local response types.** `LiftReportOut`,
-   `StalenessReportOut` and `ConsolidationDiffsOut` are declared inside their
-   own view files rather than in `types.ts`, so nothing forces them to stay
-   consistent with each other or with `api/models_reports.py`. They should be
-   promoted into `types.ts` with named hooks in `hooks.ts`.
-3. **`Consolidation` renders an empty page on every build shipped today.**
+1. **`Consolidation` has an unpopulated source path.**
    `workers/consolidator.py`'s per-sweep `DeltaRecord` has no store, and
    `derived_state` — the only table shaped to fit — has no writer either. The
    route is real and tested; nothing populates it. The wire carries
    `sweep_deltas_available: false` so "this project ran no sweeps" and
    "nothing in this system records sweeps" do not render identically.
-4. **`Lift & Q`'s methodology constants are process defaults, not this
+2. **`Lift & Q`'s methodology constants are process defaults, not this
    project's resolved config.** `methodology.source == "process_default"` and
    the page warns about it, but a project that overrode
    `killswitch.min_cell_n` sees this report judge cells against 200 while the
    kill switch judges them against the override.
-5. **`Kill Switch` is read-only.** No write route exists, so the confirmed,
+3. **`Kill Switch` is read-only.** No write route exists, so the confirmed,
    blast-radius-shown governing action the view is designed around cannot be
    performed from the dashboard.
-6. **Eight views call `useExportRows`**, and for five of them (Injections,
-   Abstention, Memory Vault, Vault Trend, Forensics) the whole-project export
-   is the *only* data source — an entire NDJSON dump streamed and filtered in
-   the browser to render one table, capped at 5000 rows. Purpose-built routes
-   already exist for two of the five (see the unused-routes table above).
-7. **No `project_id` is ever displayed as a matter of course.**
-   `GET /admin/whoami` exists and **Registry**/**Settings** use it, but the
-   shell does not show which project the current credential resolves to, so
-   a screenshot from one project is indistinguishable from another's.
+4. **Export-derived views remain.** Abstention, Vault Trend, Forensics,
+   Overview, Health and Memory Detail still use bounded project exports where
+   no dedicated join/report route exists. Each retained view discloses the
+   cap and truncation; Injections and Memory Vault no longer use that path.
+5. **Frontend authorization is not an authorization control.** The shell
+   reflects `GET /admin/whoami` for every view and clears view state on a
+   session transition, but API/edge enforcement and deployment validation
+   remain required.

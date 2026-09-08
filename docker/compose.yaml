@@ -1,35 +1,45 @@
-# Tracebed local stack (PHASE-0 Task 1).
-#
-# UNVERIFIED IMAGE TAGS: this file was authored on a machine with no Docker daemon, so the
-# image tags below have not been pulled. Confirm them on first `docker compose up` and pin
-# by digest once confirmed. Everything else here — ports, extensions, roles, healthchecks —
-# is dictated by PLAN.md §5 and is not guesswork.
-#
-#   docker compose -f docker/compose.yaml up -d
-#   python -m tracebed.stores.pg.migrate apply
-
 name: tracebed
+
+x-runtime-build: &runtime-build
+  build:
+    context: .
+    dockerfile: docker/api.Dockerfile
+
+x-runtime-environment: &runtime-environment
+  TB_STORAGE__VALKEY_URL: valkey://valkey:6379/0
+  TB_STORAGE__TRACESTORE__DRIVER: s3
+  TB_STORAGE__TRACESTORE__ENDPOINT: http://seaweedfs:8333
+  TB_STORAGE__TRACESTORE__BUCKET: tracebed-traces
+  TB_STORAGE__TRACESTORE__REGION: us-east-1
+  TB_EMBEDDING__DRIVER: hash-local
+  TB_EMBEDDING__MODEL_ID: tracebed-hash-local
+  TB_EMBEDDING__MODEL_VERSION: sha256-unigram-bigram-v1
+  TB_HOLDOUT_SALT_FILE: /run/secrets/holdout_salt
+  TB_MASTER_KEY_FILE: /run/secrets/master_key
+
+x-api-environment: &api-environment
+  <<: *runtime-environment
+  TB_ADMIN_KEY_FILE: /run/secrets/admin_key
+  TB_READYZ_TOKEN_FILE: /run/secrets/readyz_token
 
 services:
   postgres:
-    # Postgres 18 is required, not preferred: pg_textsearch (true BM25, PostgreSQL License)
-    # is what replaced ts_rank after the audit measured ts_rank at nDCG@10 0.07 vs BM25 0.69
-    # on BEIR SciFact — and §7.5's rarity gate is an IDF computation ts_rank cannot provide.
-    # The vchord-suite image bundles pgvector + pg_textsearch on a PG18 base.
-    # Fallback if unavailable: pgvector/pgvector:pg18 + build pg_textsearch from source.
-    image: tensorchord/vchord-suite:pg18-latest
-    container_name: tracebed-pg
+    image: tensorchord/vchord-suite@sha256:c6e5e77a1180199f91b040b6e85c6d10b0ded6d49fb614dfd2e7272ffb91af08
     environment:
       POSTGRES_USER: tracebed_owner
-      POSTGRES_PASSWORD: ${TB_PG_PASSWORD:-tracebed_dev_only}
       POSTGRES_DB: tracebed
-      # Deterministic collation: BM25 tokenisation and tsvector behaviour must not vary by host.
+      POSTGRES_PASSWORD_FILE: /run/secrets/owner_db_password
       POSTGRES_INITDB_ARGS: "--locale-provider=icu --icu-locale=en-US --encoding=UTF8"
     command:
       - postgres
-      # The queue and the vector index share this buffer cache. PLAN.md §3 records that
-      # coupling as a hot-path latency risk; queue.py alarms on xmin-horizon age because
-      # of exactly this line.
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - max_prepared_transactions=0
+      - -c
+      - listen_addresses=*
       - -c
       - shared_buffers=1GB
       - -c
@@ -38,46 +48,46 @@ services:
       - maintenance_work_mem=512MB
       - -c
       - max_connections=200
-      # Long-lived idle transactions hold back the xmin horizon and bloat work_queue.
       - -c
       - idle_in_transaction_session_timeout=60s
       - -c
-      # vchord_bm25 (the BM25 lexical arm — the mandated pg_textsearch is a phantom, absent from
-      # this image and not a real extension) and its pg_tokenizer dependency must be preloaded;
-      # both refuse to CREATE EXTENSION otherwise. pgvector needs no preload.
       - shared_preload_libraries=pg_stat_statements,pg_tokenizer,vchord_bm25
-    ports:
-      - "5442:5432"   # not 5432: this must not collide with a host Postgres
     volumes:
-      # PG18's Docker image stores data in a major-version subdirectory and refuses to boot when
-      # the volume is mounted at the legacy /var/lib/postgresql/data (docker-library/postgres #1259:
-      # "there appears to be PostgreSQL data in ... (unused mount/volume)"). Mount the parent;
-      # the entrypoint then initialises /var/lib/postgresql/18/docker inside it.
       - pgdata:/var/lib/postgresql
-      - ./initdb:/docker-entrypoint-initdb.d:ro
+      - ./docker/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    secrets:
+      - owner_db_password
+    networks:
+      pg-admin:
+        ipv4_address: 10.77.10.2
+        aliases: [postgres-admin]
+      pg-api:
+        ipv4_address: 10.77.11.2
+        aliases: [postgres-api]
+      pg-worker:
+        ipv4_address: 10.77.12.2
+        aliases: [postgres-worker]
+      pg-erasure:
+        ipv4_address: 10.77.16.2
+        aliases: [postgres-erasure]
+      pg-probe:
+        ipv4_address: 10.77.13.2
+        aliases: [postgres-probe]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U tracebed_owner -d tracebed"]
       interval: 5s
       timeout: 5s
       retries: 20
+      start_period: 10s
     restart: unless-stopped
 
   valkey:
-    # Valkey, not Redis: Redis relicensed to RSALv2/SSPL, which scripts/license_policy.toml denies.
-    image: valkey/valkey:8-alpine
-    container_name: tracebed-valkey
-    command:
-      - valkey-server
-      - --save
-      - ""                        # working memory and the tool cache are both reconstructible
-      - --appendonly
-      - "no"
-      - --maxmemory
-      - 512mb
-      - --maxmemory-policy
-      - allkeys-lru
-    ports:
-      - "6389:6379"
+    image: valkey/valkey@sha256:a038175878d66b9d274fbf8be73c0305e93798b83917647f167e18cef3c71eec
+    command: ["valkey-server", "--save", "", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    networks:
+      runtime-data:
+        ipv4_address: 10.77.14.2
+        aliases: [valkey]
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 5s
@@ -86,64 +96,349 @@ services:
     restart: unless-stopped
 
   seaweedfs:
-    # Generic S3 target for the TraceStorePort integration tests. SeaweedFS is the primary
-    # target; legacy MinIO still works because the driver speaks plain S3 and never imports
-    # a MinIO SDK (its OSS repo was archived 2026-04-25).
-    image: chrislusf/seaweedfs:latest
-    container_name: tracebed-s3
-    command: "server -dir=/data -s3 -s3.port=8333 -master.volumeSizeLimitMB=256"
-    ports:
-      - "8333:8333"
-      - "9333:9333"
+    build:
+      context: .
+      dockerfile: docker/seaweedfs/Dockerfile
+    command:
+      ["server", "-dir=/data", "-s3", "-s3.port=8333", "-s3.config=/run/tracebed-s3/s3.json", "-master.volumeSizeLimitMB=256"]
     volumes:
       - s3data:/data
+    tmpfs:
+      - /run/tracebed-s3:uid=65532,gid=65532,mode=0700
+    secrets:
+      - s3_signing_key
+      - s3_init_access_key
+      - s3_init_secret_key
+      - s3_runtime_access_key
+      - s3_runtime_secret_key
+      - s3_erasure_access_key
+      - s3_erasure_secret_key
+    environment:
+      SEAWEED_S3_SIGNING_KEY_FILE: /run/secrets/s3_signing_key
+      SEAWEED_S3_INIT_ACCESS_KEY_FILE: /run/secrets/s3_init_access_key
+      SEAWEED_S3_INIT_SECRET_KEY_FILE: /run/secrets/s3_init_secret_key
+      SEAWEED_S3_RUNTIME_ACCESS_KEY_FILE: /run/secrets/s3_runtime_access_key
+      SEAWEED_S3_RUNTIME_SECRET_KEY_FILE: /run/secrets/s3_runtime_secret_key
+      SEAWEED_S3_ERASURE_ACCESS_KEY_FILE: /run/secrets/s3_erasure_access_key
+      SEAWEED_S3_ERASURE_SECRET_KEY_FILE: /run/secrets/s3_erasure_secret_key
+    networks:
+      runtime-data:
+        ipv4_address: 10.77.14.3
+        aliases: [seaweedfs]
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O- http://localhost:9333/cluster/status || exit 1"]
-      interval: 10s
-      timeout: 5s
+      # An unsigned S3 root request is expected to receive 403 once the
+      # generated IAM file is loaded.  Treat that authenticated S3 response
+      # (or a 2xx response) as ready; a TCP listener alone, master port 9333,
+      # connection failure, or 5xx cannot satisfy this healthcheck.
+      test: ["CMD-SHELL", "test -s /run/tracebed-s3/s3.json && (wget -S --spider -O /dev/null http://127.0.0.1:8333/ 2>&1 || true) | grep -Eq 'HTTP/[0-9.]+ (2[0-9][0-9]|403)'"]
+      interval: 5s
+      timeout: 3s
       retries: 20
+      start_period: 10s
     restart: unless-stopped
 
-  api:
+  # Named volumes are created root-owned by Docker.  This one-shot has no
+  # network and no secrets; it exists only to hand the volume to Seaweed's
+  # fixed non-root UID before the long-running object-store process starts.
+  s3-volume-init:
     build:
-      context: ..
-      dockerfile: docker/api.Dockerfile
-    container_name: tracebed-api
-    depends_on:
-      postgres: { condition: service_healthy }
-      valkey: { condition: service_healthy }
+      context: .
+      dockerfile: docker/seaweedfs/Dockerfile
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["mkdir -p /data && chown -R 65532:65532 /data"]
+    volumes:
+      - s3data:/data
+    network_mode: none
+    restart: "no"
+
+  db-bootstrap:
+    <<: *runtime-build
+    entrypoint: ["tracebed-compose-bootstrap"]
     environment:
-      TB_STORAGE__PG_DSN: postgresql://tracebed_app:${TB_APP_PASSWORD:-tracebed_app_dev}@postgres:5432/tracebed
+      TB_OWNER_DB_PASSWORD_FILE: /run/secrets/owner_db_password
+      TB_APP_DB_PASSWORD_FILE: /run/secrets/app_db_password
+      TB_API_DB_PASSWORD_FILE: /run/secrets/api_db_password
+      TB_WORKER_DB_PASSWORD_FILE: /run/secrets/worker_db_password
+      TB_ERASURE_DB_PASSWORD_FILE: /run/secrets/erasure_db_password
+    secrets:
+      - owner_db_password
+      - app_db_password
+      - api_db_password
+      - worker_db_password
+      - erasure_db_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      pg-admin:
+        ipv4_address: 10.77.10.3
+      pg-api:
+        ipv4_address: 10.77.11.4
+      pg-worker:
+        ipv4_address: 10.77.12.4
+      pg-probe:
+        ipv4_address: 10.77.13.3
+      pg-erasure:
+        ipv4_address: 10.77.16.4
+    restart: "no"
+
+  s3-init:
+    <<: *runtime-build
+    entrypoint: ["tracebed-compose-s3-init"]
+    environment:
+      TB_STORAGE__TRACESTORE__ENDPOINT: http://seaweedfs:8333
+      TB_STORAGE__TRACESTORE__BUCKET: tracebed-traces
+      TB_STORAGE__TRACESTORE__REGION: us-east-1
+      TB_S3_INIT_ACCESS_KEY_FILE: /run/secrets/s3_init_access_key
+      TB_S3_INIT_SECRET_KEY_FILE: /run/secrets/s3_init_secret_key
+    secrets:
+      - s3_init_access_key
+      - s3_init_secret_key
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    networks:
+      runtime-data:
+        ipv4_address: 10.77.14.4
+    restart: "no"
+
+  api:
+    <<: *runtime-build
+    entrypoint: ["tracebed-compose-api"]
+    environment:
+      <<: *api-environment
+      TB_AUTH__OIDC_ISSUER: "${TB_AUTH__OIDC_ISSUER:-}"
+      TB_AUTH__OIDC_JWKS_URL: "${TB_AUTH__OIDC_JWKS_URL:-}"
+      TB_AUTH__OIDC_AUDIENCE: "${TB_AUTH__OIDC_AUDIENCE:-}"
+      TB_API_DB_PASSWORD_FILE: /run/secrets/api_db_password
+      TB_S3_RUNTIME_ACCESS_KEY_FILE: /run/secrets/s3_runtime_access_key
+      TB_S3_RUNTIME_SECRET_KEY_FILE: /run/secrets/s3_runtime_secret_key
+    secrets:
+      - api_db_password
+      - s3_runtime_access_key
+      - s3_runtime_secret_key
+      - holdout_salt
+      - master_key
+      - admin_key
+      - readyz_token
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    networks:
+      pg-api:
+        ipv4_address: 10.77.11.3
+      runtime-data:
+        ipv4_address: 10.77.14.5
+      ingress:
+        ipv4_address: 10.77.15.2
+    ports:
+      - "127.0.0.1:${TB_API_HOST_PORT:?TB_API_HOST_PORT must be an unused loopback port}:8110"
+    healthcheck:
+      test: ["CMD", "tracebed-compose-api-health"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  # Browser requests enter only through this same-origin BFF.  The API retains
+  # its loopback publication for the sealed Compose acceptance harness; it is
+  # never an ingress-network browser upstream.
+  edge:
+    <<: *runtime-build
+    entrypoint: ["tracebed-edge"]
+    environment:
+      # A public OIDC client uses Code+PKCE, not a browser-held client secret.
+      # Empty defaults are normalized to "disabled" by EdgeSettings; supplying
+      # any one setting requires the complete, validated five-value boundary.
+      TB_EDGE_OIDC_ISSUER: "${TB_AUTH__OIDC_ISSUER:-}"
+      TB_EDGE_OIDC_JWKS_URL: "${TB_AUTH__OIDC_JWKS_URL:-}"
+      TB_EDGE_OIDC_CLIENT_ID: "${TB_EDGE_OIDC_CLIENT_ID:-}"
+      TB_EDGE_OIDC_API_AUDIENCE: "${TB_AUTH__OIDC_AUDIENCE:-}"
+      TB_EDGE_REDIRECT_URI: "${TB_EDGE_REDIRECT_URI:-}"
+      TB_EDGE_ALLOWED_ORIGIN: "${TB_EDGE_ALLOWED_ORIGIN:-}"
+      TB_EDGE_TRUSTED_INGRESS_HOST: "10.77.15.3"
+      TB_EDGE_SECURE_COOKIE: "${TB_EDGE_SECURE_COOKIE:-true}"
+    depends_on:
+      api:
+        condition: service_started
+    networks:
+      ingress:
+        ipv4_address: 10.77.15.4
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8120/healthz', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: unless-stopped
+
+  worker:
+    <<: *runtime-build
+    entrypoint: ["tracebed-compose-worker"]
+    environment:
+      <<: *runtime-environment
+      TB_WORKER_DB_PASSWORD_FILE: /run/secrets/worker_db_password
+      TB_S3_RUNTIME_ACCESS_KEY_FILE: /run/secrets/s3_runtime_access_key
+      TB_S3_RUNTIME_SECRET_KEY_FILE: /run/secrets/s3_runtime_secret_key
+    secrets:
+      - worker_db_password
+      - s3_runtime_access_key
+      - s3_runtime_secret_key
+      - holdout_salt
+      - master_key
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    networks:
+      pg-worker:
+        ipv4_address: 10.77.12.3
+      runtime-data:
+        ipv4_address: 10.77.14.6
+    healthcheck:
+      test: ["CMD", "tracebed-compose-worker-ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  erasure:
+    <<: *runtime-build
+    entrypoint: ["tracebed-compose-erasure"]
+    environment:
+      TB_ERASURE_DB_PASSWORD_FILE: /run/secrets/erasure_db_password
+      TB_ERASURE_POLL_SECONDS: "2"
+      TB_ERASURE_LEASE_SECONDS: "90"
+      TB_ERASURE_HEARTBEAT_SECONDS: "20"
+      TB_ERASURE_BATCH_SIZE: "100"
+      TB_ERASURE_EXTERNAL_TIMEOUT_SECONDS: "10"
+      TB_ERASURE_TRACE_STORE: trace_s3_v1
+      TB_ERASURE_VECTOR_STORE: vector_postgres
+      TB_ERASURE_GRAPH_STORE: graph_postgres
       TB_STORAGE__VALKEY_URL: valkey://valkey:6379/0
       TB_STORAGE__TRACESTORE__DRIVER: s3
       TB_STORAGE__TRACESTORE__ENDPOINT: http://seaweedfs:8333
       TB_STORAGE__TRACESTORE__BUCKET: tracebed-traces
-      TB_EMBEDDING__MODEL_VERSION: ${TB_EMBEDDING_MODEL_VERSION:-unset-pin-me}
-      TB_HOLDOUT_SALT: ${TB_HOLDOUT_SALT:-dev-salt-change-me}
-      # NOT `TB_CRYPTO__MASTER_KEY`. `crypto.shred.EnvMasterKeyProvider` reads the
-      # bare name `TB_MASTER_KEY`, deliberately outside `TracebedSettings` (C-15:
-      # settings objects get repr()'d into logs, and key material must not be one
-      # accidental str(settings) from a leak). A `TB_CRYPTO__` prefix here would be
-      # read by nothing and the api container would abort with MasterKeyMissing.
-      TB_MASTER_KEY: ${TB_MASTER_KEY:-}
-    ports:
-      - "8110:8110"
-    profiles: ["full"]
+      TB_STORAGE__TRACESTORE__REGION: us-east-1
+      TB_S3_ERASURE_ACCESS_KEY_FILE: /run/secrets/s3_erasure_access_key
+      TB_S3_ERASURE_SECRET_KEY_FILE: /run/secrets/s3_erasure_secret_key
+    secrets:
+      - erasure_db_password
+      - s3_erasure_access_key
+      - s3_erasure_secret_key
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    networks:
+      pg-erasure:
+        ipv4_address: 10.77.16.3
+      runtime-data:
+        ipv4_address: 10.77.14.7
+    healthcheck:
+      test: ["CMD", "tracebed-compose-erasure-ready"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
     restart: unless-stopped
 
   dashboard:
     build:
-      context: ../dashboard
+      context: dashboard
       dockerfile: ../docker/dashboard.Dockerfile
-    container_name: tracebed-dashboard
-    depends_on: [api]
     environment:
       VITE_API_BASE: http://localhost:8110
+    depends_on:
+      edge:
+        # Controller publication deliberately starts runtime processes while
+        # authority admission remains closed.  Dashboard may wait only for
+        # the API process; serving readiness turns healthy after the final
+        # owner admission-open mutation.
+        condition: service_healthy
+    networks:
+      ingress:
+        ipv4_address: 10.77.15.3
     ports:
-      - "8111:8111"
-    profiles: ["full"]
+      - "127.0.0.1:${TB_DASHBOARD_HOST_PORT:?TB_DASHBOARD_HOST_PORT must be an unused loopback port}:8111"
     restart: unless-stopped
 
 volumes:
   pgdata:
   s3data:
+
+networks:
+  pg-admin:
+    internal: true
+    ipam:
+      config: [{subnet: 10.77.10.0/29}]
+  pg-api:
+    internal: true
+    ipam:
+      config: [{subnet: 10.77.11.0/29}]
+  pg-worker:
+    internal: true
+    ipam:
+      config: [{subnet: 10.77.12.0/29}]
+  pg-probe:
+    internal: true
+    ipam:
+      config: [{subnet: 10.77.13.0/29}]
+  runtime-data:
+    internal: true
+    ipam:
+      config: [{subnet: 10.77.14.0/28}]
+  ingress:
+    ipam:
+      config: [{subnet: 10.77.15.0/29}]
+  pg-erasure:
+    internal: true
+    ipam:
+      config: [{subnet: 10.77.16.0/29}]
+
+secrets:
+  owner_db_password:
+    file: ${TB_OWNER_DB_PASSWORD_FILE:?TB_OWNER_DB_PASSWORD_FILE must name a secret file}
+  app_db_password:
+    file: ${TB_APP_DB_PASSWORD_FILE:?TB_APP_DB_PASSWORD_FILE must name a secret file}
+  api_db_password:
+    file: ${TB_API_DB_PASSWORD_FILE:?TB_API_DB_PASSWORD_FILE must name a secret file}
+  worker_db_password:
+    file: ${TB_WORKER_DB_PASSWORD_FILE:?TB_WORKER_DB_PASSWORD_FILE must name a secret file}
+  erasure_db_password:
+    file: ${TB_ERASURE_DB_PASSWORD_FILE:?TB_ERASURE_DB_PASSWORD_FILE must name a secret file}
+  s3_signing_key:
+    file: ${TB_S3_SIGNING_KEY_FILE:?TB_S3_SIGNING_KEY_FILE must name a secret file}
+  s3_init_access_key:
+    file: ${TB_S3_INIT_ACCESS_KEY_FILE:?TB_S3_INIT_ACCESS_KEY_FILE must name a secret file}
+  s3_init_secret_key:
+    file: ${TB_S3_INIT_SECRET_KEY_FILE:?TB_S3_INIT_SECRET_KEY_FILE must name a secret file}
+  s3_runtime_access_key:
+    file: ${TB_S3_RUNTIME_ACCESS_KEY_FILE:?TB_S3_RUNTIME_ACCESS_KEY_FILE must name a secret file}
+  s3_runtime_secret_key:
+    file: ${TB_S3_RUNTIME_SECRET_KEY_FILE:?TB_S3_RUNTIME_SECRET_KEY_FILE must name a secret file}
+  s3_erasure_access_key:
+    file: ${TB_S3_ERASURE_ACCESS_KEY_FILE:?TB_S3_ERASURE_ACCESS_KEY_FILE must name a secret file}
+  s3_erasure_secret_key:
+    file: ${TB_S3_ERASURE_SECRET_KEY_FILE:?TB_S3_ERASURE_SECRET_KEY_FILE must name a secret file}
+  holdout_salt:
+    file: ${TB_HOLDOUT_SALT_FILE:?TB_HOLDOUT_SALT_FILE must name a secret file}
+  master_key:
+    file: ${TB_MASTER_KEY_FILE:?TB_MASTER_KEY_FILE must name a secret file}
+  admin_key:
+    file: ${TB_ADMIN_KEY_FILE:?TB_ADMIN_KEY_FILE must name a secret file}
+  readyz_token:
+    file: ${TB_READYZ_TOKEN_FILE:?TB_READYZ_TOKEN_FILE must name a secret file}

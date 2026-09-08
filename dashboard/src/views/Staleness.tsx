@@ -1,12 +1,11 @@
 import { useMemo, useState } from "react";
-import { get } from "../api/client";
-import { useMemoryItem, useQuery } from "../api/hooks";
+import { useMemoryItem, useStalenessReport } from "../api/hooks";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { StatusBadge, TrustTierBadge } from "../components/StatusBadge";
 import { Table, type ColumnDef } from "../components/Table";
 import { formatDateTime, formatFloat, formatInt, truncateId } from "../lib/format";
-import type { MemType } from "../api/types";
+import type { InvalidationReportEntryOut, RevalidationCandidateOut } from "../api/types";
 
 // What went stale, why, and what is drifting towards revalidation. PLAN.md
 // §5's `invalidation_event` table and `memory_item`'s strike/lifecycle columns
@@ -35,62 +34,6 @@ import type { MemType } from "../api/types";
 // field for field: StalenessReportOut / InvalidationReportEntryOut /
 // InvalidationMatchOut / RevalidationCandidateOut.
 
-// --------------------------------------------------------------------- //
-// Wire contract for GET /admin/staleness/report.
-// --------------------------------------------------------------------- //
-
-interface InvalidationMatchOut {
-  memory_id: string;
-  mem_type: MemType;
-  strike_count: number;
-  status_changed_at: string | null;
-}
-
-interface InvalidationReportEntryOut {
-  event_id: string;
-  /** Free text server-side (PLAN.md §5 has no closed enum for this column). */
-  event_type: string;
-  selector: Record<string, unknown> | null;
-  fired_at: string;
-  /** Currently-stale memories whose provenance this event's selector matches.
-   * Evidence, NOT a recorded causal link — see this file's header. May be a
-   * capped prefix of the real match set; `matched_memories_total` is the
-   * exact count and is what this view renders as the count. */
-  matched_memories: InvalidationMatchOut[];
-  /** EXACT number of matches, even when `matched_memories` was capped. */
-  matched_memories_total: number;
-  /** True when `matched_memories` is an incomplete list — either the server's
-   * stale-memory scan was bounded, or this one event matched more than a
-   * single response carries. Either way the list reads "at least these". */
-  matched_memories_truncated: boolean;
-}
-
-interface RevalidationCandidateOut {
-  memory_id: string;
-  mem_type: MemType;
-  /** `last_retrieved_at`, or `created_at` when never retrieved — the idle
-   * reference `workers/revalidation.py` measures against. NOT the same field
-   * as `last_revalidated_at`. */
-  reference_at: string;
-  age_days: number;
-  /** `lifecycle.revalidation_age_days` (R) this response was computed under —
-   * travels with the rows so a threshold is never rendered from a client-side
-   * guess at the deployment's configured value. */
-  r_days: number;
-  last_revalidated_at: string | null;
-}
-
-interface StalenessReportOut {
-  invalidation_events: InvalidationReportEntryOut[];
-  event_limit: number;
-  event_offset: number;
-  event_returned: number;
-  approaching_revalidation: RevalidationCandidateOut[];
-  approaching_limit: number;
-  approaching_offset: number;
-  approaching_returned: number;
-  r_days: number;
-}
 
 // `cache_flush` invalidates Valkey cache keys (D-041 / stores/valkey/flush.py)
 // and touches no `memory_item` row at all — zero matches on one is CORRECT and
@@ -360,10 +303,7 @@ function ApproachingTable({ rows }: { rows: RevalidationCandidateOut[] }) {
 // --------------------------------------------------------------------- //
 
 export default function Staleness() {
-  const query = useQuery<StalenessReportOut>(
-    (signal) => get<StalenessReportOut>("/admin/staleness/report", { signal }),
-    "/admin/staleness/report"
-  );
+  const query = useStalenessReport();
   const report = query.data;
 
   // Over-invalidation risk: an event fired that is meant to reach memories and

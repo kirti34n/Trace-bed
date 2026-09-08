@@ -28,8 +28,8 @@ import pytest
 
 from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import ScoringConfig, TracebedSettings
-from tracebed.domain.enums import AdapterClass
-from tracebed.domain.ids import PrincipalId, ProjectId, RunId, uuid7
+from tracebed.domain.enums import AdapterClass, FeedbackSource, ProjectRole
+from tracebed.domain.ids import AgentTypeId, PrincipalId, ProjectId, RunId, uuid7
 from tracebed.ingest.outcome_intake import OutcomeIntake
 from tracebed.stores.pg.queue import TOPIC_OUTCOME_EVENT, QueueItem
 from tracebed.stores.pg.rows import OutcomeEventInsert
@@ -286,6 +286,34 @@ def test_replayed_event_id_inserts_exactly_one_row(settings: TracebedSettings) -
     assert h.queue.nacked == []
     assert len(h.repo.rows) == 1  # ON CONFLICT (project_id, event_id) DO NOTHING -> exactly one row
     assert len(h.repo.insert_calls) == 2  # the repo WAS called twice; it deduped, not the consumer
+
+
+def test_v1_omitted_occurrence_time_is_marked_as_derived(settings: TracebedSettings) -> None:
+    """Queue creation time is a transport fallback, never replay identity."""
+    h = _harness(settings)
+    project_id = ProjectId(uuid7())
+    item = QueueItem(
+        id=1,
+        topic=TOPIC_OUTCOME_EVENT,
+        payload={"event_id": str(uuid4()), "outcome": "positive", "payload": {}},
+        project_id=project_id,
+        priority=0,
+        attempts=1,
+        authority_version=1,
+        run_id=RunId(uuid7()),
+        source_principal_id=PrincipalId(uuid7()),
+        source_agent_type_id=AgentTypeId(uuid7()),
+        source_grant_id=uuid4(),
+        required_role=ProjectRole.FEEDBACK,
+        feedback_source=FeedbackSource.DOWNSTREAM,
+        run_owner_principal_id=PrincipalId(uuid7()),
+        run_owner_agent_type_id=AgentTypeId(uuid7()),
+        created_at=h.clock.now(),
+    )
+
+    envelope = h.intake._parse_item(item)
+    assert envelope is not None
+    assert h.intake._to_row(envelope, item).occurred_at_is_derived is True
 
 
 def test_payload_with_weight_field_is_rejected(settings: TracebedSettings) -> None:

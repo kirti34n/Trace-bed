@@ -28,12 +28,13 @@ from __future__ import annotations
 
 import inspect
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from psycopg.errors import QueryCanceled
 
 from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import (
@@ -59,7 +60,12 @@ from tracebed.domain.enums import MemType, ScopeType, TrustTier
 from tracebed.domain.ids import AgentTypeId, MemoryId, PrincipalId, ProjectId
 from tracebed.domain.scope import ProjectScope
 from tracebed.domain.state_machine import Status
-from tracebed.hotpath.assembly import CandidateAssembly, CandidateStorePort
+from tracebed.hotpath.assembly import (
+    AssemblyDeadlineExceeded,
+    CandidateAssembly,
+    CandidateStorePort,
+)
+from tracebed.hotpath.budget import Deadline
 from tracebed.hotpath.fusion import ArmSignal, FusedCandidate
 from tracebed.stores.pg import pool as pool_module
 from tracebed.stores.pg.search import CandidateRow, SearchStore
@@ -124,7 +130,7 @@ class _FakePool:
         self._rows = rows if rows is not None else []
 
     @contextmanager
-    def connection(self) -> Iterator[_FakeConn]:
+    def connection(self, *, timeout: float | None = None) -> Iterator[_FakeConn]:
         yield _FakeConn(self.log, self._rows)
 
 
@@ -185,6 +191,80 @@ def test_the_guc_value_is_the_bound_verbatim_not_a_constant() -> None:
     store, pool = _store()
     store.corpus_size(PROJECT, statement_timeout_ms=137)
     assert _timeout_gucs(pool.log) == [{"statement_timeout_ms": "137"}]
+
+
+class _SteppingDeadline:
+    def __init__(self, remaining_values: Sequence[float]) -> None:
+        self._remaining_values = iter(remaining_values)
+
+    def remaining_ms(self) -> float:
+        return next(self._remaining_values)
+
+
+def test_search_refreshes_the_deadline_timeout_after_setup_before_the_data_query() -> None:
+    """The setup statement consumes budget, so the SELECT must not inherit its older bound."""
+    store, pool = _store()
+    store.lexical_arm(
+        PROJECT,
+        "retry",
+        10,
+        deadline=_SteppingDeadline((250.0, 250.0, 137.0, 137.0)),
+    )
+    assert _timeout_gucs(pool.log) == [
+        {"statement_timeout_ms": "250"},
+        {"statement_timeout_ms": "137"},
+    ]
+
+
+class _ExpiryDuringRefreshConn(_FakeConn):
+    def __init__(self, log: list[tuple[str, Any]], expire: Callable[[], None]) -> None:
+        super().__init__(log, [])
+        self._timeout_sets = 0
+        self._expire = expire
+
+    def execute(self, sql: str, params: Any = None) -> _FakeCursor:
+        result = super().execute(sql, params)
+        if sql == pool_module._SET_STATEMENT_TIMEOUT:
+            self._timeout_sets += 1
+            if self._timeout_sets == 2:
+                self._expire()
+        return result
+
+
+class _AdvancingDeadline:
+    def __init__(self, remaining_ms: float) -> None:
+        self._remaining_ms = remaining_ms
+
+    def remaining_ms(self) -> float:
+        return self._remaining_ms
+
+    def expire(self) -> None:
+        self._remaining_ms = 0.0
+
+
+class _ExpiryDuringRefreshPool:
+    def __init__(self, deadline: _AdvancingDeadline) -> None:
+        self.log: list[tuple[str, Any]] = []
+        self._deadline = deadline
+
+    @contextmanager
+    def connection(self, *, timeout: float | None = None) -> Iterator[_ExpiryDuringRefreshConn]:
+        yield _ExpiryDuringRefreshConn(self.log, self._deadline.expire)
+
+
+def test_search_does_not_start_a_data_query_when_refresh_itself_expires_the_deadline() -> None:
+    """The timeout GUC is setup work too; expiry immediately after it must stop the SELECT."""
+    deadline = _AdvancingDeadline(250.0)
+    pool = _ExpiryDuringRefreshPool(deadline)
+    store = SearchStore(pool)  # type: ignore[arg-type]
+    with pytest.raises(pool_module.PoolDeadlineExceeded, match="refreshing"):
+        store.lexical_arm(
+            PROJECT,
+            "retry",
+            10,
+            deadline=deadline,
+        )
+    assert not any("FROM memory_item" in sql for sql, _ in pool.log)
 
 
 # --------------------------------------------------------------------------- #
@@ -261,6 +341,7 @@ class _RecordingStore:
         self.fetch_timeout: int | None = None
         self.corpus_timeout: int | None = None
         self.df_timeout: int | None = None
+        self.deadlines: list[object | None] = []
         self.corpus_called = False
         self.df_called = False
 
@@ -270,7 +351,9 @@ class _RecordingStore:
         memory_ids: Sequence[MemoryId],
         *,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> list[CandidateRow]:
+        self.deadlines.append(deadline)
         self.fetch_timeout = statement_timeout_ms
         wanted = set(memory_ids)
         return [r for r in self._rows if r.memory_id in wanted]
@@ -281,14 +364,21 @@ class _RecordingStore:
         terms: Sequence[str],
         *,
         statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> dict[str, int]:
+        self.deadlines.append(deadline)
         self.df_called = True
         self.df_timeout = statement_timeout_ms
         return dict.fromkeys(terms, 1)
 
     def corpus_size(
-        self, project_id: ProjectId, *, statement_timeout_ms: int | None = None
+        self,
+        project_id: ProjectId,
+        *,
+        statement_timeout_ms: int | None = None,
+        deadline: object | None = None,
     ) -> int:
+        self.deadlines.append(deadline)
         self.corpus_called = True
         self.corpus_timeout = statement_timeout_ms
         return 1_000
@@ -307,16 +397,22 @@ class _LegacyStore:
         self.df_called = False
 
     def fetch_candidates(
-        self, project_id: ProjectId, memory_ids: Sequence[MemoryId]
+        self,
+        project_id: ProjectId,
+        memory_ids: Sequence[MemoryId],
+        *,
+        deadline: object | None = None,
     ) -> list[CandidateRow]:
         wanted = set(memory_ids)
         return [r for r in self._rows if r.memory_id in wanted]
 
-    def document_frequency(self, project_id: ProjectId, terms: Sequence[str]) -> dict[str, int]:
+    def document_frequency(
+        self, project_id: ProjectId, terms: Sequence[str], *, deadline: object | None = None
+    ) -> dict[str, int]:
         self.df_called = True
         return dict.fromkeys(terms, 1)
 
-    def corpus_size(self, project_id: ProjectId) -> int:
+    def corpus_size(self, project_id: ProjectId, *, deadline: object | None = None) -> int:
         self.corpus_called = True
         return 1_000
 
@@ -328,11 +424,12 @@ def test_run_bounds_all_three_store_calls_by_the_total_budget() -> None:
 
     assembly.run(_scope(), query_text=QUERY, candidates=[_fused(mid)], cfg=_cfg(300))
 
-    # All three round trips happened, and each carried the SAME budget-derived bound.
+    # All three round trips happened under one request-local deadline.  The pool derives the
+    # statement timeout after checkout, so assembly must not freeze a stale integer here.
     assert store.corpus_called and store.df_called
-    assert store.fetch_timeout == 300
-    assert store.corpus_timeout == 300
-    assert store.df_timeout == 300
+    assert store.fetch_timeout is None
+    assert store.corpus_timeout is None
+    assert store.df_timeout is None
 
 
 def test_run_derives_the_bound_from_config_not_a_literal() -> None:
@@ -344,31 +441,105 @@ def test_run_derives_the_bound_from_config_not_a_literal() -> None:
 
     assembly.run(_scope(), query_text=QUERY, candidates=[_fused(mid)], cfg=_cfg(123))
 
-    assert store.fetch_timeout == 123
-    assert store.corpus_timeout == 123
-    assert store.df_timeout == 123
+    assert len(store.deadlines) == 3
+    assert store.deadlines[0] is store.deadlines[1] is store.deadlines[2]
+    assert isinstance(store.deadlines[0], Deadline)
+    assert store.deadlines[0].total_budget_ms == 123
 
 
-def test_run_passes_no_keyword_to_a_store_that_cannot_accept_it() -> None:
-    """The feature-detection: a store without the parameter is called with its original argument
-    list, so bounding the assembly stage never breaks a test double or a driver that predates the
-    bound. A `TypeError` here would mean the keyword was forwarded unconditionally."""
+class _AdvancingRecordingStore(_RecordingStore):
+    def __init__(self, rows: Sequence[CandidateRow], clock: FakeClock) -> None:
+        super().__init__(rows)
+        self._clock = clock
+        self.remaining_before_calls: list[float] = []
+
+    def _record_and_advance(self, deadline: object | None) -> None:
+        assert isinstance(deadline, Deadline)
+        self.remaining_before_calls.append(deadline.remaining_ms())
+        self._clock.advance(ms=10)
+
+    def fetch_candidates(
+        self, *args: object, deadline: object | None = None, **kwargs: object
+    ) -> list[CandidateRow]:
+        self._record_and_advance(deadline)
+        return super().fetch_candidates(*args, deadline=deadline, **kwargs)  # type: ignore[arg-type]
+
+    def corpus_size(self, *args: object, deadline: object | None = None, **kwargs: object) -> int:
+        self._record_and_advance(deadline)
+        return super().corpus_size(*args, deadline=deadline, **kwargs)  # type: ignore[arg-type]
+
+    def document_frequency(
+        self, *args: object, deadline: object | None = None, **kwargs: object
+    ) -> dict[str, int]:
+        self._record_and_advance(deadline)
+        return super().document_frequency(*args, deadline=deadline, **kwargs)  # type: ignore[arg-type]
+
+
+def test_assembly_recomputes_decreasing_remaining_budget_before_each_store_call() -> None:
+    clock = FakeClock(NOW)
+    mid = MemoryId(uuid.UUID(int=1))
+    store = _AdvancingRecordingStore([_row(mid)], clock)
+    deadline = Deadline(clock=clock, total_budget_ms=50, embed_timeout_ms=20)
+
+    CandidateAssembly(store, clock).run(
+        _scope(), query_text=QUERY, candidates=[_fused(mid)], cfg=_cfg(50), deadline=deadline
+    )
+
+    assert store.remaining_before_calls == [50.0, 40.0, 30.0]
+
+
+class _CancelAfterDeadlineStore(_RecordingStore):
+    def __init__(self, rows: Sequence[CandidateRow], clock: FakeClock, *, expire: bool) -> None:
+        super().__init__(rows)
+        self._clock = clock
+        self._expire = expire
+
+    def fetch_candidates(
+        self, *args: object, deadline: object | None = None, **kwargs: object
+    ) -> list[CandidateRow]:
+        if self._expire:
+            self._clock.advance(ms=300)
+        raise QueryCanceled("statement timeout")
+
+
+def test_assembly_maps_query_canceled_only_after_the_shared_deadline_expires() -> None:
+    clock = FakeClock(NOW)
+    mid = MemoryId(uuid.UUID(int=1))
+    deadline = Deadline(clock=clock, total_budget_ms=300, embed_timeout_ms=200)
+    store = _CancelAfterDeadlineStore([_row(mid)], clock, expire=True)
+    with pytest.raises(AssemblyDeadlineExceeded, match="expired retrieval query"):
+        CandidateAssembly(store, clock).run(
+            _scope(), query_text=QUERY, candidates=[_fused(mid)], cfg=_cfg(), deadline=deadline
+        )
+
+
+def test_assembly_preserves_early_query_canceled_as_a_store_error() -> None:
+    clock = FakeClock(NOW)
+    mid = MemoryId(uuid.UUID(int=1))
+    store = _CancelAfterDeadlineStore([_row(mid)], clock, expire=False)
+    with pytest.raises(QueryCanceled):
+        CandidateAssembly(store, clock).run(
+            _scope(), query_text=QUERY, candidates=[_fused(mid)], cfg=_cfg()
+        )
+
+
+def test_run_passes_the_deadline_to_the_explicit_store_port() -> None:
     mid = MemoryId(uuid.UUID(int=1))
     store = _LegacyStore([_row(mid)])
     assembly = CandidateAssembly(store, FakeClock(NOW))
 
     result = assembly.run(_scope(), query_text=QUERY, candidates=[_fused(mid)], cfg=_cfg(300))
 
-    # It ran to completion (no unexpected-keyword TypeError) and still exercised all three reads.
+    # It ran to completion and still exercised all three reads.
     assert store.corpus_called and store.df_called
     assert result.outcome_code is not None
 
 
-def test_the_store_port_advertises_the_optional_bound() -> None:
+def test_the_store_port_advertises_the_deadline() -> None:
     """`CandidateStorePort` — shared with `hotpath.jit` — must carry the optional keyword on all
     three methods, so the production `SearchStore` and the port stay one contract (the parity guard
     in `tests/phase1/test_assembly.py` compares their signatures) and `run` can rely on it."""
     for name in ("fetch_candidates", "document_frequency", "corpus_size"):
         params = inspect.signature(getattr(CandidateStorePort, name)).parameters
-        assert "statement_timeout_ms" in params, name
-        assert params["statement_timeout_ms"].kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert "deadline" in params, name
+        assert params["deadline"].kind is inspect.Parameter.KEYWORD_ONLY, name

@@ -17,6 +17,9 @@ question is exactly the wrong one for a fail-open budget to be answering.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from threading import RLock
+
 from tracebed.domain.clock import Clock
 
 __all__ = ["Deadline"]
@@ -44,7 +47,15 @@ class Deadline:
     call entry pass that reading in; the default keeps the object usable standalone.
     """
 
-    __slots__ = ("_clock", "_started_at_ms", "embed_timeout_ms", "total_budget_ms")
+    __slots__ = (
+        "_clock",
+        "_listeners",
+        "_lock",
+        "_next_listener_id",
+        "_started_at_ms",
+        "embed_timeout_ms",
+        "total_budget_ms",
+    )
 
     def __init__(
         self,
@@ -62,6 +73,38 @@ class Deadline:
         self.total_budget_ms = total_budget_ms
         self.embed_timeout_ms = embed_timeout_ms
         self._started_at_ms = clock.monotonic_ms() if started_at_ms is None else started_at_ms
+        self._lock = RLock()
+        self._listeners: dict[int, Callable[[], None]] = {}
+        self._next_listener_id = 0
+
+    def narrow_total_budget_ms(self, total_budget_ms: int) -> None:
+        """Narrow this request's absolute expiry; never restart its clock."""
+        if total_budget_ms <= 0:
+            raise ValueError("total_budget_ms must be positive")
+        with self._lock:
+            if total_budget_ms >= self.total_budget_ms:
+                return
+            self.total_budget_ms = total_budget_ms
+            listeners = tuple(self._listeners.values())
+        for listener in listeners:
+            listener()
+
+    def add_narrow_listener(self, listener: Callable[[], None]) -> int:
+        """Subscribe this request's waiter to a future absolute-expiry narrowing.
+
+        The returned token is request-local and must be removed when the waiter
+        stops. A listener may run on the narrowing worker thread.
+        """
+        with self._lock:
+            token = self._next_listener_id
+            self._next_listener_id += 1
+            self._listeners[token] = listener
+            return token
+
+    def remove_narrow_listener(self, token: int) -> None:
+        """Stop a request-local narrowing notification safely and idempotently."""
+        with self._lock:
+            self._listeners.pop(token, None)
 
     def elapsed_ms(self) -> float:
         """Monotonic milliseconds since this `Deadline` was constructed."""
@@ -71,6 +114,10 @@ class Deadline:
         """`total_budget_ms` minus elapsed time. May be negative once exceeded —
         callers compare against 0 via `total_exceeded()` rather than re-deriving it."""
         return self.total_budget_ms - self.elapsed_ms()
+
+    def expires_at_ms(self) -> float:
+        """Absolute monotonic expiry for collaborators that wait asynchronously."""
+        return self._started_at_ms + float(self.total_budget_ms)
 
     def total_exceeded(self) -> bool:
         """True once the total retrieval budget (PLAN.md §2 invariant 2's second

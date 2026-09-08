@@ -52,6 +52,7 @@ def hair_trigger_thread_switching() -> Iterator[None]:
     finally:
         sys.setswitchinterval(previous)
 
+
 # Fixture-only knobs. `workflow.prefetch` itself has no defaults for these (PLAN.md §6
 # defines no `prefetch` section, so the module refuses to invent one); every test states
 # what it needs. `_LONG_MS` is "longer than any test's wall-clock duration", i.e. the
@@ -73,13 +74,20 @@ class _CountingRetriever:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.deadlines: list[object | None] = []
         self._lock = threading.Lock()
 
     def retrieve(
-        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig
+        self,
+        project_id: ProjectId,
+        query_text: str,
+        *,
+        cfg: RetrievalConfig,
+        deadline: object | None = None,
     ) -> _Outcome:
         with self._lock:
             self.calls.append((str(project_id), query_text))
+            self.deadlines.append(deadline)
         return _Outcome(label=f"{project_id}:{query_text}:{cfg.rrf_k}")
 
 
@@ -95,7 +103,12 @@ class _VersionedRetriever:
         self._lock = threading.Lock()
 
     def retrieve(
-        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig
+        self,
+        project_id: ProjectId,
+        query_text: str,
+        *,
+        cfg: RetrievalConfig,
+        deadline: object | None = None,
     ) -> _Outcome:
         with self._lock:
             self.calls += 1
@@ -114,7 +127,12 @@ class _BlockOnFirstCallRetriever:
         self.calls = 0
 
     def retrieve(
-        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig
+        self,
+        project_id: ProjectId,
+        query_text: str,
+        *,
+        cfg: RetrievalConfig,
+        deadline: object | None = None,
     ) -> _Outcome:
         self.calls += 1
         if self.calls == 1:
@@ -132,7 +150,12 @@ class _FlakyOnceRetriever:
         self.calls = 0
 
     def retrieve(
-        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig
+        self,
+        project_id: ProjectId,
+        query_text: str,
+        *,
+        cfg: RetrievalConfig,
+        deadline: object | None = None,
     ) -> _Outcome:
         self.calls += 1
         if self.calls == 1:
@@ -149,7 +172,12 @@ class _SleepingRetriever:
         self.calls = 0
 
     def retrieve(
-        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig
+        self,
+        project_id: ProjectId,
+        query_text: str,
+        *,
+        cfg: RetrievalConfig,
+        deadline: object | None = None,
     ) -> _Outcome:
         self.calls += 1
         time.sleep(self._latency_s)
@@ -242,6 +270,17 @@ def test_no_prefetch_falls_through_to_an_ordinary_call() -> None:
     assert len(inner.calls) == 1
 
 
+def test_cold_prefetch_wrapper_forwards_the_callers_deadline() -> None:
+    inner = _CountingRetriever()
+    pref: PrefetchingRetriever[_Outcome] = _pref(inner)
+    deadline = object()
+    try:
+        pref.retrieve(_project(), "q", cfg=_cfg(), deadline=deadline)  # type: ignore[arg-type]
+        assert inner.deadlines == [deadline]
+    finally:
+        pref.close()
+
+
 def test_a_warm_entry_is_never_served_to_another_project() -> None:
     """Invariant 4 on the newest cache in the codebase. A prefetch warmed under project
     A must be invisible to project B even for a byte-identical query and config: the
@@ -316,7 +355,10 @@ def test_fingerprint_covers_every_parameter_of_the_retriever_port() -> None:
     hits that ignore it."""
     from tracebed.hotpath.pipeline import HybridRetrieverPort
 
-    port_params = set(inspect.signature(HybridRetrieverPort.retrieve).parameters) - {"self"}
+    port_params = set(inspect.signature(HybridRetrieverPort.retrieve).parameters) - {
+        "self",
+        "deadline",
+    }
     assert port_params == {"project_id", "query_text", "cfg"}
 
     # Each parameter, varied alone, must produce a different key.
@@ -352,7 +394,9 @@ def test_not_yet_ready_falls_through_without_waiting_on_the_pending_future() -> 
         result = pref.retrieve(project_id, "q", cfg=cfg)
         elapsed = time.monotonic() - start
 
-        assert elapsed < 0.2, f"retrieve() waited on a still-running prefetch: {elapsed * 1000:.1f}ms"
+        assert elapsed < 0.2, (
+            f"retrieve() waited on a still-running prefetch: {elapsed * 1000:.1f}ms"
+        )
         assert result.label == "fast-call-result"
         assert inner.calls == 2
     finally:

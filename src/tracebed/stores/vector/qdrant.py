@@ -16,7 +16,7 @@ self-contained "off by default" fact this chunk owns and its tests assert direct
 into `EffectiveConfig`/`StorageConfig` is reported for whichever future chunk owns that file.
 
 CONTRACT GAP (client surface): `QdrantClientPort` is modelled on `qdrant_client.QdrantClient`'s
-`search`/`upsert`/`delete` signatures. `qdrant-client` is not installed in this environment, so
+`search`/`upsert` signatures. `qdrant-client` is not installed in this environment, so
 that shape is asserted against a fake, never against the real package — any deployment enabling
 this driver must run the port's contract tests against the pinned client version first.
 
@@ -30,9 +30,9 @@ driver." Concretely, in this module:
      (`project_id`, `memory_id`) together (`_point_id`), because a Qdrant point id is unique
      per COLLECTION and not per filter: two projects reusing one `memory_id` would otherwise
      overwrite each other's vector on upsert, which no read-side filter can undo.
-  2. Every search/delete attaches a `must`-filter on `project_id` (`_project_condition`) built
-     from that call's own `project_id` argument -- there is no method on this class, and no
-     keyword argument on any method, that can issue a search or delete without that filter.
+  2. Every search attaches a `must`-filter on `project_id` (`_project_condition`) built from
+     that call's own `project_id` argument.  Destructive work is absent from this hot-path
+     driver and belongs to the E3-only erasure adapter.
   3. Every result is re-checked on the way OUT (`_result_to_arm_hit`): if a point whose payload
      `project_id` disagrees with the query's `project_id` is ever returned (a driver bug, a
      stale index, an operator who queried the wrong collection), `QdrantScopeViolation` is
@@ -75,11 +75,13 @@ from tracebed.domain.enums import TrustTier
 from tracebed.domain.errors import TracebedError
 from tracebed.domain.ids import MemoryId, ProjectId
 from tracebed.domain.state_machine import Status
+from tracebed.stores.pg.pool import RemainingBudget
 from tracebed.stores.pg.search import ArmHit, assert_dynamically_retrievable
 
 __all__ = [
     "DEFAULT_ENABLED",
     "QdrantClientPort",
+    "QdrantDeadlineUnsupported",
     "QdrantPayloadInvalid",
     "QdrantScopeViolation",
     "QdrantUnavailable",
@@ -109,6 +111,10 @@ class QdrantUnavailable(TracebedError):
     a missing optional dependency must fail deployment wiring, not the hot path's first
     retrieval (same discipline as `OnnxRuntimeUnavailable`).
     """
+
+
+class QdrantDeadlineUnsupported(TracebedError):
+    """Qdrant's client port has no verified request-timeout mechanism for a shared deadline."""
 
 
 class QdrantScopeViolation(TracebedError):
@@ -148,8 +154,6 @@ class QdrantClientPort(Protocol):
 
     def upsert(self, collection_name: str, points: Sequence[Mapping[str, Any]]) -> Any: ...
 
-    def delete(self, collection_name: str, points_selector: Mapping[str, Any]) -> Any: ...
-
 
 def _project_condition(project_id: ProjectId) -> dict[str, Any]:
     """The ONE project-scope condition every search/delete call carries -- built from
@@ -183,18 +187,6 @@ def _retrievable_condition() -> dict[str, Any]:
 def _search_filter(project_id: ProjectId) -> dict[str, Any]:
     """Project scope AND retrievability -- the filter every READ carries."""
     return {"must": [_project_condition(project_id), _retrievable_condition()]}
-
-
-def _erasure_filter(project_id: ProjectId) -> dict[str, Any]:
-    """Project scope ONLY -- the filter every DELETE carries.
-
-    Deliberately NOT `_search_filter`: erasure must remove every point of the project,
-    including the quarantined/retired/tombstoned ones a read must never surface. A delete
-    narrowed by the retrievability condition would leave exactly the vectors an erasure exists
-    to destroy (`stores.pg.partitions.drop_project`, the pgvector driver's own delete path,
-    drops the whole partition for the same reason).
-    """
-    return {"must": [_project_condition(project_id)]}
 
 
 def _point_id(project_id: ProjectId, memory_id: MemoryId) -> str:
@@ -358,6 +350,7 @@ class QdrantVectorStore:
         hnsw_iterative_scan: bool,
         hnsw_max_scan_tuples: int,
         statement_timeout_ms: int | None = None,
+        deadline: RemainingBudget | None = None,
     ) -> list[ArmHit]:
         # Qdrant's own ANN tuning is `hnsw_ef` / exact-search flags, not pgvector's iterative-
         # scan GUCs -- accepted (per VectorStorePort's contract) and deliberately unused here
@@ -372,6 +365,11 @@ class QdrantVectorStore:
         # strength of an API this environment cannot exercise (no Qdrant here) would be a claim
         # rather than a mechanism. The pgvector driver is the shipped default; this is a gap in
         # the alternative driver, named where a reader of it will meet it.
+        if deadline is not None:
+            raise QdrantDeadlineUnsupported(
+                "Qdrant ann_search cannot honor a shared retrieval deadline; use the pgvector "
+                "driver or add a bounded Qdrant client adapter"
+            )
         del hnsw_iterative_scan, hnsw_max_scan_tuples, statement_timeout_ms
         if top_n <= 0 or not embedding:
             return []
@@ -402,12 +400,3 @@ class QdrantVectorStore:
             status=status,
         )
         self._client.upsert(collection_name=self._collection, points=[point])
-
-    def delete_by_project(self, project_id: ProjectId) -> None:
-        # `{"filter": ...}` (Qdrant's `FilterSelector` shape), not a bare filter: the delete
-        # endpoint's selector is a union of "these ids" and "everything matching this filter",
-        # and the bare filter is neither arm of it.
-        self._client.delete(
-            collection_name=self._collection,
-            points_selector={"filter": _erasure_filter(project_id)},
-        )

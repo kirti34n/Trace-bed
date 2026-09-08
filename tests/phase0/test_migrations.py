@@ -25,8 +25,15 @@ Two halves:
 from __future__ import annotations
 
 import re
+import threading
+import time
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 import pytest
 
@@ -41,7 +48,18 @@ MIGRATION_IDS = (
     "0004_lifecycle",
     "0005_bm25",
     "0006_q_update_ledger",
+    "0007_project_provisioning",
+    "0008_trace_learning_job",
+    "0009_trace_index_terminal_freeze",
+    "0010_authority_foundation",
+    "0011_authority_cutover",
+    "0012_erasure_saga",
+    "0013_erasure_deployment",
 )
+
+# E4 is deliberately controller-applied from closed c12; ordinary migration
+# bootstrap stops at the accepted c12 boundary.
+BOOTSTRAP_MIGRATION_IDS = MIGRATION_IDS[:-1]
 
 REGISTRY_TABLES = (
     "project",
@@ -70,6 +88,536 @@ _PARTITIONED_TABLES = (
     "spend_ledger",
     "review_queue",
 )
+
+
+def test_yoyo_connection_rejects_caller_options_before_backend_selection() -> None:
+    """The wrapper never forwards or normalizes caller option/search-path smuggling."""
+
+    from tracebed.stores.pg.migrate import _yoyo_dsn
+
+    with pytest.raises(ValueError, match="PostgreSQL URL DSN"):
+        _yoyo_dsn(
+            "postgresql://owner:secret@db.example/tracebed?"
+            "options=-c%20tracebed.cluster_scope%3Ddedicated%20-c%20search_path%3Dhostile%2Cpublic"
+        )
+
+
+def test_yoyo_connection_recomposes_exact_authority_receipts_with_atomic_guard() -> None:
+    """Bootstrap receipts preserve an ordinary transport URL through yoyo rewrite."""
+
+    from psycopg.conninfo import conninfo_to_dict
+
+    from tracebed.stores.pg import bootstrap
+    from tracebed.stores.pg.migrate import _yoyo_dsn
+
+    bootstrap_dsn = bootstrap._dedicated_cluster_dsn(
+        "postgresql://owner:secret@db.example:5432/tracebed?sslmode=require",
+        "dedicated",
+        ingress_quarantined=True,
+    )
+    dsn = _yoyo_dsn(bootstrap_dsn)
+    parsed = urlsplit(dsn)
+    options = [value for key, value in parse_qsl(parsed.query) if key == "options"]
+    assert options == [
+        "-c tracebed.cluster_scope=dedicated -c tracebed.ingress_quarantined=on "
+        "-c tracebed.atomic_migration_runner=on -c search_path=public,pg_catalog"
+    ]
+    assert dict(parse_qsl(parsed.query))["sslmode"] == "require"
+    # yoyo's backend selector requires ``postgresql+psycopg``. Changing it
+    # back for libpq parsing proves that its URL authority/path and preserved
+    # transport query resolve exactly the same endpoint and identity.
+    yoyo_libpq_view = "postgresql://" + dsn.removeprefix("postgresql+psycopg://")
+    bootstrap_view = conninfo_to_dict(bootstrap_dsn)
+    yoyo_view = conninfo_to_dict(yoyo_libpq_view)
+    assert {key: bootstrap_view.get(key) for key in ("user", "password", "host", "port", "dbname")} == {
+        key: yoyo_view.get(key) for key in ("user", "password", "host", "port", "dbname")
+    }
+    assert bootstrap_view.get("sslmode") == yoyo_view.get("sslmode") == "require"
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    (
+        "postgresql://owner:secret@db.example:5432/tracebed?sslmode=require",
+        "postgresql://owner:secret@127.0.0.1:5432/tracebed",
+        "postgresql://owner%2Dname:sec%2Dret@db.example:5432/tracebed?sslmode=require",
+        "postgresql://owner:secret@[::1]:5432/tracebed?sslmode=require",
+    ),
+    ids=("hostname-ssl", "ipv4", "escaped-user-password", "ipv6"),
+)
+def test_authority_url_coordinates_are_identical_for_psycopg_and_yoyo(dsn: str) -> None:
+    """The shared fence admits only URL coordinates both clients resolve identically."""
+
+    from psycopg.conninfo import conninfo_to_dict
+    from yoyo.connections import parse_uri
+
+    from tracebed.stores.pg.authority_dsn import authority_migration_coordinates
+
+    expected = authority_migration_coordinates(dsn)
+    libpq = conninfo_to_dict(dsn)
+    yoyo = parse_uri("postgresql+psycopg://" + dsn.removeprefix("postgresql://"))
+    libpq_coordinates = (
+        libpq.get("user"),
+        libpq.get("password"),
+        libpq.get("host"),
+        int(libpq["port"]) if libpq.get("port") else None,
+        libpq.get("dbname"),
+    )
+    yoyo_coordinates = (yoyo.username, yoyo.password, yoyo.hostname, yoyo.port, yoyo.database)
+
+    assert expected == libpq_coordinates == yoyo_coordinates
+
+
+def test_migration_runner_rejects_keyword_conninfo_before_backend_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The URI-only yoyo backend contract fails before it can open a connection."""
+
+    from tracebed.stores.pg import migrate
+
+    def unexpected_backend(_dsn: str) -> object:
+        raise AssertionError("keyword conninfo reached yoyo backend selection")
+
+    monkeypatch.setattr(migrate, "get_backend", unexpected_backend)
+    with pytest.raises(ValueError, match="PostgreSQL URL DSN"):
+        migrate.apply_migrations("dbname=owner user=tracebed_owner host=localhost")
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    (
+        "postgresql://owner:secret@db.example:5432/tracebed?user=shadow",
+        "postgresql://owner:secret@db.example:5432/tracebed?PASSWORD=shadow",
+        "postgresql://owner:secret@db.example:5432/tracebed?host=shadow",
+        "postgresql://owner:secret@db.example:5432/tracebed?hostaddr=127.0.0.2",
+        "postgresql://owner:secret@db.example:5432/tracebed?port=6432",
+        "postgresql://owner:secret@db.example:5432/tracebed?dbname=shadow",
+        "postgresql://owner:secret@db.example:5432/tracebed?database=shadow",
+        "postgresql://owner:secret@db.example:5432/tracebed?service=shadow",
+        "postgresql://owner:secret@db.example:5432/tracebed?servicefile=/tmp/rogue",
+        "postgresql://owner:secret@db.example:5432/tracebed?passfile=/tmp/rogue",
+        "postgresql://owner:secret@db.example:5432/tracebed?%75ser=shadow",
+        "postgresql://owner:secret@db.example:5432/tracebed?sslmode=require&SSLMODE=disable",
+        "postgresql://owner:secret@db.example:5432/tracebed?options=-c%20search_path%3Drogue",
+        "postgresql://owner:secret@primary,standby:5432/tracebed",
+        "postgresql://owner:secret@primary%2Cstandby:5432/tracebed",
+        "postgresql://owner:secret@primary%2cstandby:5432/tracebed",
+        "postgresql://owner:secret@primary%252Cstandby:5432/tracebed",
+        "postgresql://owner:secret@db%2Eexample:5432/tracebed",
+        "postgresql://owner:secret@db.example:5432/trace,bed",
+        "postgresql://owner:secret@db.example:5432/trace%2Fbed",
+        "postgresql://owner:secret@db.example:5432/trace%252Fbed",
+        "postgresql://owner:secret@db.example:/tracebed",
+        "postgresql://owner@shadow@db.example:5432/tracebed",
+    ),
+    ids=(
+        "query-user",
+        "query-password-case",
+        "query-host",
+        "query-hostaddr",
+        "query-port",
+        "query-dbname",
+        "query-database",
+        "query-service",
+        "query-servicefile",
+        "query-passfile",
+        "query-percent-user",
+        "query-duplicate-transport-key",
+        "query-options",
+        "raw-multi-host",
+        "encoded-multi-host-uppercase",
+        "encoded-multi-host-lowercase",
+        "double-encoded-multi-host",
+        "encoded-host-dot",
+        "raw-database-comma",
+        "encoded-database-separator",
+        "double-encoded-database-separator",
+        "empty-port",
+        "ambiguous-user",
+    ),
+)
+@pytest.mark.parametrize("operation", ("apply", "rollback"))
+def test_migration_runner_rejects_ambiguous_url_before_backend_access(
+    monkeypatch: pytest.MonkeyPatch, dsn: str, operation: str
+) -> None:
+    """Neither supported mutation direction may resolve conflicting URL coordinates."""
+
+    from tracebed.stores.pg import migrate
+
+    def unexpected_backend(_dsn: str) -> object:
+        raise AssertionError("ambiguous URL reached yoyo backend selection")
+
+    monkeypatch.setattr(migrate, "get_backend", unexpected_backend)
+    runner = migrate.apply_migrations if operation == "apply" else migrate.rollback_migrations
+    with pytest.raises(ValueError, match="PostgreSQL URL DSN"):
+        runner(dsn)
+
+
+def test_tracebed_apply_uses_one_backend_transaction_not_yoyo_native_copy_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The supported API never delegates an apply to yoyo's split path."""
+
+    from tracebed.stores.pg import migrate
+
+    class FakeMigration:
+        use_transactions = True
+
+        def __init__(self, migration_id: str, migration_hash: str, depends: set[object]) -> None:
+            self.id = migration_id
+            self.hash = migration_hash
+            self.depends = depends
+
+        def load(self) -> None:
+            return None
+
+        def process_steps(self, backend: object, direction: str) -> None:
+            assert backend is fake_backend
+            assert direction == "apply"
+            fake_backend.events.append(f"apply-sql:{self.id}")
+
+    class FakeBackend:
+        has_transactional_ddl = True
+
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        @contextmanager
+        def lock(self) -> Iterator[None]:
+            self.events.append("lock")
+            yield
+
+        @contextmanager
+        def transaction(self) -> Iterator[None]:
+            self.events.append("begin")
+            try:
+                yield
+            except BaseException:
+                self.events.append("rollback")
+                raise
+            else:
+                self.events.append("commit")
+
+        def ensure_internal_schema_updated(self) -> None:
+            self.events.append("ensure")
+
+        def to_apply(self, _migrations: object) -> list[FakeMigration]:
+            self.events.append("select-target")
+            return [first, second]
+
+        def log_migration(self, received: FakeMigration, operation: str) -> None:
+            assert operation == "apply"
+            self.events.append(f"log:{received.id}")
+
+        def mark_one(self, received: FakeMigration, *, log: bool) -> None:
+            assert log is False
+            self.events.append(f"mark:{received.id}")
+
+        def apply_migrations(self, _targets: object) -> None:
+            raise AssertionError("native yoyo apply path must not be called")
+
+        def apply_one(self, _target: object) -> None:
+            raise AssertionError("native yoyo apply-one path must not be called")
+
+        def copy(self) -> object:
+            raise AssertionError("atomic apply must not open yoyo's copied backend")
+
+    first = FakeMigration("0001_registries", "first-hash", set())
+    second = FakeMigration("0002_partitioned", "second-hash", {first})
+    fake_backend = FakeBackend()
+    monkeypatch.setattr(migrate, "get_backend", lambda _dsn: fake_backend)
+    monkeypatch.setattr(migrate, "read_all_migrations", lambda: [first, second])
+    monkeypatch.setattr(migrate, "version", lambda _distribution: "9.0.0")
+
+    assert migrate.apply_migrations("postgresql://owner@db.example/tracebed") == [
+        "0001_registries",
+        "0002_partitioned",
+    ]
+    assert fake_backend.events == [
+        "lock",
+        "ensure",
+        "select-target",
+        "begin",
+        "apply-sql:0001_registries",
+        "log:0001_registries",
+        "mark:0001_registries",
+        "commit",
+        "begin",
+        "apply-sql:0002_partitioned",
+        "log:0002_partitioned",
+        "mark:0002_partitioned",
+        "commit",
+    ]
+
+
+def test_tracebed_apply_through_does_not_skip_to_later_pending_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already/non-pending target cannot expand a bounded reference apply."""
+
+    from tracebed.stores.pg import migrate
+
+    class FakeMigration:
+        use_transactions = True
+
+        def __init__(self, migration_id: str) -> None:
+            self.id = migration_id
+            self.hash = f"{migration_id}-hash"
+            self.depends: set[object] = set()
+
+        def load(self) -> None:
+            return None
+
+        def process_steps(self, _backend: object, _direction: str) -> None:
+            raise AssertionError("no migration before the bounded target may run")
+
+    class FakeBackend:
+        has_transactional_ddl = True
+
+        @contextmanager
+        def lock(self) -> Iterator[None]:
+            yield
+
+        def ensure_internal_schema_updated(self) -> None:
+            return None
+
+        def to_apply(self, _migrations: object) -> list[FakeMigration]:
+            return [later]
+
+    target = FakeMigration("0001_registries")
+    later = FakeMigration("0002_partitioned")
+    fake_backend = FakeBackend()
+    monkeypatch.setattr(migrate, "get_backend", lambda _dsn: fake_backend)
+    monkeypatch.setattr(migrate, "read_all_migrations", lambda: [target, later])
+
+    assert migrate.apply_migrations("postgresql://owner@db.example/tracebed", through=target.id) == []
+
+
+def test_tracebed_rollback_uses_one_backend_transaction_not_yoyo_native_copy_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The supported API never delegates a protected rollback to yoyo's split path."""
+
+    from tracebed.stores.pg import migrate
+
+    class FakeMigration:
+        id = "0011_authority_cutover"
+        hash = "expected-hash"
+        use_transactions = True
+
+        def load(self) -> None:
+            return None
+
+        def process_steps(self, backend: object, direction: str) -> None:
+            assert backend is fake_backend
+            assert direction == "rollback"
+            fake_backend.events.append("rollback-sql")
+
+    class FakeBackend:
+        has_transactional_ddl = True
+
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        @contextmanager
+        def lock(self) -> Iterator[None]:
+            self.events.append("lock")
+            yield
+
+        @contextmanager
+        def transaction(self) -> Iterator[None]:
+            self.events.append("begin")
+            try:
+                yield
+            except BaseException:
+                self.events.append("rollback")
+                raise
+            else:
+                self.events.append("commit")
+
+        def ensure_internal_schema_updated(self) -> None:
+            self.events.append("ensure")
+
+        def to_rollback(self, _migrations: object) -> list[FakeMigration]:
+            self.events.append("select-target")
+            return [migration]
+
+        def log_migration(self, received: FakeMigration, operation: str) -> None:
+            assert received is migration and operation == "rollback"
+            self.events.append("log")
+
+        def unmark_one(self, received: FakeMigration, *, log: bool) -> None:
+            assert received is migration and log is False
+            self.events.append("unmark")
+
+        def rollback_migrations(self, _targets: object) -> None:
+            raise AssertionError("native yoyo rollback path must not be called")
+
+        def copy(self) -> object:
+            raise AssertionError("atomic rollback must not open yoyo's copied backend")
+
+    migration = FakeMigration()
+    fake_backend = FakeBackend()
+    monkeypatch.setattr(migrate, "get_backend", lambda _dsn: fake_backend)
+    monkeypatch.setattr(migrate, "read_all_migrations", lambda: [migration])
+    monkeypatch.setattr(migrate, "version", lambda _distribution: "9.0.0")
+
+    assert migrate.rollback_migrations("postgresql://owner@db.example/tracebed") == [
+        "0011_authority_cutover"
+    ]
+    assert fake_backend.events == [
+        "lock",
+        "ensure",
+        "select-target",
+        "begin",
+        "rollback-sql",
+        "log",
+        "unmark",
+        "commit",
+    ]
+
+
+def test_tracebed_atomic_rollback_fails_closed_for_a_nontransactional_or_unpinned_yoyo_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The narrow yoyo-9 internals dependency cannot silently widen on upgrade."""
+
+    from tracebed.stores.pg import migrate
+
+    class FakeMigration:
+        id = "0011_authority_cutover"
+        hash = "expected-hash"
+        use_transactions = True
+
+        def load(self) -> None:
+            return None
+
+        def process_steps(self, _backend: object, _direction: str) -> None:
+            raise AssertionError("must not execute with an unpinned yoyo contract")
+
+    class FakeBackend:
+        has_transactional_ddl = True
+
+        @contextmanager
+        def transaction(self) -> Iterator[None]:
+            yield
+
+        def log_migration(self, _migration: object, _operation: str) -> None:
+            raise AssertionError("must not log with an unpinned yoyo contract")
+
+        def unmark_one(self, _migration: object, *, log: bool) -> None:
+            raise AssertionError("must not unmark with an unpinned yoyo contract")
+
+    migration = FakeMigration()
+    monkeypatch.setattr(migrate, "version", lambda _distribution: "9.0.1")
+    with pytest.raises(RuntimeError, match=r"yoyo-migrations 9\.0\.0"):
+        migrate._rollback_migration_atomically(FakeBackend(), migration, {migration.id: migration})
+
+    monkeypatch.setattr(migrate, "version", lambda _distribution: "9.0.0")
+    with pytest.raises(RuntimeError, match="target is not a packaged migration object"):
+        migrate._rollback_migration_atomically(FakeBackend(), migration, {})
+
+    migration.use_transactions = False
+    with pytest.raises(RuntimeError, match="requires transactional migrations"):
+        migrate._rollback_migration_atomically(
+            FakeBackend(), migration, {migration.id: migration}
+        )
+
+
+class TestProjectProvisioningMigration:
+    def test_paired_hashes_and_partial_idempotency_index(self) -> None:
+        forward = _strip_sql_comments(_read("0007_project_provisioning.sql"))
+        assert "ADD COLUMN provisioning_key_hash text" in forward
+        assert "ADD COLUMN provisioning_request_hash text" in forward
+        assert "project_provisioning_hashes_paired" in forward
+        assert "provisioning_key_hash IS NULL AND provisioning_request_hash IS NULL" in forward
+        assert "provisioning_key_hash IS NOT NULL AND provisioning_request_hash IS NOT NULL" in forward
+        assert re.search(
+            r"CREATE UNIQUE INDEX project_provisioning_key_hash_unique.*"
+            r"WHERE provisioning_key_hash IS NOT NULL",
+            forward,
+            re.DOTALL,
+        )
+
+    def test_rollback_removes_only_provisioning_schema(self) -> None:
+        rollback = _strip_sql_comments(_read("0007_project_provisioning.rollback.sql"))
+        assert "DROP INDEX IF EXISTS project_provisioning_key_hash_unique" in rollback
+        assert "DROP CONSTRAINT IF EXISTS project_provisioning_hashes_paired" in rollback
+        assert "DROP COLUMN IF EXISTS provisioning_key_hash" in rollback
+        assert "DROP COLUMN IF EXISTS provisioning_request_hash" in rollback
+
+
+class TestTraceLearningJobMigration:
+    def test_durable_job_parent_has_exact_identity_and_state_guards(self) -> None:
+        from tracebed.domain.config import MAX_QUEUE_ATTEMPTS
+
+        forward = _strip_sql_comments(_read("0008_trace_learning_job.sql"))
+        block = _table_block(forward, "trace_learning_job")
+        assert re.search(
+            r"PRIMARY KEY\s*\(\s*project_id\s*,\s*run_id\s*,\s*pipeline\s*,\s*pipeline_version\s*\)",
+            block,
+            re.IGNORECASE,
+        )
+        assert re.search(r"trace_ended_at\s+timestamptz\s+NOT NULL", block, re.IGNORECASE)
+        assert re.search(r"pipeline\s+~\s+'\^\[a-z\]\[a-z0-9_\]\{0,31\}\$'", block)
+        assert "pipeline_version >= 1" in block
+        assert "'pending', 'running', 'retry', 'succeeded', 'skipped', 'dead'" in block
+        assert f"max_attempts BETWEEN 1 AND {MAX_QUEUE_ATTEMPTS}" in block
+        assert "PARTITION BY LIST (project_id)" in block
+
+    def test_null_sensitive_receipt_lease_and_attempt_guards_are_explicit(self) -> None:
+        block = _table_block(_strip_sql_comments(_read("0008_trace_learning_job.sql")), "trace_learning_job")
+        normalised = " ".join(block.split())
+        # SQL CHECK passes UNKNOWN: each required value must therefore be tested
+        # explicitly, rather than relying only on octet_length(NULL) = NULL.
+        assert "result_digest IS NOT NULL AND octet_length(result_digest) = 32" in normalised
+        assert "trace_digest IS NOT NULL AND octet_length(trace_digest) = 32" in normalised
+        assert "state <> 'running' AND lease_token IS NULL AND lease_owner IS NULL AND lease_expires_at IS NULL" in normalised
+        assert "state = 'pending' AND attempts = 0" in normalised
+        assert "state = 'retry' AND attempts >= 1 AND attempts < max_attempts" in normalised
+        assert "state = 'skipped' AND skip_code IS NOT NULL" in normalised
+        assert "state <> 'skipped' AND skip_code IS NULL" in normalised
+        assert "state IN ('retry', 'dead') AND last_error_code IS NOT NULL" in normalised
+        assert "state NOT IN ('retry', 'dead') AND last_error_code IS NULL" in normalised
+
+    def test_parent_rls_trigger_and_rollback_are_complete(self) -> None:
+        forward = _strip_sql_comments(_read("0008_trace_learning_job.sql"))
+        assert "ALTER TABLE trace_learning_job ENABLE ROW LEVEL SECURITY" in forward
+        assert "ALTER TABLE trace_learning_job FORCE ROW LEVEL SECURITY" in forward
+        assert "CREATE POLICY trace_learning_job_isolation" in forward
+        assert "NULLIF(current_setting('tracebed.project_id', true), '')::uuid" in forward
+        assert "REVOKE DELETE ON trace_learning_job FROM tracebed_app" in forward
+        assert "GRANT SELECT, INSERT, UPDATE ON trace_learning_job TO tracebed_app" in forward
+        assert "trace_learning_job_enforce_transition" in forward
+        assert "trace learning job trace_digest is write-once" in forward
+        assert "trace learning job first_started_at is write-once" in forward
+        assert "trace learning job attempts advance only on claim" in forward
+        assert "TG_OP = 'INSERT'" in forward
+        assert "TG_OP = 'DELETE'" in forward
+        assert "insert must be a pristine pending schedule row" in forward
+        assert "BEFORE INSERT OR UPDATE OR DELETE" in forward
+        rollback = _strip_sql_comments(_read("0008_trace_learning_job.rollback.sql"))
+        assert "DROP TABLE IF EXISTS trace_learning_job CASCADE" in rollback
+        assert "DROP FUNCTION IF EXISTS trace_learning_job_enforce_transition" in rollback
+
+
+class TestTraceIndexTerminalFreezeMigration:
+    def test_parent_trigger_and_app_delete_repair_are_explicit(self) -> None:
+        forward = _strip_sql_comments(_read("0009_trace_index_terminal_freeze.sql"))
+        assert "CREATE FUNCTION trace_index_enforce_terminal_immutability" in forward
+        assert "BEFORE UPDATE OR DELETE ON trace_index" in forward
+        assert "OLD.outcome_status IN ('ok', 'error', 'cancelled')" in forward
+        assert "REVOKE DELETE ON trace_index FROM tracebed_app" in forward
+        assert "GRANT SELECT, INSERT, UPDATE ON trace_index TO tracebed_app" in forward
+        assert "FROM pg_inherits" in forward
+        assert "REVOKE DELETE ON TABLE %s FROM tracebed_app" in forward
+
+    def test_rollback_removes_guard_and_restores_prior_delete_grant(self) -> None:
+        rollback = _strip_sql_comments(_read("0009_trace_index_terminal_freeze.rollback.sql"))
+        assert "DROP TRIGGER IF EXISTS trace_index_terminal_immutability_guard ON trace_index" in rollback
+        assert "DROP FUNCTION IF EXISTS trace_index_enforce_terminal_immutability" in rollback
+        assert "GRANT DELETE ON trace_index TO tracebed_app" in rollback
+        assert "GRANT DELETE ON TABLE %s TO tracebed_app" in rollback
 
 
 def _read(name: str) -> str:
@@ -343,7 +891,7 @@ class TestRlsStructure:
         """A missing GUC must yield zero rows, never an error a caller could
         catch and route around (contract C-09, PHASE-0 Task 6's proving
         test). `missing_ok=true` covers "unset"; `NULLIF(..., '')` covers
-        "preset to empty", which is what docker/initdb/01-roles.sql's
+        "preset to empty", which is what the current owner bootstrap's
         `ALTER DATABASE ... SET tracebed.project_id TO ''` actually produces
         — and where a bare `''::uuid` raises on every row of every query."""
         sql = _read("0003_rls.sql")
@@ -377,7 +925,7 @@ class TestRlsStructure:
 
     def test_migration_ships_no_credential(self) -> None:
         """A password in a migration is a checked-in secret AND a second
-        source of truth for a credential docker/initdb/01-roles.sql already
+        source of truth for a credential the deployment bootstrap already
         owns — the two silently disagreed before this assertion existed."""
         sql = _strip_sql_comments(_read("0003_rls.sql"))
         assert not re.search(r"\bPASSWORD\b\s*'", sql, re.IGNORECASE)
@@ -396,7 +944,14 @@ class TestRlsStructure:
 # Integration: apply against a live PG18
 # --------------------------------------------------------------------------- #
 
-_ALL_MIGRATION_TABLES = REGISTRY_TABLES + _PARTITIONED_TABLES + ("work_queue", "dead_letter")
+_ALL_MIGRATION_TABLES = REGISTRY_TABLES + _PARTITIONED_TABLES + (
+    "trace_learning_job",
+    "principal_grant",
+    "run_owner",
+    "authority_cutover_state",
+    "work_queue",
+    "dead_letter",
+)
 
 
 def _existing_tables(conn: Any) -> set[str]:
@@ -420,7 +975,7 @@ class TestMigrationsIntegration:
 
         apply_migrations(pg_dsn)
         applied = set(current_revision(pg_dsn))
-        assert applied == set(MIGRATION_IDS)
+        assert applied == set(BOOTSTRAP_MIGRATION_IDS)
 
         with pg_pool.connection() as conn:
             present = _existing_tables(conn)
@@ -475,6 +1030,555 @@ class TestMigrationsIntegration:
             )
             owned = {row[0] for row in cur.fetchall()}
         assert not owned, f"tracebed_app owns tables: {sorted(owned)}"
+
+    def test_trace_learning_job_rejects_partial_or_null_sensitive_shapes(
+        self, pg_pool: Any, two_projects: tuple[Any, Any]
+    ) -> None:
+        """CHECK's three-valued logic must not admit malformed durable jobs.
+
+        The SQL-text assertions above catch accidental removal of `IS NOT
+        NULL`; this applies the migration and proves Postgres rejects partial
+        running lease metadata and terminal rows missing their required
+        receipts/digests.
+        """
+        import psycopg
+
+        from tracebed.stores.pg.pool import scoped
+
+        scope_a, _ = two_projects
+        project_id = str(scope_a.project_id.value)
+        invalid_rows = (
+            # Pending cannot carry either kind of terminal/retry code.
+            """
+            INSERT INTO trace_learning_job (
+                project_id, run_id, pipeline, pipeline_version, state, attempts,
+                max_attempts, trace_ended_at, last_error_code
+            ) VALUES (%s, gen_random_uuid(), 'tier_a', 1, 'pending', 0, 3, now(), 'transient_failure')
+            """,
+            """
+            INSERT INTO trace_learning_job (
+                project_id, run_id, pipeline, pipeline_version, state, attempts,
+                max_attempts, trace_ended_at, skip_code
+            ) VALUES (%s, gen_random_uuid(), 'tier_a', 1, 'pending', 0, 3, now(), 'manual_skip')
+            """,
+            # Running requires all three lease fields, not merely one.
+            """
+            INSERT INTO trace_learning_job (
+                project_id, run_id, pipeline, pipeline_version, state, attempts,
+                max_attempts, trace_ended_at, lease_token
+            ) VALUES (%s, gen_random_uuid(), 'tier_a', 1, 'running', 1, 3, now(), gen_random_uuid())
+            """,
+            """
+            INSERT INTO trace_learning_job (
+                project_id, run_id, pipeline, pipeline_version, state, attempts,
+                max_attempts, trace_ended_at, first_started_at, lease_token, lease_owner,
+                lease_expires_at, last_error_code
+            ) VALUES (%s, gen_random_uuid(), 'tier_a', 1, 'running', 1, 3, now(), now(),
+                      gen_random_uuid(), 'migration-test', now() + interval '1 minute', 'transient_failure')
+            """,
+            # Retry requires an explicit safe error code after every failed
+            # lease; an error-free retry would lose the audit reason.
+            """
+            INSERT INTO trace_learning_job (
+                project_id, run_id, pipeline, pipeline_version, state, attempts,
+                max_attempts, trace_ended_at, first_started_at
+            ) VALUES (%s, gen_random_uuid(), 'tier_a', 1, 'retry', 1, 3, now(), now())
+            """,
+            # A dead receipt cannot be NULL merely because octet_length(NULL)
+            # evaluates to NULL (which a CHECK would otherwise accept).
+            """
+            INSERT INTO trace_learning_job (
+                project_id, run_id, pipeline, pipeline_version, state, attempts,
+                max_attempts, trace_ended_at, last_error_code, finished_at
+            ) VALUES (%s, gen_random_uuid(), 'tier_a', 1, 'dead', 1, 3, now(), 'lease_expired', now())
+            """,
+            # Succeeded needs a write-once trace digest as well as a receipt.
+            """
+            INSERT INTO trace_learning_job (
+                project_id, run_id, pipeline, pipeline_version, state, attempts,
+                max_attempts, trace_ended_at, result_digest, finished_at
+            ) VALUES (%s, gen_random_uuid(), 'tier_a', 1, 'succeeded', 1, 3, now(), decode(repeat('00', 32), 'hex'), now())
+            """,
+        )
+        with pg_pool.connection() as conn:
+            for statement in invalid_rows:
+                with (
+                    pytest.raises(psycopg.errors.CheckViolation),
+                    conn.transaction(),
+                    conn.cursor() as cur,
+                ):
+                    cur.execute("SELECT set_config('tracebed.project_id', %s, true)", (project_id,))
+                    cur.execute(statement, (project_id,))
+
+        with pg_pool.connection() as conn:
+            with conn.transaction(), conn.cursor() as cur:
+                cur.execute("SELECT set_config('tracebed.project_id', %s, true)", (project_id,))
+                cur.execute(
+                    """
+                    INSERT INTO trace_learning_job (
+                        project_id, run_id, pipeline, pipeline_version, trace_ended_at
+                    ) VALUES (%s, gen_random_uuid(), 'tier_a', 1, now())
+                    RETURNING run_id
+                    """,
+                    (project_id,),
+                )
+                retry_row = cur.fetchone()
+                assert retry_row is not None
+                retry_run_id = retry_row[0]
+                cur.execute(
+                    """
+                    INSERT INTO trace_learning_job (
+                        project_id, run_id, pipeline, pipeline_version, trace_ended_at
+                    ) VALUES (%s, gen_random_uuid(), 'tier_a', 1, now())
+                    RETURNING run_id
+                    """,
+                    (project_id,),
+                )
+                dead_row = cur.fetchone()
+                assert dead_row is not None
+                dead_run_id = dead_row[0]
+                for run_id in (retry_run_id, dead_run_id):
+                    cur.execute(
+                        """
+                        UPDATE trace_learning_job
+                        SET state = 'running', attempts = 1, first_started_at = now(),
+                            lease_token = gen_random_uuid(), lease_owner = 'migration-test',
+                            lease_expires_at = now() + interval '1 minute'
+                        WHERE project_id = %s AND run_id = %s AND pipeline = 'tier_a' AND pipeline_version = 1
+                        """,
+                        (project_id, run_id),
+                    )
+                cur.execute(
+                    """
+                    UPDATE trace_learning_job
+                    SET state = 'retry', available_at = now(), lease_token = NULL,
+                        lease_owner = NULL, lease_expires_at = NULL, last_error_code = 'transient_failure'
+                    WHERE project_id = %s AND run_id = %s AND pipeline = 'tier_a' AND pipeline_version = 1
+                    """,
+                    (project_id, retry_run_id),
+                )
+                cur.execute(
+                    """
+                    UPDATE trace_learning_job
+                    SET state = 'dead', lease_token = NULL, lease_owner = NULL, lease_expires_at = NULL,
+                        last_error_code = 'max_attempts_exhausted',
+                        result_digest = decode(repeat('00', 32), 'hex'), finished_at = now()
+                    WHERE project_id = %s AND run_id = %s AND pipeline = 'tier_a' AND pipeline_version = 1
+                    """,
+                    (project_id, dead_run_id),
+                )
+
+            with (
+                pytest.raises(psycopg.errors.CheckViolation),
+                conn.transaction(),
+                conn.cursor() as cur,
+            ):
+                cur.execute("SELECT set_config('tracebed.project_id', %s, true)", (project_id,))
+                cur.execute(
+                    """
+                    UPDATE trace_learning_job SET last_error_code = NULL
+                    WHERE project_id = %s AND run_id = %s AND pipeline = 'tier_a' AND pipeline_version = 1
+                    """,
+                    (project_id, retry_run_id),
+                )
+
+        # The owner can still DROP the whole partition for erasure, but no
+        # caller may delete an individual durable ledger row.
+        with pytest.raises(psycopg.errors.CheckViolation), scoped(pg_pool, scope_a.project_id) as conn:
+            conn.execute(
+                """
+                DELETE FROM trace_learning_job
+                WHERE project_id = %s AND run_id = %s AND pipeline = 'tier_a' AND pipeline_version = 1
+                """,
+                (project_id, retry_run_id),
+            )
+
+    def test_trace_learning_store_leases_are_scoped_idempotent_and_terminal(
+        self, pg_pool: Any, two_projects: tuple[Any, Any]
+    ) -> None:
+        """Exercise the P2A1 DB-time path, including a final crashed lease.
+
+        The second pipeline version proves the full four-part identity is
+        respected.  The owner pool still enters through ``scoped()``, so this
+        also proves RLS scope is set before each job operation.
+        """
+        import psycopg
+
+        from tracebed.domain.ids import RunId
+        from tracebed.stores.pg.pool import scoped
+        from tracebed.stores.pg.trace_learning import TraceLearningJobStore
+        from tracebed.workers.trace_learning import TIER_A_PIPELINE, result_receipt_digest
+
+        scope_a, _ = two_projects
+        project_id = scope_a.project_id
+        run_id = RunId(uuid.uuid4())
+        store = TraceLearningJobStore(pg_pool, lease_duration=timedelta(seconds=30))
+        with scoped(pg_pool, project_id) as conn:
+            for version in (1, 2):
+                conn.execute(
+                    """
+                    INSERT INTO trace_learning_job
+                        (project_id, run_id, pipeline, pipeline_version, state, attempts,
+                         max_attempts, trace_ended_at)
+                    VALUES (%(project_id)s, %(run_id)s, 'tier_a', %(version)s,
+                            'pending', 0, 3, now())
+                    """,
+                    {
+                        "project_id": project_id.value,
+                        "run_id": run_id.value,
+                        "version": version,
+                    },
+                )
+
+        first = store.claim(project_id, TIER_A_PIPELINE, 1, "migration-proof", 10)
+        version_two = store.claim(project_id, TIER_A_PIPELINE, 2, "migration-proof", 10)
+        assert len(first) == len(version_two) == 1
+        assert first[0].run_id == run_id and first[0].trace_ended_at is not None
+        assert version_two[0].run_id == run_id
+
+        # Retry pins the trace digest, and the old ownership token can never
+        # renew/retry after the next claim.
+        assert store.retry(first[0], timedelta(), "transient_failure", b"a" * 32).value == "retry"
+        second = store.claim(project_id, TIER_A_PIPELINE, 1, "migration-proof", 1)[0]
+        assert second.attempts == 2 and second.trace_digest == b"a" * 32
+        assert store.renew(first[0]) is None
+        assert store.retry(first[0], timedelta(), "transient_failure") is None
+
+        # A healthy renewal prevents re-claim. Then emulate a crash: the next
+        # claim sweeps the expired running row, rotates its token, and reaches
+        # exactly its third/last delivery.
+        renewed = store.renew(second)
+        assert renewed is not None and renewed.lease_expires_at > second.lease_expires_at
+        assert store.claim(project_id, TIER_A_PIPELINE, 1, "migration-proof", 1) == ()
+        with scoped(pg_pool, project_id) as conn:
+            conn.execute(
+                """
+                UPDATE trace_learning_job SET lease_expires_at = now() - interval '1 second'
+                WHERE project_id = %s AND run_id = %s AND pipeline = 'tier_a' AND pipeline_version = 1
+                """,
+                (project_id.value, run_id.value),
+            )
+        third = store.claim(project_id, TIER_A_PIPELINE, 1, "migration-proof", 1)[0]
+        assert third.attempts == 3 and third.lease_token != second.lease_token
+        assert store.retry(third, timedelta(), "transient_failure").value == "dead"
+        assert store.claim(project_id, TIER_A_PIPELINE, 1, "migration-proof", 1) == ()
+
+        with scoped(pg_pool, project_id) as conn:
+            row = conn.execute(
+                """
+                SELECT state, attempts, result_digest
+                FROM trace_learning_job
+                WHERE project_id = %s AND run_id = %s AND pipeline = 'tier_a' AND pipeline_version = 1
+                """,
+                (project_id.value, run_id.value),
+            ).fetchone()
+        assert row is not None and row[:2] == ("dead", 3)
+        assert bytes(row[2]) == result_receipt_digest(
+            project_id=project_id,
+            run_id=run_id,
+            pipeline=TIER_A_PIPELINE,
+            pipeline_version=1,
+            code="max_attempts_exhausted",
+            trace_digest=b"a" * 32,
+        )
+
+        # The parent trigger makes every terminal row absorbing even for a
+        # caller that attempted a raw SQL update outside the store.
+        with pytest.raises(psycopg.errors.CheckViolation), scoped(pg_pool, project_id) as conn:
+            conn.execute(
+                """
+                UPDATE trace_learning_job SET available_at = now()
+                WHERE project_id = %s AND run_id = %s AND pipeline = 'tier_a' AND pipeline_version = 1
+                """,
+                (project_id.value, run_id.value),
+            )
+
+    def test_trace_learning_concurrent_claimers_receive_disjoint_leases(
+        self, pg_dsn: str, two_projects: tuple[Any, Any]
+    ) -> None:
+        """`FOR UPDATE SKIP LOCKED` prevents a duplicate delivery race."""
+        from tracebed.domain.ids import RunId
+        from tracebed.stores.pg.pool import create_pool, scoped
+        from tracebed.stores.pg.trace_learning import TraceLearningJobStore
+
+        scope_a, _ = two_projects
+        project_id = scope_a.project_id
+        run_ids = (RunId(uuid.uuid4()), RunId(uuid.uuid4()))
+        claim_pool = create_pool(pg_dsn, min_size=2, max_size=2)
+        claim_pool.wait(timeout=5.0)
+        store = TraceLearningJobStore(claim_pool, lease_duration=timedelta(seconds=30))
+        try:
+            with scoped(claim_pool, project_id) as conn:
+                for run_id in run_ids:
+                    conn.execute(
+                        """
+                        INSERT INTO trace_learning_job
+                            (project_id, run_id, pipeline, pipeline_version, state, attempts,
+                             max_attempts, trace_ended_at)
+                        VALUES (%s, %s, 'claim_race', 1, 'pending', 0, 3, clock_timestamp())
+                        """,
+                        (project_id.value, run_id.value),
+                    )
+
+            barrier = threading.Barrier(3)
+            results: list[tuple[RunId, ...]] = []
+            errors: list[BaseException] = []
+
+            def claim_one() -> None:
+                try:
+                    barrier.wait(timeout=2.0)
+                    results.append(
+                        tuple(
+                            lease.run_id
+                            for lease in store.claim(project_id, "claim_race", 1, "claim-racer", 1)
+                        )
+                    )
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            workers = [threading.Thread(target=claim_one), threading.Thread(target=claim_one)]
+            for worker in workers:
+                worker.start()
+            barrier.wait(timeout=2.0)
+            for worker in workers:
+                worker.join(timeout=3.0)
+                assert not worker.is_alive()
+            assert errors == []
+            delivered = [run_id for claim in results for run_id in claim]
+            assert len(delivered) == 2
+            assert set(delivered) == set(run_ids)
+        finally:
+            claim_pool.close()
+
+    def test_trace_learning_lease_fencing_rechecks_after_a_row_lock_wait(
+        self,
+        pg_dsn: str,
+        two_projects: tuple[Any, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A transaction that began pre-expiry cannot revive a post-expiry lease.
+
+        The holder takes the job row lock before the short lease expires.
+        Each worker operation starts its own transaction and blocks in
+        ``SELECT ... FOR UPDATE``; releasing the lock only after expiry proves
+        the later UPDATE's ``clock_timestamp()`` predicate fences both renew
+        and retry rather than trusting transaction-start ``now()``.
+        """
+        from contextlib import contextmanager
+
+        from tracebed.domain.ids import RunId
+        from tracebed.stores.pg import trace_learning as trace_learning_store_module
+        from tracebed.stores.pg.pool import create_pool, scoped
+        from tracebed.stores.pg.trace_learning import TraceLearningJobStore
+        from tracebed.workers.trace_learning import TraceLearningLease
+
+        scope_a, _ = two_projects
+        project_id = scope_a.project_id
+        pipeline = "fence_test"
+        # Allow a cold pool to establish the second physical connection while
+        # still ensuring its transaction starts before the lease expires.
+        fence_pool = create_pool(pg_dsn, min_size=2, max_size=2)
+        fence_pool.wait(timeout=5.0)
+        store = TraceLearningJobStore(fence_pool, lease_duration=timedelta(seconds=3))
+        worker_scope_entered = threading.Event()
+        worker_pids: list[int] = []
+        real_scoped = trace_learning_store_module.scoped
+
+        @contextmanager
+        def tracked_scoped(pool: Any, scope: Any) -> Any:
+            with real_scoped(pool, scope) as conn:
+                if threading.current_thread() is not threading.main_thread():
+                    worker_pids.append(conn.info.backend_pid)
+                    worker_scope_entered.set()
+                yield conn
+
+        monkeypatch.setattr(trace_learning_store_module, "scoped", tracked_scoped)
+
+        def new_lease() -> TraceLearningLease:
+            run_id = RunId(uuid.uuid4())
+            with scoped(fence_pool, project_id) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO trace_learning_job
+                        (project_id, run_id, pipeline, pipeline_version, state, attempts,
+                         max_attempts, trace_ended_at)
+                    VALUES (%s, %s, 'fence_test', 1, 'pending', 0, 3, clock_timestamp())
+                    """,
+                    (project_id.value, run_id.value),
+                )
+            return store.claim(project_id, pipeline, 1, "fence-test", 1)[0]
+
+        def wait_until_worker_blocks(holder: Any, worker_pid: int) -> None:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                waiting = holder.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_locks
+                        WHERE pid = %s AND NOT granted
+                    )
+                    """,
+                    (worker_pid,),
+                ).fetchone()
+                if waiting is not None and waiting[0]:
+                    return
+                time.sleep(0.01)
+            pytest.fail("lease operation did not block on the holder row lock before expiry")
+
+        def prove_fenced(operation: str) -> None:
+            lease = new_lease()
+            started = threading.Event()
+            results: list[object] = []
+            errors: list[BaseException] = []
+            worker_scope_entered.clear()
+            worker_pids.clear()
+
+            def call_store() -> None:
+                started.set()
+                try:
+                    if operation == "renew":
+                        results.append(store.renew(lease))
+                    else:
+                        results.append(store.retry(lease, timedelta(), "transient_failure"))
+                except BaseException as exc:  # pragma: no cover - surfaced by assertion below
+                    errors.append(exc)
+
+            with scoped(fence_pool, project_id) as holder:
+                holder.execute(
+                    """
+                    SELECT 1 FROM trace_learning_job
+                    WHERE project_id = %s AND run_id = %s AND pipeline = %s AND pipeline_version = 1
+                    FOR UPDATE
+                    """,
+                    (project_id.value, lease.run_id.value, pipeline),
+                )
+                worker = threading.Thread(target=call_store)
+                worker.start()
+                assert started.wait(timeout=1.0)
+                assert worker_scope_entered.wait(timeout=1.0)
+                assert len(worker_pids) == 1
+                wait_until_worker_blocks(holder, worker_pids[0])
+                time.sleep(3.2)
+            worker.join(timeout=3.0)
+            assert not worker.is_alive()
+            assert errors == []
+            assert results == [None]
+            with scoped(fence_pool, project_id) as conn:
+                row = conn.execute(
+                    """
+                    SELECT state, lease_token FROM trace_learning_job
+                    WHERE project_id = %s AND run_id = %s AND pipeline = %s AND pipeline_version = 1
+                    """,
+                    (project_id.value, lease.run_id.value, pipeline),
+                ).fetchone()
+            assert row == ("running", lease.lease_token)
+
+        try:
+            prove_fenced("renew")
+            prove_fenced("retry")
+        finally:
+            fence_pool.close()
+
+    def test_trace_learning_candidate_time_predicates_are_index_conditions(
+        self, pg_pool: Any, two_projects: tuple[Any, Any]
+    ) -> None:
+        """The nonblocking claim/sweep scans keep their time terms indexable."""
+        from tracebed.domain.ids import RunId
+        from tracebed.stores.pg.pool import scoped
+
+        scope_a, _ = two_projects
+        project_id = scope_a.project_id
+        ready_run_id = RunId(uuid.uuid4())
+        lease_run_id = RunId(uuid.uuid4())
+        with scoped(pg_pool, project_id) as conn:
+            conn.execute(
+                """
+                INSERT INTO trace_learning_job
+                    (project_id, run_id, pipeline, pipeline_version, state, attempts,
+                     max_attempts, available_at, trace_ended_at)
+                VALUES (%s, %s, 'plan_ready', 1, 'pending', 0, 3,
+                        clock_timestamp(), clock_timestamp())
+                """,
+                (project_id.value, ready_run_id.value),
+            )
+            conn.execute(
+                """
+                INSERT INTO trace_learning_job
+                    (project_id, run_id, pipeline, pipeline_version, state, attempts,
+                     max_attempts, trace_ended_at)
+                VALUES (%s, %s, 'plan_lease', 1, 'pending', 0, 3, clock_timestamp())
+                """,
+                (project_id.value, lease_run_id.value),
+            )
+            conn.execute(
+                """
+                UPDATE trace_learning_job
+                SET state = 'running', attempts = 1, first_started_at = clock_timestamp(),
+                    lease_token = gen_random_uuid(), lease_owner = 'plan-probe',
+                    lease_expires_at = clock_timestamp() + interval '1 minute'
+                WHERE project_id = %s AND run_id = %s AND pipeline = 'plan_lease'
+                  AND pipeline_version = 1
+                """,
+                (project_id.value, lease_run_id.value),
+            )
+            conn.execute("SELECT set_config('enable_seqscan', 'off', true)")
+            conn.execute("SELECT set_config('enable_bitmapscan', 'off', true)")
+
+            def index_conditions(statement: str, pipeline: str) -> list[str]:
+                row = conn.execute(
+                    statement,
+                    {"project_id": project_id.value, "pipeline": pipeline},
+                ).fetchone()
+                assert row is not None
+                plan = row[0]
+                assert isinstance(plan, list) and plan
+                conditions: list[str] = []
+
+                def visit(node: Any) -> None:
+                    condition = node.get("Index Cond")
+                    if isinstance(condition, str):
+                        conditions.append(condition)
+                    for child in node.get("Plans", []):
+                        visit(child)
+
+                visit(plan[0]["Plan"])
+                return conditions
+
+            ready_conditions = index_conditions(
+                """
+                EXPLAIN (FORMAT JSON, COSTS OFF)
+                SELECT run_id FROM trace_learning_job
+                WHERE project_id = %(project_id)s AND pipeline = %(pipeline)s
+                  AND pipeline_version = 1 AND state IN ('pending', 'retry')
+                  AND attempts < max_attempts AND available_at <= statement_timestamp()
+                ORDER BY available_at, scheduled_at, run_id
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+                """,
+                "plan_ready",
+            )
+            lease_conditions = index_conditions(
+                """
+                EXPLAIN (FORMAT JSON, COSTS OFF)
+                SELECT run_id FROM trace_learning_job
+                WHERE project_id = %(project_id)s AND pipeline = %(pipeline)s
+                  AND pipeline_version = 1 AND state = 'running'
+                  AND lease_expires_at <= statement_timestamp()
+                ORDER BY lease_expires_at, scheduled_at, run_id
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+                """,
+                "plan_lease",
+            )
+
+        assert any(
+            "available_at" in condition and "statement_timestamp()" in condition
+            for condition in ready_conditions
+        )
+        assert any(
+            "lease_expires_at" in condition and "statement_timestamp()" in condition
+            for condition in lease_conditions
+        )
 
     def test_duplicate_agent_registration_rejected(self, pg_pool: Any) -> None:
         import psycopg

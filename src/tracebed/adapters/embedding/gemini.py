@@ -107,6 +107,11 @@ class GeminiEmbeddingClient:
     def model_version(self) -> str:
         return self._pin.model_version
 
+    def close(self) -> None:
+        """Close the owned HTTP client when a long-running worker exits."""
+
+        self._http.close()
+
     def embed(self, texts: Sequence[str], *, timeout_ms: int) -> list[list[float]]:
         """Raises `EmbeddingTimeout` past `timeout_ms`. Never retries internally.
 

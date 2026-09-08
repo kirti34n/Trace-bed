@@ -104,6 +104,36 @@ class AdapterClass(StrEnum):
     IMPLICIT = "implicit"
 
 
+class FeedbackSource(StrEnum):
+    """Publicly grantable origins for feedback authority.
+
+    This is deliberately distinct from :class:`AdapterClass`.  ``implicit``
+    is an internal provenance class with zero scoring weight; it is never a
+    principal grant, HTTP value, or feedback capability.
+    """
+
+    VERDICT = "verdict"
+    CORRECTION_ADAPTER = "correction_adapter"
+    DOWNSTREAM = "downstream"
+
+
+class ProjectRole(StrEnum):
+    """Closed project capabilities, resolved from durable grants in Phase 3."""
+
+    ADMIN = "admin"
+    DATA = "data"
+    ERASURE_REQUEST = "erasure_request"
+    EXPORT = "export"
+    FEEDBACK = "feedback"
+
+
+class RunOrigin(StrEnum):
+    """The first trusted path that bound a run to its server-side owner."""
+
+    RETRIEVE = "retrieve"
+    TRACE = "trace"
+
+
 class Arm(StrEnum):
     """Killswitch experiment arm stamped on every run (`trace_index.arm`)."""
 

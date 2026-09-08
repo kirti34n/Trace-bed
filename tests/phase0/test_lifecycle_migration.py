@@ -114,6 +114,13 @@ class TestMigrationPairExists:
             "0004_lifecycle",
             "0005_bm25",
             "0006_q_update_ledger",
+            "0007_project_provisioning",
+            "0008_trace_learning_job",
+            "0009_trace_index_terminal_freeze",
+            "0010_authority_foundation",
+            "0011_authority_cutover",
+            "0012_erasure_saga",
+            "0013_erasure_deployment",
         ]
 
     def test_rollback_has_no_more_statements_than_the_migration(self) -> None:

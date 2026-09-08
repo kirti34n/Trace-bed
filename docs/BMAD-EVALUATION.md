@@ -1,3 +1,10 @@
+# Archived BMAD evaluation
+
+> **Historical, point-in-time evaluation; non-normative for current capability, deployment,
+> security, or release status.** The measurements and classifications below were recorded on the
+> stated date and must not be treated as current evidence. For current claims, use
+> [`capabilities.toml`](capabilities.toml) and [`CAPABILITIES.md`](CAPABILITIES.md).
+
 # BMAD v6.10.0 evaluation — measured against this repository's existing review methodology
 
 **Date:** 2026-07-27

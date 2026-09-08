@@ -4,7 +4,7 @@ Two tiers, deliberately kept apart because they differ in whether a real,
 production adapter exists for them today.
 
 TIER 1 -- observability, real today. `queue_health()` is wired against
-primitives `stores.pg.queue.WorkQueue` already implements
+primitives `stores.pg.queue.WorkerQueue` already implements
 (`dead_letter_count`, `depth`, `oldest_age_s`, `xmin_horizon_alarm`), and
 `find_orphaned_trace_payloads()` against `Repo.list_runs` +
 `TraceStorePort.exists` -- both already real. Neither invents a threshold:
@@ -68,13 +68,13 @@ __all__ = [
 
 
 # --------------------------------------------------------------------------- #
-# Tier 1 -- observability (real against `WorkQueue` today).
+# Tier 1 -- observability (real against `WorkerQueue` today).
 # --------------------------------------------------------------------------- #
 
 
 class QueueObservabilityPort(Protocol):
-    """The subset of `stores.pg.queue.WorkQueue`'s public surface this module
-    reads. `WorkQueue` satisfies this structurally with zero changes."""
+    """The subset of `stores.pg.queue.WorkerQueue`'s public surface this module
+    reads. `WorkerQueue` satisfies this structurally with zero changes."""
 
     def depth(self, topic: str) -> int: ...
     def dead_letter_count(self, topic: str) -> int: ...
@@ -100,7 +100,7 @@ class QueueHealthReport:
 
     Deliberately stated as "oldest row", not "oldest UNCLAIMED row": the only
     primitive `QueueObservabilityPort` offers is `oldest_age_s`, and
-    `WorkQueue.oldest_age_s` is `MIN(available_at)` across every row on the
+    `WorkerQueue.oldest_age_s` is `MIN(available_at)` across every row on the
     topic regardless of lease state (`stores/pg/queue.py`). A topic with a
     genuine backlog being actively drained therefore also reports stuck. A
     precise signal needs a lease-aware age primitive on the queue, which
@@ -110,7 +110,7 @@ class QueueHealthReport:
     xmin_horizon_alarm: bool
     """PLAN.md §3: `work_queue` shares Postgres's buffer cache with the
     vector index, so bloat here is a hot-path latency risk. Read straight
-    through `WorkQueue.xmin_horizon_alarm()`, which already implements the
+    through `WorkerQueue.xmin_horizon_alarm()`, which already implements the
     threshold check (`stores/pg/queue.py::XMIN_HORIZON_ALARM_THRESHOLD_S`) --
     this module does not duplicate that constant, only surfaces it."""
 
@@ -209,7 +209,7 @@ def find_orphaned_trace_payloads(
 
 
 class DeadLetterReaperPort(Protocol):
-    """CONTRACT GAP: `stores.pg.queue.WorkQueue` does not implement this --
+    """CONTRACT GAP: `stores.pg.queue.WorkerQueue` does not implement this --
     see module docstring. Declared so the reaping LOGIC (cutoff computation,
     cadence via `workers.scheduler.Scheduler`) is complete and fully tested;
     no concrete adapter satisfies it yet anywhere in this codebase."""
@@ -218,7 +218,7 @@ class DeadLetterReaperPort(Protocol):
 
 
 class ExpiredLeasePort(Protocol):
-    """CONTRACT GAP: ditto. `WorkQueue` has no primitive to COUNT `work_queue`
+    """CONTRACT GAP: ditto. `WorkerQueue` has no primitive to COUNT `work_queue`
     rows whose lease has expired -- only the automatic reclaim-on-claim
     behaviour (`claim()`'s own `WHERE lease_expires_at IS NULL OR
     lease_expires_at < now()`), which needs no action to correct itself but

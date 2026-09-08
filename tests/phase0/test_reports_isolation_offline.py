@@ -125,6 +125,16 @@ def test_call_table_covers_every_public_reports_method() -> None:
     assert _public_method_names() == set(_calls(repo))
 
 
+def test_q_trajectory_reads_the_memory_stamped_epoch_without_registry_access() -> None:
+    """The API role may read its project memory row, not the global epoch registry."""
+
+    repo, pool = _reports()
+    repo.q_trajectory(PROJECT)
+    query = next(sql for sql, _ in pool.log if "FROM memory_item mi" in sql)
+    assert "mi.epoch_id AS scoring_epoch_id" in query
+    assert "FROM scoring_epoch" not in query
+
+
 @pytest.mark.parametrize("method_name", sorted(_public_method_names()))
 def test_every_report_builder_sets_the_guc_first(method_name: str) -> None:
     repo, pool = _reports()

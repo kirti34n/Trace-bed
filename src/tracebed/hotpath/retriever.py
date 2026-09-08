@@ -53,12 +53,9 @@ collaborators:
    returning on its own ever released it — which also meant `close()` blocked at shutdown, and the
    admission control above spent most of a stall refusing rather than serving. `_run_arm` now
    derives `statement_timeout_ms` from the SAME `deadline_ms` every other bound in this module
-   uses, at the instant the query is about to be issued, and `stores.pg.search` passes it to
-   `stores.pg.pool.scoped()` as a transaction-scoped `set_config`. No new configuration knob
-   exists for it: the number is `retrieval.total_budget_ms` minus elapsed, so the client-side and
-   server-side bounds cannot drift apart, and being transaction-scoped it can never leak onto the
-   next checkout of that pooled connection — which is the property that lets one shared pool carry
-   a hot-path bound at all.
+   uses. `_run_arm` carries Pipeline's shared `Deadline` into `stores.pg.search`; pool checkout and
+   each data statement derive their own remaining timeout from that object. No new configuration
+   knob exists for it, and transaction-scoped GUCs cannot leak onto the next checkout.
 
    ADMISSION CONTROL (D-138), the half a flat thread count hides: `ThreadPoolExecutor`'s work queue
    is UNBOUNDED, so bounding only the WAIT converts an unbounded hang into an unbounded queue. With
@@ -128,7 +125,12 @@ from tracebed.domain.clock import Clock
 from tracebed.domain.config import RetrievalConfig
 from tracebed.domain.errors import EmbeddingTimeout
 from tracebed.domain.ids import ProjectId
+from tracebed.hotpath.budget import Deadline
 from tracebed.hotpath.fusion import FusedCandidate, fuse
+from tracebed.stores.pg.pool import (
+    PoolDeadlineExceeded,
+    is_expired_deadline_query_cancellation,
+)
 from tracebed.stores.pg.search import ArmHit, SearchStore
 
 __all__ = [
@@ -283,7 +285,7 @@ class Retriever:
         return all(now_ms >= deadline for deadline in self._running_deadlines.values())
 
     def _submit_arm(
-        self, call: Callable[..., list[ArmHit]], deadline_ms: float
+        self, call: Callable[..., list[ArmHit]], deadline: Deadline
     ) -> Future[list[ArmHit]]:
         """Submits one arm, or hands back an already-abandoned future when the pool is wedged.
 
@@ -296,10 +298,10 @@ class Retriever:
                 return _abandoned_arm("every retriever worker is stuck past its own deadline")
             token = self._submitted_arms
             self._submitted_arms += 1
-        return self._executor.submit(self._run_arm, token, deadline_ms, call)
+        return self._executor.submit(self._run_arm, token, deadline, call)
 
     def _run_arm(
-        self, token: int, deadline_ms: float, call: Callable[..., list[ArmHit]]
+        self, token: int, deadline: Deadline, call: Callable[..., list[ArmHit]]
     ) -> list[ArmHit]:
         """Runs one arm on a worker thread, but only if its caller can still use the answer.
 
@@ -310,28 +312,33 @@ class Retriever:
         check, and clearing it in `finally`, is what lets `_arm_pool_is_wedged` see a worker that is
         stuck rather than merely busy.
 
-        `statement_timeout_ms` is computed here for the same reason, and is the third bound of the
-        set (D-139). Submission time is the wrong instant to derive it from -- a task that waited in
-        the queue would carry a server-side budget larger than the time its caller actually has
-        left -- so it is `deadline_ms` minus the reading taken one line above, which is by
-        construction the caller's true remaining budget at the moment the query is about to be
-        issued. Rounded UP to at least one millisecond: this line is only reached when the deadline
-        has NOT passed, so the correct bound is "the sliver that remains", and `int()` truncating a
-        0.4ms remainder to 0 would mean "no limit" to Postgres -- the exact opposite.
+        The shared deadline is passed into the concrete store. Its pool layer checks checkout time
+        and refreshes the PostgreSQL statement timeout immediately before the data query.
         """
         with self._lock:
-            self._running_deadlines[token] = deadline_ms
+            self._running_deadlines[token] = deadline.expires_at_ms()
         try:
-            now_ms = self._clock.monotonic_ms()
-            if now_ms >= deadline_ms:
+            if deadline.total_exceeded():
                 raise _ArmAbandoned("this arm reached a worker after its caller's budget expired")
-            return call(statement_timeout_ms=max(1, ceil(deadline_ms - now_ms)))
+            try:
+                return call(deadline=deadline)
+            except PoolDeadlineExceeded as exc:
+                raise _ArmAbandoned(str(exc)) from exc
+            except Exception as exc:
+                if is_expired_deadline_query_cancellation(exc, deadline):
+                    raise _ArmAbandoned("PostgreSQL cancelled an expired retrieval query") from exc
+                raise
         finally:
             with self._lock:
                 self._running_deadlines.pop(token, None)
 
     def retrieve(
-        self, project_id: ProjectId, query_text: str, *, cfg: RetrievalConfig
+        self,
+        project_id: ProjectId,
+        query_text: str,
+        *,
+        cfg: RetrievalConfig,
+        deadline: Deadline | None = None,
     ) -> RetrievalOutcome:
         """Start the lexical arm, embed (sub-budgeted) alongside it, run the vector arm, fuse.
 
@@ -347,25 +354,35 @@ class Retriever:
         which is the store-error rung of the degradation ladder (PLAN.md §2 invariant 2), the
         assembler/API layer's responsibility, not this module's.
         """
-        retrieve_started_ms = self._clock.monotonic_ms()
+        deadline = deadline or Deadline(
+            clock=self._clock,
+            total_budget_ms=cfg.total_budget_ms,
+            embed_timeout_ms=cfg.embed_timeout_ms,
+        )
         # One deadline for the whole call, computed once from this method's own entry reading: both
         # waits below narrow against it, and both arm tasks check it before touching Postgres, so
         # "the budget" means the same instant everywhere in this call instead of each consumer
         # re-deriving its own (D-132's re-derivation, D-138's stale-work check).
-        deadline_ms = retrieve_started_ms + float(cfg.total_budget_ms)
-
         # Submitted BEFORE the embed call so the lexical arm's latency is paid inside the embed
         # sub-budget rather than after it (module docstring §2): on the degraded path the embedder
         # may burn its entire 200ms of a 300ms total budget, and a lexical arm that only starts
         # then would push the whole call past `retrieval.total_budget_ms`.
         lexical_future = self._submit_arm(
-            partial(self._search.lexical_arm, project_id, query_text, cfg.arm_top_n), deadline_ms
+            partial(self._search.lexical_arm, project_id, query_text, cfg.arm_top_n), deadline
         )
         embed_start_ms = self._clock.monotonic_ms()
         embedding: list[float] | None = None
         degraded = False
         try:
-            vectors = self._embedding.embed([query_text], timeout_ms=cfg.embed_timeout_ms)
+            # A caller-provided outer deadline may have a larger embedding
+            # cap than this project's retrieval configuration. Both limits
+            # are nested; accepting the outer value must never widen cfg.
+            embed_timeout_ms = ceil(
+                min(float(cfg.embed_timeout_ms), deadline.embed_sub_budget_ms())
+            )
+            if embed_timeout_ms <= 0:
+                raise EmbeddingTimeout("retrieval deadline expired before embedding")
+            vectors = self._embedding.embed([query_text], timeout_ms=embed_timeout_ms)
             embedding = vectors[0] if vectors else None
             if embedding is None:
                 # An embedder that answers a non-empty request with nothing is exactly as
@@ -399,7 +416,7 @@ class Retriever:
                     hnsw_iterative_scan=cfg.hnsw_iterative_scan,
                     hnsw_max_scan_tuples=cfg.hnsw_max_scan_tuples,
                 ),
-                deadline_ms,
+                deadline,
             )
         )
 
@@ -411,7 +428,7 @@ class Retriever:
         # `Future.result` -- undocumented behaviour is not a budget guarantee, so this never relies
         # on how a negative timeout happens to behave.
         def _remaining_budget_ms() -> float:
-            return max(0.0, deadline_ms - self._clock.monotonic_ms())
+            return max(0.0, deadline.remaining_ms())
 
         lexical_hits, lexical_timed_out = _await_arm(lexical_future, _remaining_budget_ms())
         if lexical_timed_out:

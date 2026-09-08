@@ -1,24 +1,18 @@
-"""`workers.tier_a_lane` -- the coordinator that makes the lane's two
-lane-level guarantees true rather than merely available.
-
-Neither guarantee could be tested inside a single extractor, which is why
-neither was: `tier_a.candidate_cap_per_run` is per RUN and four extractors
-each held their own budget, and idempotency is a property of "the same batch,
-run twice", which no single `extract()` call can exhibit.
-
-Fully offline: `FakeClock`, a fake `MemoryWriterPort`, and a fake
-`KnownContentPort` standing in for the store query that does not exist yet.
-"""
+"""Pure planning boundary for the Tier-A trace-learning lane."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from uuid import uuid4
 
 import pytest
 
-from tracebed.core.scans.tier_a_template import ErrorClassEnum
+import tracebed.workers.tier_a_lane as tier_a_lane_module
+from tracebed.core.scans import SUITE_VERSION, ScanResult, verify_verdict
+from tracebed.core.scans import scan as real_scan
+from tracebed.core.scans.tier_a_template import ErrorClassEnum, render_note
 from tracebed.domain.canonical import content_hash
 from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import (
@@ -40,40 +34,30 @@ from tracebed.domain.config import (
     SpendConfig,
     TierAConfig,
 )
-from tracebed.domain.events import ErrorEvent, RunStart, TraceEvent
-from tracebed.domain.ids import (
-    AgentTypeId,
-    MemoryId,
-    PrincipalId,
-    ProjectId,
-    RunId,
-    mint_memory_id,
-)
-from tracebed.domain.memory import NewMemoryItem
-from tracebed.domain.scan import ScanVerdict
+from tracebed.domain.enums import Lane, MemType, ProvenanceClass, ScopeType, TrustTier
+from tracebed.domain.events import ErrorEvent, RunStart, ToolCall, ToolResult, TraceEvent
+from tracebed.domain.ids import AgentTypeId, PrincipalId, ProjectId, RunId
 from tracebed.domain.scope import ProjectScope
+from tracebed.domain.state_machine import Status
 from tracebed.workers.extractors import (
-    ExtractionOutcome,
-    SchemaFailureExtractor,
+    TIER_A_KIND_MEM_TYPES,
+    CandidateCapTracker,
+    TierACandidateProposal,
     ToolFailureExtractor,
+    try_build_note,
 )
-from tracebed.workers.tier_a_lane import TierALane, default_extractors
+from tracebed.workers.tier_a_lane import TierALane, TierAPlan, default_extractors
 
 pytestmark = pytest.mark.phase2
 
-_BASE_TS = datetime(2026, 7, 25, tzinfo=UTC)
-_MANIFEST = ["tool_a", "tool_b", "tool_c"]
+_TS = datetime(2026, 7, 25, tzinfo=UTC)
 
 
 def _scope() -> ProjectScope:
-    return ProjectScope(
-        project_id=ProjectId(uuid4()),
-        agent_type_id=AgentTypeId(uuid4()),
-        principal_id=PrincipalId(uuid4()),
-    )
+    return ProjectScope(ProjectId(uuid4()), AgentTypeId(uuid4()), PrincipalId(uuid4()))
 
 
-def _cfg(*, candidate_cap_per_run: int = 1) -> EffectiveConfig:
+def _cfg(*, cap: int = 1) -> EffectiveConfig:
     return EffectiveConfig(
         retrieval=RetrievalConfig(),
         abstention=AbstentionConfig(),
@@ -85,7 +69,7 @@ def _cfg(*, candidate_cap_per_run: int = 1) -> EffectiveConfig:
         lifecycle=LifecycleConfig(),
         derived=DerivedConfig(),
         proposals=ProposalConfig(),
-        tier_a=TierAConfig(candidate_cap_per_run=candidate_cap_per_run),
+        tier_a=TierAConfig(candidate_cap_per_run=cap),
         killswitch=KillswitchConfig(),
         spend=SpendConfig(),
         cache=CacheConfig(),
@@ -95,391 +79,418 @@ def _cfg(*, candidate_cap_per_run: int = 1) -> EffectiveConfig:
     )
 
 
-class _FakeWriter:
-    def __init__(self) -> None:
-        self.inserted: list[NewMemoryItem] = []
-        self.projects: list[ProjectId] = []
-
-    def insert_memory_item(
-        self, project_id: ProjectId, item: NewMemoryItem, scan_verdict: ScanVerdict
-    ) -> MemoryId:
-        self.inserted.append(item)
-        self.projects.append(project_id)
-        return mint_memory_id()
-
-
-class _FakeVault:
-    """`KnownContentPort` over an in-memory (project_id, content_hash) index.
-
-    `remember` is how a test says "a previous batch already wrote this",
-    which is the only way to exercise the cross-batch half of the dedupe
-    without a store.
-    """
-
-    def __init__(self) -> None:
-        self.rows: dict[tuple[ProjectId, str], MemoryId] = {}
-        self.queries: list[tuple[ProjectId, str]] = []
-
-    def remember(self, project_id: ProjectId, content: str) -> MemoryId:
-        memory_id = mint_memory_id()
-        self.rows[(project_id, content_hash(content))] = memory_id
-        return memory_id
-
-    def find_memory_by_content_hash(
-        self, project_id: ProjectId, content_hash_hex: str
-    ) -> MemoryId | None:
-        self.queries.append((project_id, content_hash_hex))
-        return self.rows.get((project_id, content_hash_hex))
-
-
-def _start(ts: datetime = _BASE_TS) -> RunStart:
+def _start() -> RunStart:
     return RunStart(
-        type="run_start", ts=ts, payload={"query_text": "q", "tool_manifest": list(_MANIFEST)}
+        type="run_start",
+        ts=_TS,
+        payload={"query_text": "q", "tool_manifest": ["tool_a", "tool_b"]},
     )
 
 
-def _error(
-    ts: datetime,
-    tool_id: str,
-    error_class: ErrorClassEnum,
-    *,
-    schema_fields: list[str] | None = None,
-) -> ErrorEvent:
-    payload: dict[str, object] = {
-        "tool_id": tool_id,
-        "tool_version": "v1",
-        "error_class": error_class.value,
-        "duration_ms": 50,
-        "error_body": "",
-    }
-    if schema_fields is not None:
-        payload["schema_fields"] = schema_fields
-    return ErrorEvent(type="error", ts=ts, payload=payload)
+def _error(ts: datetime, tool_id: str, error_class: ErrorClassEnum) -> ErrorEvent:
+    return ErrorEvent(
+        type="error",
+        ts=ts,
+        payload={
+            "tool_id": tool_id,
+            "tool_version": "v1",
+            "error_class": error_class.value,
+        },
+    )
 
 
-def _one_run_two_extractors_would_both_fire() -> Mapping[RunId, Sequence[TraceEvent]]:
-    """One run carrying BOTH a repeated plain tool error and a repeated schema
-    violation, so `ToolFailureExtractor` and `SchemaFailureExtractor` each have
-    a genuine pattern to emit -- which is what makes the shared cap observable.
-    """
+def _traces() -> Mapping[RunId, Sequence[TraceEvent]]:
     run = RunId(uuid4())
     return {
         run: [
             _start(),
-            _error(_BASE_TS, "tool_a", ErrorClassEnum.TIMEOUT),
-            _error(_BASE_TS + timedelta(seconds=1), "tool_a", ErrorClassEnum.TIMEOUT),
-            _error(
-                _BASE_TS + timedelta(seconds=2),
-                "tool_b",
-                ErrorClassEnum.SCHEMA_VALIDATION,
-                schema_fields=["amount", "currency"],
-            ),
-            _error(
-                _BASE_TS + timedelta(seconds=3),
-                "tool_b",
-                ErrorClassEnum.SCHEMA_VALIDATION,
-                schema_fields=["amount", "currency"],
-            ),
+            _error(_TS, "tool_a", ErrorClassEnum.TIMEOUT),
+            _error(_TS + timedelta(seconds=1), "tool_a", ErrorClassEnum.TIMEOUT),
+            _error(_TS + timedelta(seconds=2), "tool_b", ErrorClassEnum.TIMEOUT),
+            _error(_TS + timedelta(seconds=3), "tool_b", ErrorClassEnum.TIMEOUT),
         ]
     }
 
 
-def _lane(writer: _FakeWriter, **kwargs: object) -> TierALane:
-    return TierALane(
-        cfg=kwargs.pop("cfg", None) or _cfg(),  # type: ignore[arg-type]
-        clock=FakeClock(_BASE_TS),
-        writer=writer,
-        **kwargs,  # type: ignore[arg-type]
+class _Extractor:
+    def __init__(self, proposals: Sequence[TierACandidateProposal]) -> None:
+        self._proposals = tuple(proposals)
+
+    def propose(
+        self,
+        _traces: Mapping[RunId, Sequence[TraceEvent]],
+        *,
+        require_declared_tools: bool = True,
+    ) -> list[TierACandidateProposal]:
+        assert require_declared_tools is True
+        return list(self._proposals)
+
+
+def _proposal(run_id: RunId, tool_id: str) -> TierACandidateProposal:
+    note = try_build_note(
+        error_class=ErrorClassEnum.TIMEOUT,
+        tool_id=tool_id,
+        tool_version="v1",
+        count=2,
+        duration_ms=10,
+        payload_class_hash="a" * 64,
+    )
+    assert note is not None
+    return TierACandidateProposal(
+        note=note,
+        mem_type=MemType.EPISODIC,
+        kind="test",
+        contributing_run_ids=(run_id,),
+        primary_run_id=run_id,
     )
 
 
-# --------------------------------------------------------------------------- #
-# The shared cap -- the defect that made this module necessary
-# --------------------------------------------------------------------------- #
-
-
-def test_the_four_extractors_share_one_per_run_candidate_budget() -> None:
-    """`tier_a.candidate_cap_per_run` is 1. Two extractors each have a real
-    pattern for the SAME run; exactly one note may be written."""
-    writer = _FakeWriter()
-    result = _lane(writer).run_batch(_scope(), _one_run_two_extractors_would_both_fire())
-
-    assert len(result.inserted) == 1
-    assert len(writer.inserted) == 1
-
-
-def test_without_the_lane_the_same_traces_write_one_note_per_extractor() -> None:
-    """Guard the guard. If the extractors did not actually contend for one
-    budget, the assertion above would pass for the wrong reason -- so run the
-    same traces WITHOUT a shared tracker and prove the count differs. This is
-    the defect as it existed: a cap of 1 behaving as a cap of 4.
-    """
+def test_plan_is_pure_and_candidate_is_exactly_tier_a_candidate() -> None:
+    lane = TierALane(cfg=_cfg(), clock=FakeClock(_TS), extractors=(ToolFailureExtractor(),))
     scope = _scope()
-    traces = _one_run_two_extractors_would_both_fire()
-    writer = _FakeWriter()
 
-    for extractor in (ToolFailureExtractor(), SchemaFailureExtractor()):
-        extractor.extract(scope, traces, cfg=_cfg(), clock=FakeClock(_BASE_TS), writer=writer)
+    plan = lane.plan(scope, _traces())
 
-    assert len(writer.inserted) == 2
-
-
-def test_a_raised_cap_lets_both_extractors_through() -> None:
-    """The cap must come from config, not from the lane hardcoding "one"."""
-    writer = _FakeWriter()
-    lane = TierALane(cfg=_cfg(candidate_cap_per_run=2), clock=FakeClock(_BASE_TS), writer=writer)
-
-    result = lane.run_batch(_scope(), _one_run_two_extractors_would_both_fire())
-
-    assert len(result.inserted) == 2
-
-
-def test_the_cap_is_per_run_not_per_batch() -> None:
-    """Three runs, each failing a DIFFERENT tool, so each forms its own group
-    charged to its own run. One shared tracker must not turn a per-run cap
-    into a per-batch one -- all three notes are written.
-
-    Distinct tools deliberately: the extractors group across runs by
-    (tool_id, tool_version, error_class), so three runs failing the SAME tool
-    are one group charged to one primary run, which would test grouping
-    rather than the cap's scope.
-    """
-    writer = _FakeWriter()
-    traces: dict[RunId, Sequence[TraceEvent]] = {}
-    for tool in _MANIFEST:
-        traces[RunId(uuid4())] = [
-            _start(),
-            _error(_BASE_TS, tool, ErrorClassEnum.TIMEOUT),
-            _error(_BASE_TS + timedelta(seconds=1), tool, ErrorClassEnum.TIMEOUT),
-        ]
-
-    result = _lane(writer).run_batch(_scope(), traces)
-
-    assert len(result.inserted) == len(_MANIFEST)
-    assert len({o.primary_run_id for o in result.inserted}) == len(_MANIFEST)
+    assert len(plan.candidates) == 1
+    candidate = plan.candidates[0]
+    assert candidate.item.lane is Lane.OPERATIONAL
+    assert candidate.item.trust_tier is TrustTier.A
+    assert candidate.item.status is Status.CANDIDATE
+    assert candidate.item.scope_type is ScopeType.AGENT_TYPE
+    assert candidate.item.scope_id == scope.agent_type_id.value
+    assert candidate.item.provenance.cls is ProvenanceClass.PARSER
+    assert candidate.item.provenance.trace_ids == candidate.contributing_run_ids
+    assert candidate.item.provenance.tool_refs == (candidate.item.content.split("|ti=")[1].split("|")[0],)
+    assert candidate.item.schema_version == 1
+    assert candidate.item.token_count >= 0
+    assert candidate.scan_result.content_hash == content_hash(candidate.item.content)
+    assert candidate.scan_result.passed is True
+    verify_verdict(
+        candidate.scan_result.verdict(clock=FakeClock(_TS)), candidate.scan_result.content_hash
+    )
+    assert not hasattr(lane, "writer")
+    assert not hasattr(lane, "review_writer")
+    assert not hasattr(lane, "queue")
 
 
-def test_the_extractor_order_is_fixed_so_the_contended_slot_is_reproducible() -> None:
-    """The cap is first-come. If `default_extractors()` reordered between
-    processes, the same batch would charge a DIFFERENT note against the same
-    run's one slot, and the soak's vault-growth curve would stop being
-    reproducible."""
-    assert [type(e).__name__ for e in default_extractors()] == [
+def test_shared_cap_has_fixed_order_and_records_refusal() -> None:
+    lane = TierALane(cfg=_cfg(cap=1), clock=FakeClock(_TS), extractors=(ToolFailureExtractor(),))
+
+    plans = [lane.plan(_scope(), _traces()) for _ in range(3)]
+
+    assert all(len(plan.candidates) == 1 for plan in plans)
+    assert all(len(plan.outcomes) == 2 for plan in plans)
+    assert all("candidate_cap_per_run" in (plan.outcomes[1].skipped_reason or "") for plan in plans)
+
+
+def test_zero_cap_observes_outcomes_but_never_emits_candidates() -> None:
+    lane = TierALane(cfg=_cfg(cap=0), clock=FakeClock(_TS), extractors=(ToolFailureExtractor(),))
+
+    plan = lane.plan(_scope(), _traces())
+
+    assert plan.candidates == ()
+    assert len(plan.outcomes) == 2
+    assert all("candidate_cap_per_run" in (outcome.skipped_reason or "") for outcome in plan.outcomes)
+    assert lane.plan(_scope(), {}) == TierAPlan(candidates=(), rejections=(), outcomes=())
+
+
+def test_scan_rejection_is_planned_not_persisted_and_does_not_spend_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = RunId(uuid4())
+    rejected, accepted = _proposal(run, "a_rejected"), _proposal(run, "b_accepted")
+
+    def fake_scan(content: str, *, context: object) -> ScanResult:
+        del context
+        return ScanResult(
+            passed="a_rejected" not in content,
+            reasons=("test_rejection",) if "a_rejected" in content else (),
+            content_hash=content_hash(content),
+            suite_version="test/1",
+        )
+
+    monkeypatch.setattr(tier_a_lane_module, "scan", fake_scan)
+    plan = TierALane(
+        cfg=_cfg(cap=1), clock=FakeClock(_TS), extractors=(_Extractor((rejected, accepted)),)
+    ).plan(_scope(), {})
+
+    assert len(plan.rejections) == 1
+    assert plan.rejections[0].reasons == ("test_rejection",)
+    assert len(plan.candidates) == 1
+    assert "b_accepted" in plan.candidates[0].item.content
+    assert plan.outcomes[0].skipped_reason == "scan_rejected: test_rejection"
+
+
+def test_cap_is_per_run_shared_across_extractors_and_has_a_fixed_winner() -> None:
+    first_run, second_run = RunId(uuid4()), RunId(uuid4())
+    same_run = tuple(_Extractor((_proposal(first_run, f"tool_{index}"),)) for index in range(4))
+    plan = TierALane(
+        cfg=_cfg(cap=1), clock=FakeClock(_TS), extractors=same_run
+    ).plan(_scope(), {})
+
+    assert len(plan.candidates) == 1
+    assert "tool_0" in plan.candidates[0].item.content
+    assert len([outcome for outcome in plan.outcomes if outcome.skipped_reason]) == 3
+
+    per_run = TierALane(
+        cfg=_cfg(cap=1),
+        clock=FakeClock(_TS),
+        extractors=(_Extractor((_proposal(first_run, "first"), _proposal(second_run, "second"))),),
+    ).plan(_scope(), {})
+    assert len(per_run.candidates) == 2
+
+
+def test_raised_cap_duplicate_telemetry_and_repeated_plans_do_not_leak_state() -> None:
+    run = RunId(uuid4())
+    first, duplicate, second = _proposal(run, "same"), _proposal(run, "same"), _proposal(run, "other")
+    lane = TierALane(
+        cfg=_cfg(cap=2),
+        clock=FakeClock(_TS),
+        extractors=(_Extractor((first, duplicate, second)),),
+    )
+
+    first_plan = lane.plan(_scope(), {})
+    second_plan = lane.plan(_scope(), {})
+
+    assert len(first_plan.candidates) == len(second_plan.candidates) == 2
+    assert [outcome.skipped_reason for outcome in first_plan.outcomes] == [
+        None,
+        "duplicate_candidate",
+        None,
+    ]
+    assert [candidate.item.content for candidate in first_plan.candidates] == [
+        candidate.item.content for candidate in second_plan.candidates
+    ]
+
+
+def test_duplicate_proposals_do_not_consume_additional_cap() -> None:
+    lane = TierALane(
+        cfg=_cfg(cap=1),
+        clock=FakeClock(_TS),
+        extractors=(ToolFailureExtractor(), ToolFailureExtractor()),
+    )
+
+    plan = lane.plan(_scope(), _traces())
+
+    assert len(plan.candidates) == 1
+    assert len([o for o in plan.outcomes if o.skipped_reason == "duplicate_candidate"]) == 2
+
+
+def test_default_extractors_keep_the_cross_process_order() -> None:
+    assert [type(extractor).__name__ for extractor in default_extractors()] == [
         "ToolFailureExtractor",
         "SchemaFailureExtractor",
         "LatencyOutlierExtractor",
         "SequencePatternExtractor",
     ]
 
-    scope = _scope()
-    traces = _one_run_two_extractors_would_both_fire()
-    contents = set()
-    for _ in range(5):
-        writer = _FakeWriter()
-        result = _lane(writer).run_batch(scope, traces)
-        contents.add(result.inserted[0].content)
-    assert len(contents) == 1
+
+def test_full_plan_is_equal_under_mapping_reorder_clock_advance_and_a_b_a_calls() -> None:
+    """Planning is a pure function of one scope/traces input, not call history."""
+    scope_a, scope_b = _scope(), _scope()
+    base_traces = _traces()
+    (first_run, first_events), = base_traces.items()
+    second_run = RunId(uuid4())
+    traces = {first_run: first_events, second_run: list(first_events)}
+    reordered = dict(reversed(tuple(traces.items())))
+    lane = TierALane(cfg=_cfg(cap=4), clock=FakeClock(_TS))
+    advanced = TierALane(cfg=_cfg(cap=4), clock=FakeClock(_TS + timedelta(days=30)))
+
+    plan_a_first = lane.plan(scope_a, traces)
+    plan_reordered = lane.plan(scope_a, reordered)
+    plan_b = lane.plan(scope_b, traces)
+    plan_a_after_b = lane.plan(scope_a, traces)
+    plan_advanced_clock = advanced.plan(scope_a, traces)
+
+    assert plan_a_first == plan_reordered == plan_a_after_b == plan_advanced_clock
+    assert plan_b != plan_a_first
 
 
-# --------------------------------------------------------------------------- #
-# Idempotency -- the queue redelivers, and the store has no unique constraint
-# --------------------------------------------------------------------------- #
+def test_empty_plan_and_empty_extractor_set() -> None:
+    lane = TierALane(cfg=_cfg(), clock=FakeClock(_TS))
+    assert lane.plan(_scope(), {}).candidates == ()
+    with pytest.raises(ValueError, match="at least one extractor"):
+        TierALane(cfg=_cfg(), clock=FakeClock(_TS), extractors=())
 
 
-def test_a_redelivered_batch_writes_nothing_new() -> None:
-    """`queue.lease_seconds`/`max_attempts` make redelivery ordinary and
-    `memory_item` has no uniqueness constraint on content, so without this the
-    same batch inserts the same candidate twice -- straight into the metric
-    Phase 2's soak gate measures."""
-    scope = _scope()
-    traces = _one_run_two_extractors_would_both_fire()
-    writer = _FakeWriter()
-    vault = _FakeVault()
-    lane = TierALane(
-        cfg=_cfg(), clock=FakeClock(_BASE_TS), writer=writer, known_content=vault
+def test_candidate_cap_hard_bound_matches_the_finalizer_capacity() -> None:
+    run_id = RunId(uuid4())
+    tracker = CandidateCapTracker(cap=100)
+    assert [tracker.try_reserve(run_id) for _ in range(100)] == [True] * 100
+    assert tracker.try_reserve(run_id) is False
+    with pytest.raises(ValueError, match="less than or equal to 100"):
+        TierAConfig(candidate_cap_per_run=101)
+
+
+def _rejection_overflow_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    count: int,
+    reverse: bool = False,
+    omitted_reason: str = "schema:empty_content",
+) -> TierAPlan:
+    """Build scanner rejections with a stable semantic sort key, not order."""
+
+    run_id = RunId(uuid4())
+    proposals = tuple(_proposal(run_id, f"overflow_{index}") for index in range(count))
+    indexes = {render_note(proposal.note): index for index, proposal in enumerate(proposals)}
+
+    def reject(content: str, *, context: object) -> ScanResult:
+        del context
+        index = indexes[content]
+        return ScanResult(
+            passed=False,
+            reasons=(omitted_reason if index == 100 else "schema:empty_content",),
+            content_hash=f"{index:064x}",
+            suite_version=SUITE_VERSION,
+        )
+
+    monkeypatch.setattr(tier_a_lane_module, "scan", reject)
+    ordered = tuple(reversed(proposals)) if reverse else proposals
+    return TierALane(
+        cfg=_cfg(cap=100), clock=FakeClock(_TS), extractors=(_Extractor(ordered),)
+    ).plan(_scope(), {})
+
+
+def test_rejection_overflow_retains_the_first_hundred_and_aggregates_the_101st(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exact = _rejection_overflow_plan(monkeypatch, count=100)
+    assert len(exact.rejections) == 100
+    assert exact.rejection_overflow is None
+
+    plan = _rejection_overflow_plan(monkeypatch, count=101)
+    overflow = plan.rejection_overflow
+    assert len(plan.rejections) == 100
+    assert overflow is not None
+    assert (overflow.total_count, overflow.omitted_count) == (101, 1)
+    assert overflow.mem_type_counts == ((MemType.EPISODIC, 1),)
+    assert overflow.reason_counts == (("schema:empty_content", 1),)
+    assert all("overflow_" not in value for value in (repr(overflow), str(overflow)))
+    assert sum(
+        outcome.skipped_reason is not None
+        and outcome.skipped_reason.startswith("scan_rejected_aggregated: ")
+        for outcome in plan.outcomes
+    ) == 1
+
+
+def test_rejection_overflow_is_order_invariant_and_commits_omitted_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forward = _rejection_overflow_plan(monkeypatch, count=101)
+    reversed_plan = _rejection_overflow_plan(monkeypatch, count=101, reverse=True)
+    changed_omitted = _rejection_overflow_plan(
+        monkeypatch, count=101, omitted_reason="schema:control_characters"
     )
 
-    first = lane.run_batch(scope, traces)
-    assert len(first.inserted) == 1
-    # The store now holds it, exactly as a real insert would have left it.
-    stored_id = vault.remember(scope.project_id, first.inserted[0].content)
-
-    second = lane.run_batch(scope, traces)
-
-    assert second.inserted == ()
-    assert len(second.deduplicated) == 1
-    assert second.deduplicated[0].memory_id == stored_id
-    assert len(writer.inserted) == 1  # the store was written exactly once
-
-
-def test_a_duplicate_names_the_existing_row_rather_than_vanishing() -> None:
-    """A dropped outcome and a deduplicated one look identical to a caller
-    that only counts writes. The run really did re-observe the condition; the
-    only thing that did not happen is a second INSERT, so the outcome still
-    carries the id of the row that holds the content."""
-    scope = _scope()
-    traces = _one_run_two_extractors_would_both_fire()
-    writer = _FakeWriter()
-    vault = _FakeVault()
-    lane = TierALane(cfg=_cfg(), clock=FakeClock(_BASE_TS), writer=writer, known_content=vault)
-
-    probe = lane.run_batch(scope, traces)
-    existing = vault.remember(scope.project_id, probe.inserted[0].content)
-
-    result = lane.run_batch(scope, traces)
-
-    assert result.deduplicated[0].memory_id == existing
-    assert result.deduplicated[0].skipped_reason is None
-    assert len(writer.inserted) == 1  # the probe's insert, and nothing since
+    assert [
+        (rejection.content_hash, rejection.mem_type, rejection.suite_version, rejection.reasons)
+        for rejection in forward.rejections
+    ] == [
+        (rejection.content_hash, rejection.mem_type, rejection.suite_version, rejection.reasons)
+        for rejection in reversed_plan.rejections
+    ]
+    assert forward.rejection_overflow == reversed_plan.rejection_overflow
+    assert forward.rejection_overflow is not None
+    assert changed_omitted.rejection_overflow is not None
+    assert forward.rejection_overflow.omitted_digest != changed_omitted.rejection_overflow.omitted_digest
 
 
-def test_the_dedupe_is_scoped_to_one_project() -> None:
-    """A content hash another project holds must not suppress this project's
-    write (invariant 4). The port is asked with THIS project's id and the fake
-    vault keys on the pair."""
-    traces = _one_run_two_extractors_would_both_fire()
-    vault = _FakeVault()
-
-    a_writer = _FakeWriter()
-    scope_a = _scope()
-    a = TierALane(cfg=_cfg(), clock=FakeClock(_BASE_TS), writer=a_writer, known_content=vault)
-    first = a.run_batch(scope_a, traces)
-    vault.remember(scope_a.project_id, first.inserted[0].content)
-
-    b_writer = _FakeWriter()
-    scope_b = _scope()
-    b = TierALane(cfg=_cfg(), clock=FakeClock(_BASE_TS), writer=b_writer, known_content=vault)
-    second = b.run_batch(scope_b, traces)
-
-    assert len(second.inserted) == 1
-    assert len(b_writer.inserted) == 1
-    assert all(project == scope_b.project_id for project in b_writer.projects)
-    assert all(project_id == scope_b.project_id for project_id, _ in vault.queries[-1:])
+def test_rejection_overflow_stays_bounded_for_a_large_scanner_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _rejection_overflow_plan(monkeypatch, count=512)
+    overflow = plan.rejection_overflow
+    assert len(plan.rejections) == 100
+    assert overflow is not None
+    assert (overflow.total_count, overflow.omitted_count) == (512, 412)
+    assert len(overflow.omitted_digest) == 32
+    assert len(overflow.mem_type_counts) == len(overflow.reason_counts) == 1
 
 
-def test_dedupe_is_durable_is_false_without_a_store_port() -> None:
-    """The in-batch guarantee and the cross-batch one are different promises,
-    and a caller must be able to tell which one it has. With no port injected,
-    a redelivered batch DOES duplicate -- asserted here rather than left as a
-    docstring claim."""
-    scope = _scope()
-    traces = _one_run_two_extractors_would_both_fire()
-    writer = _FakeWriter()
-    lane = TierALane(cfg=_cfg(), clock=FakeClock(_BASE_TS), writer=writer)
+def test_all_four_extractors_flow_through_one_real_scan_content_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every emitted candidate is the exact string scanned and planned.
 
-    first = lane.run_batch(scope, traces)
-    second = lane.run_batch(scope, traces)
-
-    assert first.dedupe_is_durable is False
-    assert len(first.inserted) == 1
-    assert len(second.inserted) == 1
-    assert len(writer.inserted) == 2
-
-
-def test_the_store_is_consulted_once_per_note_not_once_per_trace() -> None:
-    """The dedupe query runs after the cap and the scan, so its call count is
-    bounded by candidates, not by trace volume -- the same "cost scales with
-    vault size, not trace volume" property Phase 2's gate asserts for sweeps.
+    The raw body contains zero-width, bidi, and control characters.  It is
+    intentionally present on the events that satisfy all four real
+    extractors, so a future accidental template/input widening cannot hide
+    behind a synthetic proposal fixture.
     """
-    scope = _scope()
-    vault = _FakeVault()
-    writer = _FakeWriter()
-    traces: dict[RunId, Sequence[TraceEvent]] = {}
-    for _ in range(20):
-        traces[RunId(uuid4())] = [
+    raw = "canary\u200b\u202e\x00must-not-reach-tier-a"
+    run_a, run_b = RunId(uuid4()), RunId(uuid4())
+
+    def trace(run_id: RunId, offset: int, *, results: bool) -> list[TraceEvent]:
+        events: list[TraceEvent] = [
             _start(),
-            _error(_BASE_TS, "tool_a", ErrorClassEnum.TIMEOUT),
-            _error(_BASE_TS + timedelta(seconds=1), "tool_a", ErrorClassEnum.TIMEOUT),
+            ToolCall(type="tool_call", ts=_TS + timedelta(seconds=offset), payload={"tool_id": "tool_a", "tool_version": "v1"}),
+            ToolCall(type="tool_call", ts=_TS + timedelta(seconds=offset + 1), payload={"tool_id": "tool_b", "tool_version": "v1"}),
+            ToolCall(type="tool_call", ts=_TS + timedelta(seconds=offset + 2), payload={"tool_id": "tool_c", "tool_version": "v1"}),
+            ErrorEvent(
+                type="error",
+                ts=_TS + timedelta(seconds=offset + 3),
+                payload={
+                    "tool_id": "tool_a",
+                    "tool_version": "v1",
+                    "error_class": ErrorClassEnum.SCHEMA_VALIDATION.value,
+                    "schema_fields": ["field_name"],
+                    "error_body": raw,
+                },
+            ),
         ]
+        if results:
+            events.extend(
+                ToolResult(
+                    type="tool_result",
+                    ts=_TS + timedelta(seconds=offset + 4 + index),
+                    payload={
+                        "tool_id": "tool_a",
+                        "tool_version": "v1",
+                        "duration_ms": duration,
+                        "result_body": raw,
+                    },
+                )
+                for index, duration in enumerate((10, 11, 12, 13, 14, 100, 110))
+            )
+        return events
 
-    result = TierALane(
-        cfg=_cfg(), clock=FakeClock(_BASE_TS), writer=writer, known_content=vault
-    ).run_batch(scope, traces)
+    captured: list[str] = []
 
-    assert len(vault.queries) == len(result.inserted) + len(result.deduplicated)
+    def capture_scan(content: str, *, context: object) -> ScanResult:
+        captured.append(content)
+        # Preserve the real scan implementation; only its boundary is
+        # observed here.
+        return real_scan(content, context=context)  # type: ignore[arg-type]
 
-
-def test_identical_content_rendered_twice_in_one_batch_is_one_insert_and_one_duplicate() -> None:
-    """A set of "duplicate hashes" cannot split these two: the first render is
-    a real insert and the second is a duplicate of it. The writer keeps a
-    per-call log for exactly this case."""
+    monkeypatch.setattr(tier_a_lane_module, "scan", capture_scan)
     scope = _scope()
-    writer = _FakeWriter()
-    traces = _one_run_two_extractors_would_both_fire()
-    # Two instances of the SAME extractor over the same traces: the second
-    # renders content byte-identical to the first's. The cap is raised to 4 so
-    # the second instance is stopped by the DEDUPE and not by the budget --
-    # otherwise this test would pass without the dedupe existing at all.
-    lane = TierALane(
-        cfg=_cfg(candidate_cap_per_run=4),
-        clock=FakeClock(_BASE_TS),
-        writer=writer,
-        extractors=(ToolFailureExtractor(), ToolFailureExtractor()),
+    plan = TierALane(cfg=_cfg(cap=4), clock=FakeClock(_TS)).plan(
+        scope,
+        {run_a: trace(run_a, 0, results=True), run_b: trace(run_b, 60, results=False)},
     )
 
-    result = lane.run_batch(scope, traces)
-
-    assert len(result.inserted) == 2  # tool_a/timeout and tool_b/schema
-    assert len(result.deduplicated) == 2  # the second instance's re-renders
-    assert {o.content for o in result.inserted} == {o.content for o in result.deduplicated}
-    by_content = {o.content: o.memory_id for o in result.inserted}
-    assert all(o.memory_id == by_content[o.content] for o in result.deduplicated)
-    assert len(writer.inserted) == 2
-
-
-# --------------------------------------------------------------------------- #
-# Project homogeneity and construction
-# --------------------------------------------------------------------------- #
-
-
-def test_every_write_carries_the_batch_s_own_project_id() -> None:
-    scope = _scope()
-    writer = _FakeWriter()
-    _lane(writer).run_batch(scope, _one_run_two_extractors_would_both_fire())
-
-    assert writer.projects == [scope.project_id]
-
-
-def test_no_state_survives_between_batches_of_different_projects() -> None:
-    """The cap tracker and the dedupe cache are both built per call. A tracker
-    that outlived a batch would let one project's run counts bind another
-    project's cap; a dedupe cache that did would be a cross-project read."""
-    writer = _FakeWriter()
-    lane = _lane(writer)
-    traces = _one_run_two_extractors_would_both_fire()
-
-    a = lane.run_batch(_scope(), traces)
-    b = lane.run_batch(_scope(), traces)
-
-    assert len(a.inserted) == 1
-    assert len(b.inserted) == 1
-
-
-def test_a_lane_with_no_extractors_is_refused() -> None:
-    with pytest.raises(ValueError):
-        TierALane(cfg=_cfg(), clock=FakeClock(_BASE_TS), writer=_FakeWriter(), extractors=())
-
-
-def test_outcomes_reports_everything_considered_including_the_capped_ones() -> None:
-    """A capped pattern is a detection the operator should be able to see. It
-    is in `outcomes` with a `skipped_reason`, not silently absent."""
-    writer = _FakeWriter()
-    result = _lane(writer).run_batch(_scope(), _one_run_two_extractors_would_both_fire())
-
-    capped = [o for o in result.outcomes if o.memory_id is None]
-    # tool_failure sees BOTH conditions (it groups every error class), so it
-    # emits one and is capped on the second; schema_failure then sees its own
-    # group and is capped too. Two detections, one written note, and the two
-    # refusals are visible with the reason rather than silently absent.
-    assert len(capped) == 2
-    assert all("candidate_cap_per_run" in (o.skipped_reason or "") for o in capped)
-    assert all(isinstance(o, ExtractionOutcome) for o in capped)
-
-
-def test_an_empty_batch_writes_nothing_and_does_not_raise() -> None:
-    writer = _FakeWriter()
-    result = _lane(writer).run_batch(_scope(), {})
-
-    assert result.outcomes == ()
-    assert result.inserted == ()
-    assert writer.inserted == []
+    assert {candidate.item.kind for candidate in plan.candidates} == {
+        "tool_failure_pattern",
+        "schema_failure_pattern",
+        "latency_outlier",
+        "failure_precursor_sequence",
+    }
+    assert {
+        (candidate.item.kind, candidate.item.mem_type) for candidate in plan.candidates
+    } == set(TIER_A_KIND_MEM_TYPES.items())
+    with pytest.raises(TypeError):
+        cast(dict[str, MemType], TIER_A_KIND_MEM_TYPES)["attacker_kind"] = MemType.LESSON
+    assert captured == [outcome.content for outcome in plan.outcomes]
+    assert [candidate.item.content for candidate in plan.candidates] == [
+        outcome.content for outcome in plan.outcomes if outcome.skipped_reason is None
+    ]
+    for candidate in plan.candidates:
+        matching_outcome = next(
+            outcome for outcome in plan.outcomes if outcome.content == candidate.item.content
+        )
+        assert candidate.item.content == render_note(matching_outcome.note)
+        assert candidate.scan_result.content_hash == content_hash(candidate.item.content)
+        source = raw.encode("utf-8")
+        rendered = candidate.item.content.encode("utf-8")
+        assert all(source[index : index + 8] not in rendered for index in range(len(source) - 7))

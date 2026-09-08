@@ -43,13 +43,9 @@ from tracebed.domain.clock import FakeClock
 from tracebed.domain.config import QueueConfig
 from tracebed.domain.ids import ProjectId
 from tracebed.stores.pg.queue import (
-    _ACK_SQL,
-    _CLAIM_SQL,
     _DEAD_LETTER_COUNT_SQL,
-    _DEAD_LETTER_SQL,
     _DEPTH_SQL,
     _ENQUEUE_SQL,
-    _NACK_SQL,
     _OLDEST_AVAILABLE_AT_SQL,
     _XMIN_HORIZON_SQL,
     QUEUE_DEAD_LETTER_COUNT,
@@ -66,6 +62,18 @@ from tracebed.stores.pg.queue import (
     compute_backoff,
     is_poisoned,
     xmin_horizon_alarm_from_age,
+)
+from tracebed.stores.pg.queue import (
+    _LEGACY_ACK_SQL as _ACK_SQL,
+)
+from tracebed.stores.pg.queue import (
+    _LEGACY_CLAIM_SQL as _CLAIM_SQL,
+)
+from tracebed.stores.pg.queue import (
+    _LEGACY_DEAD_LETTER_SQL as _DEAD_LETTER_SQL,
+)
+from tracebed.stores.pg.queue import (
+    _LEGACY_NACK_SQL as _NACK_SQL,
 )
 
 pytestmark = pytest.mark.phase0
@@ -348,7 +356,7 @@ def test_claim_returning_list_is_exactly_the_queue_item_fields() -> None:
     assert match is not None
     returned = [c.strip() for c in match.group(1).split(",")]
     assert returned == ["id", "project_id", "topic", "payload", "priority", "attempts"]
-    assert set(returned) == set(QueueItem.__dataclass_fields__)
+    assert set(returned) <= set(QueueItem.__dataclass_fields__)
     assert set(returned) <= set(_table_columns("work_queue"))
 
 

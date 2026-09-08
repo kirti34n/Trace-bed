@@ -34,6 +34,8 @@ from typing import Any
 import psycopg
 import pytest
 from psycopg.abc import PyFormat
+from psycopg.errors import QueryCanceled
+from psycopg_pool import PoolTimeout
 
 from tracebed.domain.clock import FakeClock
 from tracebed.domain.enums import (
@@ -53,6 +55,7 @@ from tracebed.domain.errors import (
     IllegalTransition,
     NotFound,
     ProvenanceIncomplete,
+    RequestDeadlineExceeded,
     ScanVerdictForgery,
 )
 from tracebed.domain.ids import (
@@ -147,15 +150,26 @@ class _FakePool:
 
     def __init__(self) -> None:
         self.log: list[tuple[str, Any]] = []
+        self.checkout_timeouts: list[float] = []
 
     @contextmanager
-    def connection(self) -> Iterator[_FakeConnection]:
+    def connection(self, *, timeout: float | None = None) -> Iterator[_FakeConnection]:
+        if timeout is not None:
+            self.checkout_timeouts.append(timeout)
         yield _FakeConnection(self.log)
 
 
 def _repo() -> tuple[Repo, _FakePool]:
     pool = _FakePool()
     return Repo(pool, FakeClock(EPOCH)), pool  # type: ignore[arg-type]
+
+
+class _SteppingBudget:
+    def __init__(self, values: list[float]) -> None:
+        self._values = iter(values)
+
+    def remaining_ms(self) -> float:
+        return next(self._values)
 
 
 # --------------------------------------------------------------------------------------- #
@@ -188,6 +202,7 @@ def _trace_upsert() -> TraceIndexUpsert:
         ended_at=None,
         payload_ref=None,
         outcome_status=TraceOutcomeStatus.PENDING,
+        envelope_versions=(1,),
     )
 
 
@@ -226,31 +241,31 @@ def _calls(repo: Repo) -> dict[str, Any]:
             day=date(2026, 1, 1),
         ),
         "list_memories": lambda: repo.list_memories(PROJECT),
+        "list_memories_page": lambda: repo.list_memories_page(PROJECT),
         "upsert_trace_index": lambda: repo.upsert_trace_index(PROJECT, _trace_upsert()),
         "get_trace_index": lambda: repo.get_trace_index(PROJECT, RUN),
         "list_runs": lambda: repo.list_runs(PROJECT),
         "find_runs_missing_sentinel": lambda: repo.find_runs_missing_sentinel(PROJECT, EPOCH),
         "mark_run_incomplete": lambda: repo.mark_run_incomplete(PROJECT, RUN),
-        "append_trace_subject": lambda: repo.append_trace_subject(PROJECT, RUN, ["user:a"]),
         "insert_outcome_event": lambda: repo.insert_outcome_event(PROJECT, _outcome()),
         "insert_retrieval_event": lambda: repo.insert_retrieval_event(PROJECT, _retrieval()),
         "insert_injection_rows": lambda: repo.insert_injection_rows(
             PROJECT, RUN, [InjectionRow(memory_id=MEMORY, slot=Slot.FACT, score=1.0, tokens=3)]
         ),
-        "spend_add": lambda: repo.spend_add(
-            PROJECT, date(2026, 1, 1), "w", "m", 1, 2, 0.5
-        ),
+        "spend_add": lambda: repo.spend_add(PROJECT, date(2026, 1, 1), "w", "m", 1, 2, 0.5),
         "spend_by_day": lambda: repo.spend_by_day(PROJECT, date(2026, 1, 1)),
         "spend_since": lambda: repo.spend_since(PROJECT, date(2026, 1, 1)),
         "get_subject_key": lambda: repo.get_subject_key(PROJECT, "user:a"),
+        "get_subject_key_by_digest": lambda: repo.get_subject_key_by_digest(PROJECT, b"d" * 32),
         "insert_subject_key": lambda: repo.insert_subject_key(
             PROJECT, "user:a", uuid.uuid4(), b"kek"
         ),
-        "destroy_subject_key": lambda: repo.destroy_subject_key(PROJECT, "user:a"),
+        "insert_subject_key_v2": lambda: repo.insert_subject_key_v2(
+            PROJECT, b"d" * 32, uuid.uuid4(), b"k" * 60
+        ),
         "insert_review_item": lambda: repo.insert_review_item(PROJECT, "reason"),
         "list_review_items": lambda: repo.list_review_items(PROJECT),
         "list_killswitch_state": lambda: repo.list_killswitch_state(PROJECT),
-        "insert_invalidation_event": lambda: repo.insert_invalidation_event(PROJECT, "kind"),
         "list_invalidation_events": lambda: repo.list_invalidation_events(PROJECT),
         "get_project_config": lambda: repo.get_project_config(PROJECT),
         "get_agent_type_config": lambda: repo.get_agent_type_config(PROJECT, AGENT_TYPE),
@@ -621,6 +636,26 @@ def test_list_memories_status_filter_reaches_the_query() -> None:
     assert params["statuses"] == [Status.VALIDATED.value]
 
 
+def test_list_memories_page_uses_total_keyset_order_and_fetches_one_extra() -> None:
+    repo, pool = _repo()
+    anchor = datetime(2026, 1, 1, tzinfo=UTC)
+    repo.list_memories_page(
+        PROJECT,
+        statuses=[Status.VALIDATED],
+        limit=10,
+        before_created_at=anchor,
+        before_id=MEMORY,
+    )
+    selects = [(sql, params) for sql, params in pool.log if "FROM memory_item" in sql]
+    assert selects
+    sql, params = selects[0]
+    assert "(created_at, id) <" in sql
+    assert "ORDER BY created_at DESC, id DESC" in sql
+    assert params["limit"] == 11
+    assert params["before_created_at"] == anchor
+    assert params["before_id"] == MEMORY
+
+
 @pytest.mark.parametrize(
     ("requested", "expected"), [(0, 1), (-5, 1), (10, 10), (MAX_ROW_LIMIT + 5000, MAX_ROW_LIMIT)]
 )
@@ -674,7 +709,9 @@ def test_trace_index_upsert_never_regresses_a_finished_run_to_pending() -> None:
     # server itself wrote from `hotpath.holdout.assign_arm`.
     assert "%(arm)s" not in body
     assert "SELECT re.arm FROM retrieval_event re" in body
-    assert body.rstrip().endswith("), trace_index.arm)")
+    assert body.rstrip().endswith(
+        "), trace_index.arm) WHERE trace_index.outcome_status NOT IN ('ok', 'error', 'cancelled')"
+    )
     # Postgres rejects two assignments to the same column in one DO UPDATE SET with
     # "multiple assignments to same column" -- the CASE rules must REPLACE the plain
     # `EXCLUDED.x` assignments, not sit beside them. Every upsert would fail outright.
@@ -691,14 +728,11 @@ def test_trace_index_upsert_never_regresses_a_finished_run_to_pending() -> None:
     assert "@" not in body
 
 
-def test_append_trace_subject_deduplicates_caller_supplied_tags() -> None:
-    """`subject_tags` comes from a caller-supplied trace payload (C-05); repeating one tag N
-    times must not become N statements.
-    """
-    repo, pool = _repo()
-    repo.append_trace_subject(PROJECT, RUN, ["user:a", "user:a", "user:b", "user:a"])
-    inserts = [p for sql, p in pool.log if "INSERT INTO trace_subject" in sql]
-    assert [p["subject_tag"] for p in inserts] == ["user:a", "user:b"]
+def test_raw_trace_subject_append_is_not_a_repository_surface() -> None:
+    """E2 accepts typed tags only through its profiled authority bind."""
+
+    assert not hasattr(Repo, "append_trace_subject")
+    assert not hasattr(ScopedRepo, "append_trace_subject")
 
 
 def test_memory_queries_do_not_select_star() -> None:
@@ -707,7 +741,10 @@ def test_memory_queries_do_not_select_star() -> None:
     every by-id fetch and bound this module to column order.
     """
     repo, pool = _repo()
-    for call in (lambda: repo.get_memory_by_id(PROJECT, MEMORY), lambda: repo.list_memories(PROJECT)):
+    for call in (
+        lambda: repo.get_memory_by_id(PROJECT, MEMORY),
+        lambda: repo.list_memories(PROJECT),
+    ):
         with suppress(Exception):
             call()
     for sql, _ in pool.log:
@@ -740,7 +777,6 @@ def test_repo_tx_yields_a_usable_scoped_repo_bound_to_one_transaction() -> None:
     repo, pool = _repo()
     with repo.tx(PROJECT) as tx:
         tx.upsert_trace_index(_trace_upsert())
-        tx.append_trace_subject(RUN, ["user:a"])
     guc = [sql for sql, _ in pool.log if "set_config" in sql]
     assert len(guc) == 1, f"expected exactly one GUC statement per tx(), got {len(guc)}"
     assert "set_config" in pool.log[0][0]
@@ -859,16 +895,6 @@ def test_spend_rows_are_plain_floats_not_decimals() -> None:
     assert row.cost_usd + 0.5 == 1.75  # the operation that used to raise TypeError
 
 
-def test_destroy_subject_key_preserves_the_first_erasure_timestamp() -> None:
-    """`destroyed_at` is the record that an erasure request was honoured, and the row is the only
-    place it exists. A retry, a replayed queue item or a double click must not move it forward.
-    """
-    repo, pool = _repo()
-    repo.destroy_subject_key(PROJECT, "user:a")
-    sql = next(s for s, _ in pool.log if "UPDATE subject_key" in s)
-    assert "COALESCE(destroyed_at" in sql
-
-
 def test_set_project_config_stamps_updated_at_from_the_injected_clock() -> None:
     """Hard rule 5 / PLAN.md §7 Phase 2's simulated-clock soak: every timestamp Tracebed writes
     must move with `Clock`, not with the database's `now()` default (which also never fires on
@@ -879,6 +905,158 @@ def test_set_project_config_stamps_updated_at_from_the_injected_clock() -> None:
     sql, params = next((s, p) for s, p in pool.log if "INTO project_config" in s)
     assert "updated_at = EXCLUDED.updated_at" in sql
     assert params["updated_at"] == EPOCH
+
+
+@pytest.mark.parametrize(
+    "read_config",
+    [
+        lambda repo, deadline: repo.get_project_config(PROJECT, deadline=deadline),
+        lambda repo, deadline: repo.get_agent_type_config(PROJECT, AGENT_TYPE, deadline=deadline),
+        lambda repo, deadline: repo.get_killswitch_overlay(PROJECT, AGENT_TYPE, deadline=deadline),
+    ],
+)
+def test_config_reads_keep_rls_first_and_refresh_the_remaining_query_timeout(
+    read_config: Any,
+) -> None:
+    """Each deadline-bearing config read uses one budget for checkout and its data query."""
+    repo, pool = _repo()
+    deadline = _SteppingBudget([250.0, 200.0, 137.0, 137.0])
+
+    read_config(repo, deadline)
+
+    assert pool.checkout_timeouts == [0.25]
+    assert pool.log[0] == (pool_module._SET_PROJECT_GUC, {"project_id": str(PROJECT)})
+    assert pool.log[1] == (
+        pool_module._SET_STATEMENT_TIMEOUT,
+        {"statement_timeout_ms": "200"},
+    )
+    assert pool.log[2] == (
+        pool_module._SET_STATEMENT_TIMEOUT,
+        {"statement_timeout_ms": "137"},
+    )
+    assert "SELECT" in pool.log[3][0]
+
+
+def test_expired_concrete_config_checkout_is_the_request_expiry_signal() -> None:
+    repo, pool = _repo()
+
+    with pytest.raises(RequestDeadlineExceeded):
+        repo.get_project_config(PROJECT, deadline=_SteppingBudget([250.0, 0.0]))
+
+    assert pool.log == []
+
+
+def test_principal_lookup_uses_the_request_budget_for_checkout_and_query_timeout() -> None:
+    repo, pool = _repo()
+
+    assert (
+        repo.get_principal_by_external_ref(
+            "principal-ref",
+            kind="api_key",
+            deadline=_SteppingBudget([250.0, 200.0, 180.0, 137.0, 137.0]),
+        )
+        is None
+    )
+
+    assert pool.checkout_timeouts == [0.25]
+    assert pool.log[0] == (
+        pool_module._SET_STATEMENT_TIMEOUT,
+        {"statement_timeout_ms": "137"},
+    )
+    assert "SELECT principal_id" in pool.log[1][0]
+
+
+def test_expired_principal_lookup_checkout_is_the_named_request_expiry() -> None:
+    repo, pool = _repo()
+
+    with pytest.raises(RequestDeadlineExceeded):
+        repo.get_principal_by_external_ref(
+            "principal-ref", kind="api_key", deadline=_SteppingBudget([0.0])
+        )
+
+    assert pool.log == []
+
+
+def test_principal_lookup_translates_only_lazy_checkout_timeout_with_its_cause() -> None:
+    checkout_error = PoolTimeout("checkout stalled")
+
+    class LazyTimeout:
+        def __enter__(self) -> _FakeConnection:
+            raise checkout_error
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+    class Pool:
+        def __init__(self) -> None:
+            self.timeouts: list[float] = []
+
+        def connection(self, *, timeout: float | None = None) -> LazyTimeout:
+            assert timeout is not None
+            self.timeouts.append(timeout)
+            return LazyTimeout()
+
+    pool = Pool()
+    repo = Repo(pool, FakeClock(EPOCH))  # type: ignore[arg-type]
+
+    with pytest.raises(RequestDeadlineExceeded) as raised:
+        repo.get_principal_by_external_ref(
+            "principal-ref", kind="api_key", deadline=_SteppingBudget([123.0])
+        )
+
+    assert isinstance(raised.value.__cause__, pool_module.PoolDeadlineExceeded)
+    assert raised.value.__cause__.__cause__ is checkout_error
+    assert pool.timeouts == [0.123]
+
+
+def test_principal_lookup_refresh_expiry_starts_no_select() -> None:
+    repo, pool = _repo()
+
+    with pytest.raises(RequestDeadlineExceeded):
+        repo.get_principal_by_external_ref(
+            "principal-ref", kind="api_key", deadline=_SteppingBudget([250.0, 200.0, 180.0, 0.0])
+        )
+
+    assert not any("SELECT principal_id" in sql for sql, _ in pool.log)
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_principal_lookup_preserves_early_query_cancellation_and_translates_expired(
+    expired: bool,
+) -> None:
+    query_error = QueryCanceled("statement cancelled")
+
+    class Cursor(_FakeCursor):
+        def execute(self, sql: str, params: Any = None) -> _FakeCursor:
+            self._log.append((sql, params))
+            if "SELECT principal_id" in sql:
+                raise query_error
+            return self
+
+    class Connection(_FakeConnection):
+        def cursor(self, name: str | None = None, **kwargs: Any) -> Cursor:
+            return Cursor(self._log, name=name)
+
+    class Pool(_FakePool):
+        @contextmanager
+        def connection(self, *, timeout: float | None = None) -> Iterator[_FakeConnection]:
+            if timeout is not None:
+                self.checkout_timeouts.append(timeout)
+            yield Connection(self.log)
+
+    pool = Pool()
+    repo = Repo(pool, FakeClock(EPOCH))  # type: ignore[arg-type]
+    tail = 0.0 if expired else 99.0
+    deadline = _SteppingBudget([250.0, 200.0, 180.0, 137.0, 137.0, tail])
+
+    if expired:
+        with pytest.raises(RequestDeadlineExceeded) as raised:
+            repo.get_principal_by_external_ref("principal-ref", kind="api_key", deadline=deadline)
+        assert raised.value.__cause__ is query_error
+    else:
+        with pytest.raises(QueryCanceled) as raised:
+            repo.get_principal_by_external_ref("principal-ref", kind="api_key", deadline=deadline)
+        assert raised.value is query_error
 
 
 def test_export_rows_are_json_serialisable() -> None:

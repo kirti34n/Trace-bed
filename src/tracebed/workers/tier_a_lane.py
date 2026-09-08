@@ -1,147 +1,82 @@
-"""The Tier A lane coordinator -- the one caller that runs all four extractors.
+"""Pure Tier-A planning for the trace-learning worker.
 
-Two cross-chunk defects made this module necessary; neither was fixable inside
-any single extractor, because both are properties of the lane rather than of
-any parser in it.
-
-1. `tier_a.candidate_cap_per_run` is per RUN, not per extractor. Each
-   `Extractor.extract` accepts an optional `CandidateCapTracker` precisely so
-   one budget can span the lane, but an optional parameter nobody passes is a
-   cap of 1 behaving as a cap of 4. This module builds exactly one tracker per
-   batch and threads it through all four, in a fixed order, so "one candidate
-   per run" is what the lane does rather than what its config field says.
-
-2. The emission path is not idempotent. `stores.pg.repo.Repo.insert_memory_item`
-   is a plain INSERT and `memory_item` carries no uniqueness constraint on
-   content (migrations/0002_partitioned.sql declares `PRIMARY KEY (project_id,
-   id)` and nothing else), while `queue.lease_seconds` / `queue.max_attempts`
-   make redelivery of a work item ordinary rather than exceptional. Re-running
-   a batch therefore re-inserts every candidate it already inserted, which
-   attacks Phase 2's own gate ("net vault growth rate strictly decreasing
-   week-over-week") from inside the very lane the gate measures.
-
-   The dedupe is interposed at the WRITER, not applied to the outcomes
-   afterwards, and that placement is the whole design. `emit_candidate`
-   reserves a cap slot before it renders and scans, so a filter applied after
-   extraction would let an already-stored note spend a run's one candidate
-   slot and starve a genuinely new sibling. At the writer, the duplicate never
-   becomes an INSERT and the `ExtractionOutcome` still names the memory_id of
-   the row that already holds the content -- which is what idempotent means
-   here, as opposed to "silently dropped".
-
-   It has two halves and they are not the same guarantee. WITHIN one batch it
-   is exact and needs nothing from any store. ACROSS batches it is exactly as
-   good as the injected `KnownContentPort`; with none, a redelivered batch
-   still duplicates and `TierALaneResult.dedupe_is_durable` says so rather
-   than implying a promise this module cannot keep. The structural fix is a
-   unique index on `(project_id, content_hash)`, which is a migration against
-   Phase 0's frozen DDL -- recorded as a contract gap, not invented here.
-
-PROJECT HOMOGENEITY (invariant 4). `run_batch` takes ONE `ProjectScope` and
-attributes every trace in the batch to it; there is deliberately no per-run
-project argument, so a batch cannot be assembled from two projects' traces and
-write one project's observations into the other's vault.
-`workers.runner.group_by_project` is what guarantees a queue batch is
-single-project before it reaches here, and the dedupe cache below is likewise
-keyed within one scope and rebuilt per batch -- a cache that outlived a batch
-would be a cross-project read waiting to happen.
+Tier A turns already-decrypted trace events into *candidate plans*.  It does
+not own a repository, review queue, or job queue: persistence belongs to the
+fenced trace-learning finalizer.  Keeping this boundary strict matters for a
+leased job: a lost lease must be able to discard every plaintext-derived plan
+without leaving a partial memory or review behind.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from dataclasses import dataclass, field, replace
 
-from tracebed.core.scans import ReviewQueueWriter
-from tracebed.domain.canonical import content_hash
+from tracebed.core.scans import ScanContext, ScanResult, scan
+from tracebed.core.scans.tier_a_template import render_note
 from tracebed.domain.clock import Clock
-from tracebed.domain.config import EffectiveConfig
+from tracebed.domain.config import MAX_TIER_A_INDIVIDUAL_REJECTIONS_PER_RESULT, EffectiveConfig
+from tracebed.domain.enums import Lane, MemType, ProvenanceClass, TrustTier
 from tracebed.domain.events import TraceEvent
-from tracebed.domain.ids import MemoryId, ProjectId, RunId
+from tracebed.domain.ids import RunId
 from tracebed.domain.memory import NewMemoryItem
-from tracebed.domain.scan import ScanVerdict
 from tracebed.domain.scope import ProjectScope
 from tracebed.workers.extractors import (
     CandidateCapTracker,
     ExtractionOutcome,
     Extractor,
     LatencyOutlierExtractor,
-    MemoryWriterPort,
     SchemaFailureExtractor,
     SequencePatternExtractor,
+    TierACandidateProposal,
     ToolFailureExtractor,
+    build_candidate_item,
 )
+from tracebed.workers.trace_learning import TierARejectionOverflow, build_tier_a_rejection_overflow
 
 __all__ = [
-    "KnownContentPort",
     "TierALane",
-    "TierALaneResult",
+    "TierAPlan",
+    "TierAPlannedCandidate",
+    "TierAScanRejection",
     "default_extractors",
 ]
 
 
-@runtime_checkable
-class KnownContentPort(Protocol):
-    """"Does this project already hold a memory with exactly this content?"
+@dataclass(frozen=True, slots=True)
+class TierAPlannedCandidate:
+    """A scanned Tier-A candidate awaiting one fenced finalization transaction."""
 
-    Declared here rather than imported from `stores.pg` for the reason every
-    port under `workers/` is: there is no Postgres on the build machine, and a
-    lane that could only be exercised against a live database is a lane that
-    ships unexercised.
-
-    Called at most once per note that has already passed the per-run cap and
-    the scan, so the call count is bounded by `tier_a.candidate_cap_per_run`
-    times the number of runs in the batch -- not by trace volume.
-
-    CONTRACT GAP: no method on `stores.pg.repo.Repo` satisfies this today. The
-    query it needs (a project-scoped `SELECT id FROM memory_item WHERE
-    project_id = %(project_id)s AND content_hash = %(content_hash)s`) belongs
-    in `stores/pg/`, which no Phase 2 chunk owned. Until it exists the lane
-    runs with `known_content=None` and dedupes within a batch only.
-    """
-
-    def find_memory_by_content_hash(
-        self, project_id: ProjectId, content_hash_hex: str
-    ) -> MemoryId | None: ...
+    item: NewMemoryItem
+    scan_result: ScanResult
+    primary_run_id: RunId
+    contributing_run_ids: tuple[RunId, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class TierALaneResult:
-    """What one batch did, in enough detail to audit it without the store.
+class TierAScanRejection:
+    """A deterministic scan refusal to persist only if the lease is still held."""
 
-    `outcomes` is every pattern every extractor considered, in extractor order
-    -- including the ones this lane refused -- so "the cap bound here" and
-    "this note was already in the vault" are visible rather than inferred from
-    an absence.
-    """
+    mem_type: MemType
+    content_hash: str
+    suite_version: str
+    reasons: tuple[str, ...]
+    run_id: RunId
 
+
+@dataclass(frozen=True, slots=True)
+class TierAPlan:
+    """Immutable, side-effect-free result of one deterministic Tier-A pass."""
+
+    candidates: tuple[TierAPlannedCandidate, ...]
+    rejections: tuple[TierAScanRejection, ...]
     outcomes: tuple[ExtractionOutcome, ...]
-    inserted: tuple[ExtractionOutcome, ...]
-    """Notes that became a new `memory_item` row on this run of the lane."""
-    deduplicated: tuple[ExtractionOutcome, ...]
-    """Notes whose content the project already held. These still carry a
-    `memory_id` -- the pre-existing row's -- because the run really did
-    re-observe that condition; what did not happen is a second INSERT."""
-    dedupe_is_durable: bool
-    """`False` when no `KnownContentPort` was injected, in which case the
-    dedupe covers only this batch and a redelivered batch WILL duplicate.
-    Reported so a caller cannot mistake the in-batch guarantee for the
-    cross-batch one."""
+    rejection_overflow: TierARejectionOverflow | None = None
 
 
 def default_extractors() -> tuple[Extractor, ...]:
-    """The four Tier A extractors in a FIXED order.
+    """The fixed planning order, which also defines cap and dedupe precedence."""
 
-    Order is load-bearing, not cosmetic: the cap tracker is first-come, so a
-    run at its cap keeps whichever note was reserved first. A lane whose order
-    varied would charge a different note against the same run's one slot from
-    machine to machine, making the vault-growth curve Phase 2's soak measures
-    non-reproducible. Every extractor is constructed with its documented
-    defaults; the detection thresholds have no `EffectiveConfig` fields (each
-    extractor's own docstring records that gap), so a caller needing different
-    ones builds the tuple itself and passes it in.
-    """
     return (
         ToolFailureExtractor(),
         SchemaFailureExtractor(),
@@ -150,108 +85,178 @@ def default_extractors() -> tuple[Extractor, ...]:
     )
 
 
-@dataclass(slots=True)
-class _DedupingWriter:
-    """A `MemoryWriterPort` that returns the existing row instead of inserting.
-
-    Hashes with `domain.canonical.content_hash` -- the same function
-    `Repo.insert_memory_item` hashes the content with -- so this filter and the
-    column it is standing in for can never disagree about what "the same note"
-    means.
-
-    Never raises on a duplicate: `emit_candidate` treats any writer exception
-    as fatal to the whole batch, so raising here would let one already-known
-    note destroy every genuinely new note behind it.
-    """
-
-    inner: MemoryWriterPort
-    known_content: KnownContentPort | None
-    seen: dict[str, MemoryId] = field(default_factory=dict)
-    was_duplicate: list[bool] = field(default_factory=list)
-    """One entry per call, in call order: whether that call was answered from
-    an existing row instead of inserting. A per-call log rather than a set of
-    duplicate hashes, because two extractors can legitimately render the SAME
-    note in one batch -- the first of those is a real insert and the second is
-    a duplicate, and a set cannot tell them apart."""
-
-    def insert_memory_item(
-        self, project_id: ProjectId, item: NewMemoryItem, scan_verdict: ScanVerdict
-    ) -> MemoryId:
-        digest = content_hash(item.content)
-
-        existing = self.seen.get(digest)
-        if existing is None and self.known_content is not None:
-            existing = self.known_content.find_memory_by_content_hash(project_id, digest)
-        if existing is not None:
-            self.seen[digest] = existing
-            self.was_duplicate.append(True)
-            return existing
-
-        memory_id = self.inner.insert_memory_item(project_id, item, scan_verdict)
-        self.seen[digest] = memory_id
-        self.was_duplicate.append(False)
-        return memory_id
-
-
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class TierALane:
-    """Runs the four extractors over one project's batch of traces."""
+    """Plan Tier-A candidates without repository, review, or queue I/O."""
 
     cfg: EffectiveConfig
     clock: Clock
-    writer: MemoryWriterPort
-    review_writer: ReviewQueueWriter | None = None
-    known_content: KnownContentPort | None = None
     extractors: tuple[Extractor, ...] = field(default_factory=default_extractors)
     require_declared_tools: bool = True
 
     def __post_init__(self) -> None:
         if not self.extractors:
-            raise ValueError("TierALane needs at least one extractor to run")
+            raise ValueError("TierALane needs at least one extractor to plan")
 
-    def run_batch(
-        self, scope: ProjectScope, traces: Mapping[RunId, Sequence[TraceEvent]]
-    ) -> TierALaneResult:
-        """Extract, dedupe, and write every Tier A note this batch supports.
+    def plan(
+        self,
+        scope: ProjectScope,
+        traces: Mapping[RunId, Sequence[TraceEvent]],
+    ) -> TierAPlan:
+        """Return deterministic candidates and rejections with no external writes.
 
-        The cap tracker is built ONCE here and handed to every extractor: that
-        is the entire reason this method exists rather than four call sites.
-        Both it and the dedupe writer are per-call, so no state from one
-        batch -- and therefore from one project -- can reach the next.
+        Extractor order is deliberately load-bearing.  The first proposal for
+        an identical rendered note wins before the shared per-run cap is
+        reserved; rejected scans release no resource because they never take
+        one.  This means replaying the same archive yields the same plan and a
+        duplicate cannot starve a distinct candidate for its primary run.
         """
+
         tracker = CandidateCapTracker(cap=self.cfg.tier_a.candidate_cap_per_run)
-        dedupe = _DedupingWriter(inner=self.writer, known_content=self.known_content)
-
+        seen_content: set[str] = set()
+        candidates: list[TierAPlannedCandidate] = []
+        all_rejections: list[TierAScanRejection] = []
+        rejection_hash_by_content: dict[str, str] = {}
         outcomes: list[ExtractionOutcome] = []
-        for extractor in self.extractors:
-            outcomes.extend(
-                extractor.extract(
-                    scope,
-                    traces,
-                    cfg=self.cfg,
-                    clock=self.clock,
-                    writer=dedupe,
-                    review_writer=self.review_writer,
-                    cap_tracker=tracker,
-                    require_declared_tools=self.require_declared_tools,
-                )
-            )
 
-        # Every outcome carrying a memory_id is exactly one writer call, in
-        # order, so the writer's per-call log lines up positionally. Zipping
-        # is what lets the same content rendered twice in one batch be split
-        # correctly into one insert and one duplicate.
-        written = [o for o in outcomes if o.memory_id is not None]
-        if len(written) != len(dedupe.was_duplicate):
-            raise AssertionError(
-                f"Tier A lane bookkeeping diverged: {len(written)} outcome(s) carry a memory_id "
-                f"but the writer recorded {len(dedupe.was_duplicate)} call(s)"
+        for extractor in self.extractors:
+            for proposal in extractor.propose(
+                traces, require_declared_tools=self.require_declared_tools
+            ):
+                content = render_note(proposal.note)
+                result = scan(
+                    content,
+                    context=ScanContext(
+                        project_id=scope.project_id,
+                        mem_type=proposal.mem_type,
+                        trust_tier=TrustTier.A,
+                        provenance_class=ProvenanceClass.PARSER,
+                        lane=Lane.OPERATIONAL,
+                    ),
+                )
+
+                if result.content_hash in seen_content:
+                    outcomes.append(
+                        _outcome(proposal, content, skipped_reason="duplicate_candidate")
+                    )
+                    continue
+                seen_content.add(result.content_hash)
+
+                if not result.passed:
+                    rejection_hash_by_content[content] = result.content_hash
+                    all_rejections.append(
+                        TierAScanRejection(
+                            mem_type=proposal.mem_type,
+                            content_hash=result.content_hash,
+                            suite_version=result.suite_version,
+                            reasons=result.reasons,
+                            run_id=proposal.primary_run_id,
+                        )
+                    )
+                    outcomes.append(
+                        _outcome(
+                            proposal,
+                            content,
+                            skipped_reason=f"scan_rejected: {'; '.join(result.reasons)}",
+                        )
+                    )
+                    continue
+
+                if not tracker.try_reserve(proposal.primary_run_id):
+                    outcomes.append(
+                        _outcome(
+                            proposal,
+                            content,
+                            skipped_reason=(
+                                "tier_a.candidate_cap_per_run "
+                                f"({tracker.cap}) already reserved for run "
+                                f"{proposal.primary_run_id}"
+                            ),
+                        )
+                    )
+                    continue
+
+                item = build_candidate_item(
+                    scope=scope,
+                    clock=self.clock,
+                    cfg=self.cfg,
+                    proposal=proposal,
+                )
+                candidates.append(
+                    TierAPlannedCandidate(
+                        item=item,
+                        scan_result=result,
+                        primary_run_id=proposal.primary_run_id,
+                        contributing_run_ids=proposal.contributing_run_ids,
+                    )
+                )
+                outcomes.append(_outcome(proposal, content, skipped_reason=None))
+
+        ordered_rejections = tuple(sorted(all_rejections, key=_rejection_key))
+        retained_rejections = ordered_rejections[:MAX_TIER_A_INDIVIDUAL_REJECTIONS_PER_RESULT]
+        rejection_overflow = build_tier_a_rejection_overflow(
+            tuple(
+                (rejection.content_hash, rejection.mem_type, rejection.suite_version, rejection.reasons)
+                for rejection in ordered_rejections
             )
-        inserted = tuple(o for o, dup in zip(written, dedupe.was_duplicate, strict=True) if not dup)
-        duplicates = tuple(o for o, dup in zip(written, dedupe.was_duplicate, strict=True) if dup)
-        return TierALaneResult(
-            outcomes=tuple(outcomes),
-            inserted=inserted,
-            deduplicated=duplicates,
-            dedupe_is_durable=self.known_content is not None,
         )
+        if rejection_overflow is not None:
+            omitted_reasons_by_hash = {
+                rejection.content_hash: rejection.reasons
+                for rejection in ordered_rejections[
+                    MAX_TIER_A_INDIVIDUAL_REJECTIONS_PER_RESULT:
+                ]
+            }
+            outcomes = [
+                replace(
+                    outcome,
+                    skipped_reason=(
+                        "scan_rejected_aggregated: "
+                        + "; ".join(
+                            sorted(
+                                omitted_reasons_by_hash[
+                                    rejection_hash_by_content[outcome.content]
+                                ]
+                            )
+                        )
+                    ),
+                )
+                if rejection_hash_by_content.get(outcome.content) in omitted_reasons_by_hash
+                and outcome.skipped_reason is not None
+                else outcome
+                for outcome in outcomes
+            ]
+
+        return TierAPlan(
+            candidates=tuple(candidates),
+            rejections=retained_rejections,
+            outcomes=tuple(outcomes),
+            rejection_overflow=rejection_overflow,
+        )
+
+
+def _outcome(
+    proposal: TierACandidateProposal,
+    content: str,
+    *,
+    skipped_reason: str | None,
+) -> ExtractionOutcome:
+    """Keep legacy extractor-observation telemetry useful without minting IDs."""
+
+    return ExtractionOutcome(
+        note=proposal.note,
+        primary_run_id=proposal.primary_run_id,
+        contributing_run_ids=proposal.contributing_run_ids,
+        memory_id=None,
+        skipped_reason=skipped_reason,
+        content=content,
+    )
+
+
+def _rejection_key(rejection: TierAScanRejection) -> tuple[str, str, str, tuple[str, ...]]:
+    return (
+        rejection.content_hash,
+        rejection.mem_type.value,
+        rejection.suite_version,
+        tuple(sorted(rejection.reasons)),
+    )

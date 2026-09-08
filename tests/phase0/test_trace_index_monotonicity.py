@@ -81,6 +81,7 @@ def _upsert(
         ended_at=None,
         payload_ref=None,
         outcome_status=outcome_status,
+        envelope_versions=(1,),
     )
 
 
@@ -671,7 +672,7 @@ def test_neighbouring_monotonicity_rules_are_unchanged() -> None:
         "ELSE EXCLUDED.outcome_status END" in body
     )
     assert "arm = COALESCE(" in body
-    assert body.rstrip().endswith("), trace_index.arm)")
+    assert "), trace_index.arm) WHERE trace_index.outcome_status NOT IN ('ok', 'error', 'cancelled')" in body
     assert "SELECT re.arm FROM retrieval_event re" in body
     assert "%(arm)s" not in body
     # Postgres rejects two assignments to the same column in one DO UPDATE SET -- a duplicate

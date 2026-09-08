@@ -14,23 +14,15 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 
-from tracebed.core.scans import ReviewQueueWriter
 from tracebed.core.scans.tier_a_template import ErrorClassEnum
-from tracebed.domain.clock import Clock
-from tracebed.domain.config import EffectiveConfig
 from tracebed.domain.enums import MemType
 from tracebed.domain.events import TraceEvent
 from tracebed.domain.ids import RunId
-from tracebed.domain.scope import ProjectScope
 from tracebed.workers.extractors.base import (
-    CandidateCapTracker,
-    ExtractionOutcome,
-    MemoryWriterPort,
+    TierACandidateProposal,
     ToolEventRecord,
-    emit_candidate,
     mean_duration_ms,
     read_tool_events,
-    resolve_cap_tracker,
     structural_hash,
     try_build_note,
 )
@@ -59,18 +51,13 @@ class ToolFailureExtractor:
             )
         self._min_repeat_count = min_repeat_count
 
-    def extract(
+    def propose(
         self,
-        scope: ProjectScope,
         traces: Mapping[RunId, Sequence[TraceEvent]],
         *,
-        cfg: EffectiveConfig,
-        clock: Clock,
-        writer: MemoryWriterPort,
-        review_writer: ReviewQueueWriter | None = None,
-        cap_tracker: CandidateCapTracker | None = None,
         require_declared_tools: bool = True,
-    ) -> list[ExtractionOutcome]:
+    ) -> list[TierACandidateProposal]:
+        """Return deterministic structural findings without scanning or I/O."""
         groups: dict[_GroupKey, list[ToolEventRecord]] = defaultdict(list)
         for run_id, events in traces.items():
             for record in read_tool_events(
@@ -82,8 +69,7 @@ class ToolFailureExtractor:
                     continue
                 groups[(record.tool_id, record.tool_version_hash, record.error_class)].append(record)
 
-        tracker = resolve_cap_tracker(cap_tracker, cfg)
-        outcomes: list[ExtractionOutcome] = []
+        proposals: list[TierACandidateProposal] = []
         for key in sorted(groups, key=lambda k: (k[0], k[1], k[2].value)):
             records = groups[key]
             if len(records) < self._min_repeat_count:
@@ -112,19 +98,13 @@ class ToolFailureExtractor:
             if note is None:
                 continue
 
-            outcomes.append(
-                emit_candidate(
-                    scope=scope,
-                    clock=clock,
-                    cfg=cfg,
-                    writer=writer,
+            proposals.append(
+                TierACandidateProposal(
                     note=note,
                     mem_type=_MEM_TYPE,
                     kind=_KIND,
-                    trace_ids=trace_ids,
+                    contributing_run_ids=trace_ids,
                     primary_run_id=primary_run_id,
-                    cap_tracker=tracker,
-                    review_writer=review_writer,
                 )
             )
-        return outcomes
+        return proposals
