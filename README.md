@@ -36,6 +36,11 @@ The launcher owns its fixed network, secret files, admission fencing, and persis
 
 ## How it works
 
+[![Tracebed architecture: clients, API and workers, storage, and optional embedding provider.](docs/assets/diagrams/architecture.png)](docs/assets/diagrams/architecture.png)
+
+This is a logical component view, not network topology. Read the accessible descriptions and source
+map in [Architecture](docs/ARCHITECTURE.md).
+
 1. A host authenticates to the API and submits a retrieval request.
 2. Tracebed derives project scope and grants server-side, opens an authorized run, and returns a bounded context block or an empty result.
 3. The host may queue trace, feedback, and proposal evidence for later server-side processing.

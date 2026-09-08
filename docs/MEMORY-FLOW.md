@@ -30,7 +30,8 @@ The intended path is:
 The stages above need separate deployment evidence. In particular, the presence of a worker or a
 retrieval path does not show that all events are captured, a learning loop runs, or an agent is
 improving. See [DATA-LIFECYCLE.md](DATA-LIFECYCLE.md) for handling expectations and
-[THREAT-MODEL.md](THREAT-MODEL.md) for trust boundaries.
+[THREAT-MODEL.md](THREAT-MODEL.md) for trust boundaries. [ARCHITECTURE.md](ARCHITECTURE.md)
+provides accessible retrieval and evidence-flow diagrams with code source maps.
 
 No host-specific adapter is included in this repository. Integrators should implement and test
 the ports described in [ADAPTER-GUIDE.md](ADAPTER-GUIDE.md).
